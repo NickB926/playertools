@@ -1,0 +1,10 @@
+{
+    "name":  "playertools",
+    "version":  "1.0.1",
+    "private":  true,
+    "description":  "Swordburst 2 PlayerTools â€” GitHub raw update feed (Neuublue-style)",
+    "scripts":  {
+                    "publish:updates":  "powershell -ExecutionPolicy Bypass -File ./Publish-PlayerTools.ps1",
+                    "publish:updates:skip-bump":  "powershell -ExecutionPolicy Bypass -File ./Publish-PlayerTools.ps1 -SkipVersionBump"
+                }
+}

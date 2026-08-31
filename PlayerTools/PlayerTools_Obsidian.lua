@@ -13054,184 +13054,38 @@ local ok, err = pcall(function()
 		end
 		getgenv().SB2FreshServerFinderTick = freshServerFinderTick
 
-		-- Nested scope: CombatTab chunk is near Luau's 200-local limit.
+		-- Fresh finder always hops the floor you are on (no floor picker).
 		do
 			local HARD = {
-				{ placeId = 542351431, name = 'Virhst Woodlands', floor = 1 },
-				{ placeId = 548231754, name = 'Redveil Grove', floor = 2 },
-				{ placeId = 555980327, name = 'Avalanche Expanse', floor = 3 },
-				{ placeId = 572487908, name = 'Hidden Wilds', floor = 4 },
-				{ placeId = 580239979, name = 'Desolate Dunes', floor = 5 },
-				{ placeId = 566212942, name = 'Helmfirth', floor = 6 },
-				{ placeId = 582198062, name = 'Entoloma Gloomlands', floor = 7 },
-				{ placeId = 548878321, name = 'Blooming Plateau', floor = 8 },
-				{ placeId = 573267292, name = "Va' Rok", floor = 9 },
-				{ placeId = 2659143505, name = 'Transylvania', floor = 10 },
-				{ placeId = 5287433115, name = 'Hypersiddia', floor = 11 },
-				{ placeId = 6144637080, name = 'Sector - 235', floor = 12 },
+				[542351431] = 'F1 Virhst Woodlands',
+				[548231754] = 'F2 Redveil Grove',
+				[555980327] = 'F3 Avalanche Expanse',
+				[572487908] = 'F4 Hidden Wilds',
+				[580239979] = 'F5 Desolate Dunes',
+				[566212942] = 'F6 Helmfirth',
+				[582198062] = 'F7 Entoloma Gloomlands',
+				[548878321] = 'F8 Blooming Plateau',
+				[573267292] = "F9 Va' Rok",
+				[2659143505] = 'F10 Transylvania',
+				[5287433115] = 'F11 Hypersiddia',
+				[6144637080] = 'F12 Sector - 235',
 			}
-
-			local function addRec(out, byLabel, seen, rec)
-				if type(rec) ~= 'table' or not tonumber(rec.placeId) or seen[rec.placeId] then
-					return
-				end
-				seen[rec.placeId] = true
-				local label = rec.label
-				if type(label) ~= 'string' or label == '' then
-					if rec.floor then
-						label = ('F%d %s'):format(tonumber(rec.floor) or 0, tostring(rec.name or rec.placeId))
-					else
-						label = tostring(rec.name or ('Place ' .. tostring(rec.placeId)))
-						if type(rec.category) == 'string' and rec.category ~= '' then
-							label = label .. ' [' .. rec.category .. ']'
-						end
-					end
-				end
-				local row = {
-					placeId = rec.placeId,
-					name = rec.name,
-					floor = rec.floor,
-					category = rec.category,
-					label = label,
-				}
-				out[#out + 1] = label
-				byLabel[label] = row
+			local function currentFloorLabel()
+				local pid = tonumber(game.PlaceId) or game.PlaceId
+				return HARD[pid] or ('Current floor (' .. tostring(pid) .. ')')
 			end
-
-			local function listFloorLabels()
-				if type(getgenv().SB2RefreshFreshFinderFloors) == 'function' then
-					pcall(getgenv().SB2RefreshFreshFinderFloors)
-				elseif type(getgenv().SB2EnsureServerHopCatalog) == 'function' then
-					pcall(getgenv().SB2EnsureServerHopCatalog)
-				end
-				local labels = {}
-				local byLabel = {}
-				local seen = {}
-				if type(getgenv().SB2ListFreshFinderFloors) == 'function' then
-					local ok, list = pcall(getgenv().SB2ListFreshFinderFloors)
-					if ok and type(list) == 'table' then
-						for _, rec in ipairs(list) do
-							addRec(labels, byLabel, seen, rec)
-						end
-					end
-				end
-				local cat = getgenv().SB2ServerHopCatalog
-				if type(cat) == 'table' then
-					if type(cat.floors) == 'table' then
-						for i, rec in ipairs(cat.floors) do
-							addRec(labels, byLabel, seen, {
-								placeId = rec.placeId,
-								name = rec.name,
-								floor = rec.floor or i,
-								category = rec.category,
-							})
-						end
-					end
-					if type(cat.all) == 'table' then
-						for _, rec in ipairs(cat.all) do
-							addRec(labels, byLabel, seen, rec)
-						end
-					end
-				end
-				if #labels == 0 then
-					for _, rec in ipairs(HARD) do
-						addRec(labels, byLabel, seen, rec)
-					end
-				end
-				-- Always offer current place if missing from catalog.
-				addRec(labels, byLabel, seen, {
-					placeId = game.PlaceId,
-					name = 'Current floor',
-					label = 'Current floor',
-				})
-				getgenv().SB2FreshFinderFloorByLabel = byLabel
-				return labels, byLabel
-			end
-
-			local function refreshFloorDropdown()
-				local labels, byLabel = listFloorLabels()
-				if Options.FreshFinderFloor and type(Options.FreshFinderFloor.SetValues) == 'function' then
-					Options.FreshFinderFloor:SetValues(labels)
-					local keep = Options.FreshFinderFloor.Value
-					if keep and byLabel[keep] then
-						Options.FreshFinderFloor:SetValue(keep)
-					elseif byLabel['Current floor'] then
-						Options.FreshFinderFloor:SetValue('Current floor')
-					elseif labels[1] then
-						Options.FreshFinderFloor:SetValue(labels[1])
-					end
-				end
-				return #labels
-			end
-
-			local labels, byLabel = listFloorLabels()
-			local defaultLabel = byLabel['Current floor'] and 'Current floor' or labels[1]
+			-- Keep AutoBlock pref locked to this place whenever finder runs.
 			pcall(function()
-				if type(getgenv().SB2GetFreshFinderFloor) == 'function' then
-					local ok, placeId = pcall(getgenv().SB2GetFreshFinderFloor)
-					if ok and tonumber(placeId) then
-						for label, rec in pairs(byLabel) do
-							if tonumber(rec.placeId) == tonumber(placeId) then
-								defaultLabel = label
-								break
-							end
-						end
+				if type(getgenv().SB2WriteFreshServerFinder) == 'function' then
+					local fsf = readFreshFinderState() or {}
+					if type(fsf) == 'table' and fsf.active == true then
+						fsf.placeId = game.PlaceId
+						fsf.placeName = 'Current floor'
+						pcall(getgenv().SB2WriteFreshServerFinder, fsf)
 					end
 				end
 			end)
-
-			SoloBox:AddDropdown('FreshFinderFloor', {
-				Text = 'Fresh finder floor',
-				Values = labels,
-				Default = defaultLabel,
-				AllowNull = false,
-				Searchable = true,
-				Tooltip = 'Target floor for finder. Button always hops the floor you are on now.',
-			})
-			SoloBox:AddButton('Refresh floor list', function()
-				Library:Notify(('Floor list refreshed (%d locations)'):format(refreshFloorDropdown()), 4)
-			end)
-			pcall(function()
-				Options.FreshFinderFloor:OnChanged(function(value)
-					local map = getgenv().SB2FreshFinderFloorByLabel
-					local rec = type(map) == 'table' and map[value]
-					if type(rec) == 'table' and tonumber(rec.placeId) then
-						if type(getgenv().SB2WriteFreshServerFinder) == 'function' then
-							local fsf = readFreshFinderState() or {}
-							fsf.placeId = rec.placeId
-							fsf.placeName = rec.name
-							pcall(getgenv().SB2WriteFreshServerFinder, fsf)
-						end
-						if type(writefile) == 'function' then
-							pcall(function()
-								writefile(
-									'PlayerTools/fresh_finder_floor.json',
-									game:GetService('HttpService'):JSONEncode({
-										placeId = rec.placeId,
-										placeName = rec.name,
-										t = os.time(),
-									})
-								)
-							end)
-						end
-						Library:Notify('Fresh finder floor → ' .. tostring(rec.label or rec.name), 4)
-					elseif type(getgenv().SB2SetFreshFinderFloor) == 'function' then
-						local ok, label = pcall(getgenv().SB2SetFreshFinderFloor, value)
-						if ok and label then
-							Library:Notify('Fresh finder floor → ' .. tostring(label), 4)
-						end
-					end
-				end)
-			end)
-			task.spawn(function()
-				for _ = 1, 48 do
-					local n = refreshFloorDropdown()
-					if n > 12 then
-						break
-					end
-					task.wait(0.25)
-				end
-			end)
+			SoloBox:AddLabel('Fresh finder floor: ' .. currentFloorLabel() .. ' (always this place)')
 		end
 
 		local function startFreshServerFinder()
@@ -13239,7 +13093,7 @@ local ok, err = pcall(function()
 				Library:Notify('Install IY plugin AutoBlock.iy first', 6)
 				return
 			end
-			-- Button = hop THIS floor. Dropdown is preference for teleport/join later.
+			-- Always hop THIS floor.
 			local targetPlace = tonumber(game.PlaceId) or game.PlaceId
 			local targetName = 'Current floor'
 			getgenv().SB2FreshBlockRetries = {}

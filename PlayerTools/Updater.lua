@@ -157,10 +157,15 @@ function Updater.apply(opts)
 	opts = type(opts) == 'table' and opts or {}
 	local notify = opts.notify
 	local function say(msg)
+		msg = tostring(msg)
 		if type(notify) == 'function' then
-			pcall(notify, tostring(msg))
+			pcall(notify, msg)
+			-- notify already prints (e.g. bootstrap) — skip duplicate [PlayerTools Update] line
+			if opts.quietWarn then
+				return
+			end
 		end
-		warn('[PlayerTools Update] ' .. tostring(msg))
+		warn('[PlayerTools Update] ' .. msg)
 	end
 
 	local info = Updater.check()
@@ -178,7 +183,7 @@ function Updater.apply(opts)
 	if #files == 0 then
 		return false, 'no files listed'
 	end
-	say(('Updating %s → %s (%d files)…'):format(tostring(info.localVersion), tostring(info.remoteVersion), #files))
+	say(('Updating %s -> %s (%d files)...'):format(tostring(info.localVersion), tostring(info.remoteVersion), #files))
 	local okCount, failCount = 0, 0
 	for _, rel in ipairs(files) do
 		rel = tostring(rel):gsub('^/+', '')
@@ -207,7 +212,7 @@ function Updater.apply(opts)
 		writeFile(VERSION_PATH, remoteBody)
 	end
 
-	say(('Update done — %d ok, %d failed. Rejoin / reload PlayerTools.'):format(okCount, failCount))
+	say(('Update done - %d ok, %d failed. Rejoin / reload PlayerTools.'):format(okCount, failCount))
 	return failCount == 0, ('%d/%d'):format(okCount, #files)
 end
 

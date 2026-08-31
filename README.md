@@ -18,19 +18,32 @@ Each person keeps **their own** Hive tribute webhook + Discord ping under:
 
 ## Publish a new update (you)
 
-From Windows (this machine):
+Same flow as discord-lite — from Windows:
 
 ```powershell
 cd C:\Users\Revi\Documents\playertools
-.\Publish-PlayerTools.ps1
+npm run publish:updates
 ```
 
-Or bump + push manually:
+Or double-click `publish-updates.bat`.
 
-1. Edit files under `C:\Users\Revi\AppData\Local\Potassium\scripts\PlayerTools`
-2. Bump `version` in `PlayerTools/version.json`
-3. Run the publish script (copies into the git repo and pushes `main`)
+That auto-bumps `1.0.0` → `1.0.1`, copies from Potassium `scripts/PlayerTools`, commits, and pushes `main`.
 
+Optional:
+
+```powershell
+npm run publish:updates -- -Message "tribute ping fix"
+npm run publish:updates -- -Version 1.2.0 -Message "big drop"
+npm run publish:updates:skip-bump
+```
+
+## Tribute webhook ping (you or a friend)
+
+1. Discord → create a webhook in **your** channel → copy URL  
+2. Discord → Settings → Advanced → **Developer Mode** ON → right-click **your** username → **Copy User ID**  
+3. In PlayerTools → Hive → paste webhook URL + that Discord user ID → enable **Webhook: Tribute drops**  
+
+Each Roblox account stores its own config (`hive/tribute_webhook_<userId>.json`). Friend uses **his** webhook + **his** Discord ID so he gets pinged, not you.
 ## Visibility
 
 Raw `HttpGet` only works if the repo is **public**, or friends use a token (awkward).

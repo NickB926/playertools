@@ -1,13 +1,19 @@
 --[[
 	bootstrap.lua — one-line install / update for PlayerTools (Neuublue-style)
 
-	Friend load (after repo is public, or they have access):
+	Friend load:
 
 	  loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/playertools/main/bootstrap.lua"))()
 
-	Optional: pin a different feed
+	Optional feed override:
 	  getgenv().SB2PlayerToolsUpdateBase = "https://raw.githubusercontent.com/NickB926/playertools/main"
 ]]
+
+if getgenv().SB2PlayerToolsBootstrapBusy == true then
+	warn('[PlayerTools bootstrap] already running — skip duplicate')
+	return
+end
+getgenv().SB2PlayerToolsBootstrapBusy = true
 
 local BASE = (type(getgenv().SB2PlayerToolsUpdateBase) == 'string' and getgenv().SB2PlayerToolsUpdateBase ~= ''
 	and getgenv().SB2PlayerToolsUpdateBase:gsub('/+$', ''))
@@ -38,32 +44,51 @@ local function say(msg)
 	warn('[PlayerTools bootstrap] ' .. tostring(msg))
 end
 
+local function finish(err)
+	getgenv().SB2PlayerToolsBootstrapBusy = nil
+	if err then
+		error(err)
+	end
+end
+
 if type(makefolder) == 'function' then
 	pcall(makefolder, 'PlayerTools')
 end
 if type(writefile) ~= 'function' then
-	error('[PlayerTools bootstrap] writefile required')
+	finish('[PlayerTools bootstrap] writefile required')
 end
 
--- Always refresh updater first, then run it.
+-- Refresh updater, then only pull files when remote version differs (or launch missing).
 local updaterSrc = httpGet(BASE .. '/PlayerTools/Updater.lua')
 if not updaterSrc then
-	error('[PlayerTools bootstrap] could not download Updater.lua from ' .. BASE)
+	finish('[PlayerTools bootstrap] could not download Updater.lua from ' .. BASE)
 end
 pcall(writefile, 'PlayerTools/Updater.lua', updaterSrc)
 pcall(writefile, 'PlayerTools/update_url.txt', BASE)
 
 local fn, err = (loadstring or load)(updaterSrc, 'PlayerTools/Updater.lua')
 if not fn then
-	error('[PlayerTools bootstrap] Updater compile failed: ' .. tostring(err))
+	finish('[PlayerTools bootstrap] Updater compile failed: ' .. tostring(err))
 end
 local Updater = fn()
 getgenv().SB2PlayerToolsUpdateBase = BASE
-local ok, detail = Updater.apply({ force = true, notify = say })
-if not ok then
-	say('Update finished with issues: ' .. tostring(detail))
+
+local hasLaunch = type(isfile) == 'function' and isfile('PlayerTools/launch.lua')
+local info = Updater.check and Updater.check() or { ok = false }
+if info.ok and not info.needsUpdate and hasLaunch then
+	say(('Already on %s — skip download'):format(tostring(info.remoteVersion)))
 else
-	say('Files ready. Loading launch.lua…')
+	-- First install or new version: pull files. Never force same-version rewrite.
+	local ok, detail = Updater.apply({
+		force = not hasLaunch,
+		notify = say,
+		quietWarn = true,
+	})
+	if not ok then
+		say('Update finished with issues: ' .. tostring(detail))
+	else
+		say('Files ready.')
+	end
 end
 
 local launch = (isfile and isfile('PlayerTools/launch.lua') and readfile('PlayerTools/launch.lua')) or nil
@@ -74,10 +99,16 @@ if type(launch) ~= 'string' or launch == '' then
 	end
 end
 if type(launch) ~= 'string' or launch == '' then
-	error('[PlayerTools bootstrap] launch.lua missing')
+	finish('[PlayerTools bootstrap] launch.lua missing')
 end
 local run, runErr = (loadstring or load)(launch, 'PlayerTools/launch.lua')
 if not run then
-	error('[PlayerTools bootstrap] launch compile failed: ' .. tostring(runErr))
+	finish('[PlayerTools bootstrap] launch compile failed: ' .. tostring(runErr))
 end
-return run()
+
+local okRun, result = pcall(run)
+getgenv().SB2PlayerToolsBootstrapBusy = nil
+if not okRun then
+	error(result)
+end
+return result

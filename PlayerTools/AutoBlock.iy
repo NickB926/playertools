@@ -603,29 +603,14 @@ local function resolveFloorTarget(raw)
 end
 
 local function readFreshFinderFloorPref()
-	local fsf = readFreshFinder()
-	if type(fsf) == 'table' and tonumber(fsf.placeId) then
-		return tonumber(fsf.placeId), fsf.placeName
-	end
-	if type(isfile) == 'function' and type(readfile) == 'function' then
-		local ok, exists = pcall(isfile, FRESH_FLOOR_PATH)
-		if ok and exists then
-			local okRead, body = pcall(readfile, FRESH_FLOOR_PATH)
-			if okRead and type(body) == 'string' and body ~= '' then
-				local okJson, data = pcall(function()
-					return HttpService:JSONDecode(body)
-				end)
-				if okJson and type(data) == 'table' and tonumber(data.placeId) then
-					return tonumber(data.placeId), data.placeName
-				end
-			end
-		end
-	end
-	return tonumber(game.PlaceId) or game.PlaceId, nil
+	-- Always the place you are on — no saved floor picker.
+	return tonumber(game.PlaceId) or game.PlaceId, 'Current floor'
 end
 
 local function writeFreshFinderFloorPref(placeId, placeName)
-	placeId = tonumber(placeId)
+	-- Kept for callers; always pin to current place.
+	placeId = tonumber(game.PlaceId) or tonumber(placeId)
+	placeName = 'Current floor'
 	if not placeId then
 		return
 	end
@@ -647,14 +632,9 @@ local function writeFreshFinderFloorPref(placeId, placeName)
 	end
 end
 
-local function setFreshFinderFloor(raw)
-	local rec = resolveFloorTarget(raw)
-	if not rec or not rec.placeId then
-		return false, 'unknown floor'
-	end
-	writeFreshFinderFloorPref(rec.placeId, rec.name)
-	local label = rec.floor and ('F' .. rec.floor .. ' ' .. rec.name) or rec.name
-	return true, label
+local function setFreshFinderFloor(_raw)
+	writeFreshFinderFloorPref(game.PlaceId, 'Current floor')
+	return true, 'Current floor'
 end
 
 local freshHopBusy = false
@@ -2193,59 +2173,37 @@ local Plugin = {
 		},
 		['freshserver'] = {
 			['ListName'] = 'freshserver / fsf',
-			['Description'] = 'Fresh server finder — block & hop until empty',
+			['Description'] = 'Fresh server finder — block & hop this floor until empty',
 			['Aliases'] = { 'fsf', 'freshfinder' },
-			['Function'] = function(args)
-				if args and args[1] then
-					local ok, label = setFreshFinderFloor(table.concat(args, ' '))
-					if ok then
-						say('fresh finder floor → ' .. tostring(label))
-					else
-						say('unknown floor — try fsffloor F11')
-					end
-				end
-				local targetPlace, targetName = readFreshFinderFloorPref()
+			['Function'] = function(_args)
+				local targetPlace = tonumber(game.PlaceId) or game.PlaceId
 				writeFreshFinder({
 					active = true,
-					placeId = targetPlace or game.PlaceId,
-					placeName = targetName,
+					placeId = targetPlace,
+					placeName = 'Current floor',
 					tried = { [tostring(game.JobId or '')] = true },
 					hops = 0,
 					started = os.time(),
 				})
-				local floorLabel = targetName or tostring(targetPlace or game.PlaceId)
-				say('fresh server finder started — ' .. tostring(floorLabel))
+				say('fresh server finder started — current floor (' .. tostring(targetPlace) .. ')')
 				ensureFreshFinderWatchdog()
 				resumeFreshServerFinder()
 			end,
 		},
 		['fsffloor'] = {
-			['ListName'] = 'fsffloor [F11|name]',
-			['Description'] = 'Set which floor fresh server finder hops on',
+			['ListName'] = 'fsffloor',
+			['Description'] = 'Fresh finder always uses the floor you are on',
 			['Aliases'] = { 'freshfloor', 'abfloor' },
-			['Function'] = function(args)
-				local raw = args and table.concat(args, ' ') or ''
-				if raw == '' then
-					local placeId, placeName = readFreshFinderFloorPref()
-					say(('fresh finder floor: %s (%s)'):format(tostring(placeName or '?'), tostring(placeId)))
-					return
-				end
-				local ok, label = setFreshFinderFloor(raw)
-				if ok then
-					say('fresh finder floor → ' .. tostring(label))
-				else
-					say('unknown floor — try F1, F11, Hypersiddia, etc.')
-				end
+			['Function'] = function()
+				say(('fresh finder floor: current (%s)'):format(tostring(game.PlaceId)))
 			end,
 		},
 		['fsffloors'] = {
 			['ListName'] = 'fsffloors',
-			['Description'] = 'List all locations for fresh server finder',
+			['Description'] = 'Fresh finder uses current floor only (no list)',
 			['Aliases'] = { 'fsflist', 'abfloors' },
 			['Function'] = function()
-				for _, rec in ipairs(buildFreshFinderFloorList()) do
-					say(('%s (%s)'):format(tostring(rec.label or rec.name), tostring(rec.placeId)))
-				end
+				say('fresh finder hops the floor you are on — no floor list')
 			end,
 		},
 		['fsfstop'] = {
