@@ -13428,12 +13428,14 @@ local ok, err = pcall(function()
 		end
 
 		-- Measured freeze hold times (Stunned tag). Cast windup is separate (~2s).
+		-- After a freeze cycle (WB + ES stack), game applies a ~30s global freeze CD.
 		local COMBO_FREEZE_HOLD = {
 			['Water Blast'] = 7,
 			['Everfrost'] = 10,
 			['Everfrost Strike'] = 10,
 			['Water Domain'] = 7,
 		}
+		local COMBO_FREEZE_GCD = 30
 
 		local function comboFreezeHold(skillName)
 			return COMBO_FREEZE_HOLD[skillName] or nil
@@ -13441,6 +13443,26 @@ local ok, err = pcall(function()
 
 		local function isComboFreezeSkill(skillName)
 			return comboFreezeHold(skillName) ~= nil
+		end
+
+		-- Shared freeze window for stacking WB → ES, then GCD before the next freeze.
+		local freezeState = {
+			untilClock = 0, -- os.clock when current freeze hold should end
+			gcdUntil = 0, -- os.clock when next freeze cast is allowed
+			lastSkill = nil,
+		}
+
+		local function noteFreezeCast(skillName)
+			local hold = comboFreezeHold(skillName)
+			if not hold then
+				return
+			end
+			local now = os.clock()
+			-- Stacking extends (does not shorten) the active freeze window.
+			freezeState.untilClock = math.max(freezeState.untilClock, now + hold)
+			freezeState.lastSkill = skillName
+			-- Global freeze CD: 30s AFTER the freeze window ends (updated when ES stacks).
+			freezeState.gcdUntil = freezeState.untilClock + COMBO_FREEZE_GCD
 		end
 
 		local comboBusy = false
@@ -13509,25 +13531,47 @@ local ok, err = pcall(function()
 			return isMobFrozen(mob)
 		end
 
-		-- Stay idle while Stunned is up; wake a bit before expected hold ends.
-		local function waitWhileBossFrozen(mob, token, holdSec)
-			local expectedEnd = os.clock() + math.max(1, holdSec or 7)
+		-- Wait out the freeze TIMER (hold length), not just until Stunned flickers off.
+		-- Also waits if the boss is still tagged after the expected end.
+		local function waitWhileBossFrozen(mob, token, holdSec, fromClock)
+			local expectedEnd = (type(fromClock) == 'number' and fromClock or os.clock())
+				+ math.max(1, holdSec or 7)
+			-- Prefer shared stack window if it ends later (WB+ES overlap).
+			if freezeState.untilClock > expectedEnd then
+				expectedEnd = freezeState.untilClock
+			end
 			while token == comboToken and isToggleOn('BossComboEnable') do
 				if not mob or not mob.Parent or isDeadMob(mob) then
 					return false
 				end
-				if not isMobFrozen(mob) then
-					return false
+				local now = os.clock()
+				local stillTagged = isMobFrozen(mob)
+				if now >= expectedEnd and not stillTagged then
+					return true
 				end
-				local remain = expectedEnd - os.clock()
-				if remain <= 0.4 then
-					-- Near expected end — poll for Stunned drop.
-					task.wait(0.12)
+				-- Timer done but tag lingering — keep polling until it drops (cap +4s).
+				if now >= expectedEnd + 4 and stillTagged then
+					return true
+				end
+				local remain = expectedEnd - now
+				if remain > 0.45 then
+					task.wait(math.min(0.45, remain - 0.2))
 				else
-					task.wait(math.min(0.5, remain - 0.35))
+					task.wait(0.12)
 				end
 			end
 			return isMobFrozen(mob)
+		end
+
+		local function waitFreezeGcd(token)
+			while token == comboToken and isToggleOn('BossComboEnable') do
+				local remain = freezeState.gcdUntil - os.clock()
+				if remain <= 0 then
+					return true
+				end
+				task.wait(math.min(0.5, math.max(0.15, remain)))
+			end
+			return false
 		end
 
 		local function fireComboSkill(skillName)
@@ -13540,6 +13584,12 @@ local ok, err = pcall(function()
 			local dur = (info.duration and info.duration > 0) and info.duration or 1.5
 			if hold then
 				dur = math.max(dur, 2.0)
+				-- Do not cast a freeze while the global freeze GCD is still cooling
+				-- (except the initial stack: skill2 is allowed while freeze window is active).
+				local now = os.clock()
+				if freezeState.gcdUntil > now and now >= freezeState.untilClock then
+					return false, dur
+				end
 			end
 			syncSkillCdFromGame(skillName)
 			local cdBefore = comboGameCooldown(skillName)
@@ -13588,30 +13638,10 @@ local ok, err = pcall(function()
 				local cd = info.cooldown or 2
 				markSkillUsed(skillName, cd)
 				lastAnySkillCastAt = os.clock()
-			end
-			-- #region agent log
-			pcall(function()
-				local payload = game:GetService('HttpService'):JSONEncode({
-					sessionId = '7e9135',
-					hypothesisId = 'BC1',
-					location = 'fireComboSkill',
-					message = 'combo skill cast',
-					data = {
-						skill = skillName,
-						ok = ok == true,
-						via = via,
-						hold = hold,
-						cdBefore = cdBefore,
-						cdAfter = comboGameCooldown(skillName),
-						usingSkill = skills and tostring(skills.usingSkill),
-					},
-					timestamp = os.time() * 1000,
-				})
-				if type(appendfile) == 'function' then
-					pcall(appendfile, 'PlayerTools/debug-7e9135.log', payload .. '\n')
+				if hold then
+					noteFreezeCast(skillName)
 				end
-			end)
-			-- #endregion
+			end
 			if not ok then
 				getgenv().SB2SkillActiveUntil = 0
 				getgenv().SB2SkillActiveName = nil
@@ -13620,67 +13650,49 @@ local ok, err = pcall(function()
 		end
 
 		local function maintainBossFreeze(mob, skill2, token)
-			-- Re-freeze only after Stunned drops AND game CD is ready.
-			-- Hold lengths: Water Blast ~7s, Everfrost Strike ~10s.
-			local hold = comboFreezeHold(skill2) or 7
+			-- After the opening WB+ES stack:
+			-- 1) wait out the remaining freeze timer (ES ~10s),
+			-- 2) wait the 30s global freeze GCD,
+			-- 3) re-cast skill2 and wait ITS full hold before repeating.
+			local hold = comboFreezeHold(skill2) or 10
 			while token == comboToken and isToggleOn('BossComboEnable') do
 				if not mob or not mob.Parent or isDeadMob(mob) then
 					break
 				end
-				if isMobFrozen(mob) then
-					-- #region agent log
-					pcall(function()
-						local payload = game:GetService('HttpService'):JSONEncode({
-							sessionId = '7e9135',
-							hypothesisId = 'BC3',
-							location = 'maintainBossFreeze',
-							message = 'waiting freeze hold',
-							data = { skill2 = tostring(skill2), hold = hold },
-							timestamp = os.time() * 1000,
-						})
-						if type(appendfile) == 'function' then
-							pcall(appendfile, 'PlayerTools/debug-7e9135.log', payload .. '\n')
-						end
-					end)
-					-- #endregion
-					waitWhileBossFrozen(mob, token, hold)
+				local now = os.clock()
+				-- Still inside an active freeze window — wait the timer out fully.
+				if now < freezeState.untilClock or isMobFrozen(mob) then
+					local remain = math.max(0.5, freezeState.untilClock - now)
+					waitWhileBossFrozen(mob, token, remain, now)
+					-- Ensure we don't leave early while still tagged.
+					while token == comboToken
+						and isToggleOn('BossComboEnable')
+						and isMobFrozen(mob)
+						and os.clock() < freezeState.untilClock + 2
+					do
+						task.wait(0.15)
+					end
 				else
+					-- Freeze ended — honor global 30s freeze CD before next freeze.
+					if freezeState.gcdUntil > os.clock() then
+						waitFreezeGcd(token)
+					end
+					if token ~= comboToken or not isToggleOn('BossComboEnable') then
+						break
+					end
 					syncSkillCdFromGame(skill2)
 					local gameCd = comboGameCooldown(skill2)
 					if gameCd and gameCd < 0 then
-						-- Sleep most of remaining CD instead of busy-looping.
 						task.wait(math.clamp(-gameCd, 0.2, 1.0))
 					elseif isSkillReady(skill2) and gameSkillCanCast(skill2) ~= false then
-						-- #region agent log
-						pcall(function()
-							local payload = game:GetService('HttpService'):JSONEncode({
-								sessionId = '7e9135',
-								hypothesisId = 'BC2',
-								location = 'maintainBossFreeze',
-								message = 're-freeze with skill2',
-								data = {
-									mob = tostring(mob.Name),
-									skill2 = tostring(skill2),
-									gameCd = gameCd,
-									hold = hold,
-								},
-								timestamp = os.time() * 1000,
-							})
-							if type(appendfile) == 'function' then
-								pcall(appendfile, 'PlayerTools/debug-7e9135.log', payload .. '\n')
-							end
-						end)
-						-- #endregion
+						local castAt = os.clock()
 						local ok = fireComboSkill(skill2)
 						if ok then
+							-- noteFreezeCast already set untilClock = castAt+hold and new GCD.
 							waitForBossStun(mob, token, 2.5)
-							if isMobFrozen(mob) then
-								waitWhileBossFrozen(mob, token, hold)
-							else
-								task.wait(0.4)
-							end
+							waitWhileBossFrozen(mob, token, hold, castAt)
 						else
-							task.wait(0.3)
+							task.wait(0.35)
 						end
 					else
 						task.wait(0.25)
@@ -13703,14 +13715,19 @@ local ok, err = pcall(function()
 			getgenv().SB2BossComboLock = true
 			comboToken += 1
 			local token = comboToken
+			freezeState.untilClock = 0
+			freezeState.gcdUntil = 0
+			freezeState.lastSkill = nil
 			Library:Notify(('Boss combo — %s'):format(tostring(mob.Name)), 8, true)
 			task.spawn(function()
 				local okRun, errRun = pcall(function()
 					local deadline = os.clock() + 3.5
 					local ok1, dur1 = false, 1.5
+					local cast1At = nil
 					while os.clock() < deadline and token == comboToken do
 						ok1, dur1 = fireComboSkill(skill1)
 						if ok1 then
+							cast1At = os.clock()
 							break
 						end
 						task.wait(0.12)
@@ -13721,37 +13738,48 @@ local ok, err = pcall(function()
 					end
 					local hold1 = comboFreezeHold(tostring(skill1))
 					if hold1 then
-						-- Wait for stun to land, then hold most of the freeze before skill 2.
+						-- Wait for stun, then hold most of WB (~7s) before stacking ES.
 						waitForBossStun(mob, token, math.max(1.5, tonumber(dur1) or 2))
-						waitWhileBossFrozen(mob, token, math.max(1, hold1 - 1.5))
+						waitWhileBossFrozen(mob, token, math.max(1, hold1 - 1.5), cast1At)
 					else
 						task.wait(math.max(1.2, tonumber(dur1) or 1.5))
 					end
 					if token ~= comboToken or not isToggleOn('BossComboEnable') then
 						return
 					end
+					local cast2At = os.clock()
 					local ok2, dur2 = fireComboSkill(skill2)
 					if not ok2 then
 						task.wait(0.35)
 						ok2, dur2 = fireComboSkill(skill2)
+						cast2At = os.clock()
 					end
 					local hold2 = comboFreezeHold(tostring(skill2))
 					if ok2 and hold2 then
 						waitForBossStun(mob, token, math.max(1.5, tonumber(dur2) or 2))
-						-- Skill 3 can land during the freeze; don't burn the whole hold here.
-						task.wait(0.45)
+						-- Skill 3 during ES freeze, then wait out the FULL ES timer (~10s).
+						if token == comboToken and isToggleOn('BossComboEnable') then
+							local ok3 = fireComboSkill(skill3)
+							if not ok3 then
+								task.wait(0.35)
+								fireComboSkill(skill3)
+							end
+						end
+						waitWhileBossFrozen(mob, token, hold2, cast2At)
 					else
 						task.wait(math.max(0.8, (tonumber(dur2) or 1.5) * 0.65))
+						if token == comboToken and isToggleOn('BossComboEnable') then
+							local ok3 = fireComboSkill(skill3)
+							if not ok3 then
+								task.wait(0.35)
+								fireComboSkill(skill3)
+							end
+						end
 					end
 					if token ~= comboToken or not isToggleOn('BossComboEnable') then
 						return
 					end
-					local ok3 = fireComboSkill(skill3)
-					if not ok3 then
-						task.wait(0.35)
-						fireComboSkill(skill3)
-					end
-					-- Keep global freeze up with skill 2 for its full hold length.
+					-- Re-freeze on skill2 after full hold + 30s global freeze GCD.
 					if type(skill2) == 'string' and skill2 ~= '' then
 						maintainBossFreeze(mob, skill2, token)
 					end
@@ -13816,7 +13844,7 @@ local ok, err = pcall(function()
 			Default = pickDefaultSkill(comboSkills, 'Everfrost Strike'),
 			AllowNull = false,
 			Searchable = true,
-			Tooltip = 'Cast after skill 1. Water Blast freeze ~7s, Everfrost Strike ~10s. Re-casts when Stunned drops and CD is ready.',
+			Tooltip = 'Cast after skill 1. WB ~7s then ES ~10s (waits full ES hold). Then 30s global freeze CD before re-cast.',
 		})
 		ComboBox:AddDropdown('BossComboSkill3', {
 			Text = 'Third',
@@ -13828,7 +13856,7 @@ local ok, err = pcall(function()
 		ComboBox:AddToggle('BossComboEnable', {
 			Text = 'Combo on boss spawn',
 			Default = false,
-			Tooltip = 'Cast 1 → wait freeze/cast → 2 → 3. Re-freeze uses skill 2 hold (WB ~7s / ES ~10s).',
+			Tooltip = 'WB (~7s) → ES (~10s, wait full hold) → skill 3 during ES → 30s freeze GCD → re-freeze with skill 2.',
 		}):OnChanged(function(value)
 			if not value then
 				comboToken += 1
