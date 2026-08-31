@@ -1,0 +1,143 @@
+-- Keep PlayerTools across teleports (same pattern as KeepIYImproved.iy).
+-- Requires PlayerTools.lua at workspace/PlayerTools/PlayerTools.lua
+-- Respects PlayerTools/manual_unload — Unload Script must stick.
+--
+-- Floor hops: prefer soft reparent + refresh. Full launch.lua only after retries.
+-- Also waits out an in-progress load so stacked queueteleport stubs don't
+-- unload/rebuild each other (load → unload flash).
+
+local plrs = game:GetService('Players')
+local lp = plrs.LocalPlayer
+
+-- Soft-first teleport stub (must stay a single expression string for queueteleport).
+local STUB =
+	"if isfile and isfile('PlayerTools/manual_unload') then local ok,b=pcall(readfile,'PlayerTools/manual_unload'); if ok and tostring(b)=='true' then return end end;"
+	.. "if getgenv().SB2PlayerToolsManualUnload then return end;"
+	.. "getgenv().SB2MenuHopGraceUntil=os.clock()+25;"
+	.. "getgenv().SB2UiKeeperQuietUntil=os.clock()+25;"
+	.. "getgenv().SB2MenuWantOpen=true;"
+	.. "local function soft()"
+	.. "local gui=getgenv().SB2PlayerToolsGui;"
+	.. "if typeof(gui)~='Instance' then return false end;"
+	.. "if not gui.Parent then pcall(function()"
+	.. "local h=nil; if gethui then local ok,x=pcall(gethui); if ok then h=x end end;"
+	.. "local cg=game:FindService('CoreGui') or game:GetService('CoreGui');"
+	.. "gui.Parent=h or (cg and cg:FindFirstChild('RobloxGui')) or cg;"
+	.. "if not gui.Parent then local lp=game:GetService('Players').LocalPlayer; local pg=lp and lp:FindFirstChildOfClass('PlayerGui'); if pg then gui.Parent=pg end end;"
+	.. "if gui.Parent then gui.Enabled=true; if gui.DisplayOrder<500 then gui.DisplayOrder=998 end end;"
+	.. "end) end;"
+	.. "if not gui.Parent then return false end;"
+	.. "getgenv().SB2PlayerTools=true; getgenv().SB2PlayerToolsGui=gui; getgenv().SB2UiOrphanFails=0;"
+	.. "if type(getgenv().SB2RefreshPlayerTools)=='function' then pcall(getgenv().SB2RefreshPlayerTools) end;"
+	.. "return true; end;"
+	.. "if soft() then return end;"
+	.. "if getgenv().SB2PlayerToolsLoading==true then "
+	.. "for _=1,50 do task.wait(0.4); if getgenv().SB2PlayerToolsManualUnload then return end; if soft() then return end; if getgenv().SB2PlayerToolsLoading~=true then break end end;"
+	.. "if soft() then return end; end;"
+	.. "for _=1,10 do task.wait(0.4); if soft() then return end end;"
+	.. "if getgenv().SB2PlayerToolsLoading==true then return end;"
+	.. "if type(getgenv().SB2ScrubAllLeakedHooks)=='function' then pcall(getgenv().SB2ScrubAllLeakedHooks) elseif type(getgenv().SB2TeardownStarlightLeaks)=='function' then pcall(getgenv().SB2TeardownStarlightLeaks) end;"
+	.. "getgenv().SB2SoftPlayerToolsReload=true;"
+	.. "getgenv().SB2PlayerToolsLoading=true;"
+	.. "getgenv().SB2PlayerToolsLoadingSince=os.clock();"
+	.. "getgenv().SB2PlayerTools=false;"
+	.. "getgenv().SB2PlayerToolsLibrary=nil;"
+	.. "local ok,err=pcall(function()"
+	.. "local p=(isfile and isfile('PlayerTools/launch.lua') and 'PlayerTools/launch.lua')"
+	.. "or(isfile and isfile('PlayerTools/PlayerTools.lua') and 'PlayerTools/PlayerTools.lua')"
+	.. "or(isfile and isfile('PlayerTools.lua') and 'PlayerTools.lua');"
+	.. "assert(p,'PlayerTools.lua missing from workspace');"
+	.. "local compile=loadstring or load;"
+	.. "local src=readfile(p);"
+	.. "local fn,cerr=compile(src,p);"
+	.. "if not fn then error('PlayerTools compile: '..tostring(cerr)) end;"
+	.. "fn()"
+	.. "end);if not ok then getgenv().SB2PlayerToolsLoading=false; getgenv().SB2SoftPlayerToolsReload=nil; warn('[KeepPlayerTools] '..tostring(err)) end"
+
+local function autoEnabled()
+	for _, path in ipairs({ 'PlayerTools/autoexec', 'autoexec' }) do
+		local ok, exists = pcall(function()
+			return isfile and isfile(path)
+		end)
+		if ok and exists then
+			local okRead, body = pcall(readfile, path)
+			if okRead and tostring(body) == 'false' then
+				return false
+			end
+			return true
+		end
+	end
+	return true
+end
+
+local function isBlocked()
+	if getgenv().SB2PlayerToolsManualUnload then
+		return true
+	end
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, 'PlayerTools/manual_unload')
+		if ok and exists then
+			local okRead, body = pcall(readfile, 'PlayerTools/manual_unload')
+			if okRead and tostring(body) == 'true' then
+				return true
+			end
+		end
+	end
+	-- Always allow re-queue when autoexec is on (floor changes wipe the UI
+	-- without always firing a clean teleport rejoin).
+	if autoEnabled() then
+		return false
+	end
+	-- Don't start PlayerTools just because AutoFarm loaded Infinite Yield.
+	if not getgenv().SB2PlayerTools and not getgenv().SB2PlayerToolsArmTeleport then
+		return true
+	end
+	return false
+end
+
+local function queuePlayerTools(...)
+	local first = ...
+	if typeof(first) == 'Instance' and first:IsA('Player') and first ~= lp then
+		return
+	end
+	if not queueteleport then
+		return
+	end
+	if isBlocked() then
+		return
+	end
+	if not autoEnabled() then
+		return
+	end
+
+	local now = os.clock()
+	if getgenv().SB2KeepPTArmAt and (now - getgenv().SB2KeepPTArmAt) < 0.75 then
+		return
+	end
+	getgenv().SB2KeepPTArmAt = now
+
+	queueteleport(STUB)
+end
+
+-- Re-arm every IY load; only hook events once so connections don't stack.
+if not isBlocked() then
+	queuePlayerTools()
+end
+
+if not getgenv().PLUGIN_ISKeepPlayerTools then
+	getgenv().PLUGIN_ISKeepPlayerTools = true
+	lp.OnTeleport:Connect(queuePlayerTools)
+	lp.OnTeleportInternal:Connect(queuePlayerTools)
+	print('KeepPlayerTools Running')
+end
+
+return {
+	['PluginName'] = 'Keep PlayerTools',
+	['PluginDescription'] = 'Re-queues PlayerTools on teleport the same way KeepIYImproved re-queues IY.',
+	['Commands'] = {
+		[''] = {
+			['Aliases'] = {},
+			['Function'] = function() end,
+		},
+	},
+}

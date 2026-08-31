@@ -1,0 +1,124 @@
+--[[
+    AutoHideIY.iy — Infinite Yield plugin
+
+    Hides the IY GUI on every load (same as typing hideiy).
+    Prefix key still opens the command bar.
+
+    Install: IY Plugins → Add → AutoHideIY.iy
+    Commands: autohideiyon | autohideiyoff | autohideiystatus
+]]
+
+local FOLDER = 'PlayerTools'
+local PATH = FOLDER .. '/autohide_iy'
+
+local function say(msg)
+	pcall(function()
+		game:GetService('StarterGui'):SetCore('SendNotification', {
+			Title = 'AutoHideIY',
+			Text = tostring(msg),
+			Duration = 3,
+		})
+	end)
+end
+
+local function readEnabled()
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		for _, path in ipairs({ PATH, 'autohide_iy' }) do
+			local ok, exists = pcall(isfile, path)
+			if ok and exists then
+				local okRead, body = pcall(readfile, path)
+				if okRead then
+					local s = tostring(body):lower():gsub('%s+', '')
+					if s == 'false' or s == '0' or s == 'off' then
+						return false
+					end
+					return true
+				end
+			end
+		end
+	end
+	-- Default ON when the plugin is installed.
+	return true
+end
+
+local function writeEnabled(on)
+	if type(writefile) ~= 'function' then
+		return
+	end
+	pcall(function()
+		if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder(FOLDER) then
+			makefolder(FOLDER)
+		end
+	end)
+	pcall(writefile, PATH, on and 'true' or 'false')
+end
+
+local function hideNow(silent)
+	if type(execCmd) == 'function' then
+		pcall(execCmd, silent and 'hideiy nonotify' or 'hideiy')
+		return true
+	end
+	return false
+end
+
+local function runAutoHide()
+	if not readEnabled() then
+		return
+	end
+	getgenv().SB2AutoHideIY = true
+	-- Plugin can load before the holder finishes animating — hit a few times.
+	hideNow(true)
+	task.defer(function()
+		hideNow(true)
+	end)
+	task.delay(0.35, function()
+		if readEnabled() then
+			hideNow(true)
+		end
+	end)
+	task.delay(1.25, function()
+		if readEnabled() then
+			hideNow(true)
+		end
+	end)
+end
+
+runAutoHide()
+
+local Plugin = {
+	['PluginName'] = 'AutoHideIY',
+	['PluginDescription'] = 'Auto hideiy on IY load (prefix key still works)',
+	['Commands'] = {
+		['autohideiyon'] = {
+			['ListName'] = 'autohideiyon',
+			['Description'] = 'Enable auto hideiy on IY load (default)',
+			['Aliases'] = { 'ahiyon', 'autohideiy' },
+			['Function'] = function()
+				writeEnabled(true)
+				getgenv().SB2AutoHideIY = true
+				hideNow(true)
+				say('auto hideiy ON')
+			end,
+		},
+		['autohideiyoff'] = {
+			['ListName'] = 'autohideiyoff',
+			['Description'] = 'Disable auto hideiy (IY stays visible on load)',
+			['Aliases'] = { 'ahiyoff' },
+			['Function'] = function()
+				writeEnabled(false)
+				getgenv().SB2AutoHideIY = false
+				say('auto hideiy OFF')
+			end,
+		},
+		['autohideiystatus'] = {
+			['ListName'] = 'autohideiystatus / ahiystat',
+			['Description'] = 'Show auto-hideiy status',
+			['Aliases'] = { 'ahiystat' },
+			['Function'] = function()
+				say(readEnabled() and 'auto hideiy: ON' or 'auto hideiy: OFF')
+			end,
+		},
+	},
+}
+
+return Plugin

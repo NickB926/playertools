@@ -1,0 +1,1198 @@
+--[[
+    Waypoints.iy — Infinite Yield plugin
+    Device-saved waypoints (writefile) + click-to-TP GUI.
+    Replaces IY's session-only waypoint commands with the same names.
+
+    Install: put Waypoints.iy in workspace → IY Settings → Plugins → Add → Waypoints
+    File: PlayerTools/waypoints.json (falls back to waypoints.json)
+
+    Commands:
+      wpgui                 — toggle GUI
+      setwp / swp [name]    — save current position
+      waypoint / wp [name]  — teleport
+      waypoints / wps       — list (also opens GUI)
+      deletewp / dwp [name] — delete
+      clearwps              — delete all for this place
+      wpexport / wpimport   — dump / load JSON path
+]]
+
+local HttpService = game:GetService('HttpService')
+local Players = game:GetService('Players')
+local UserInputService = game:GetService('UserInputService')
+local TweenService = game:GetService('TweenService')
+
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
+	or Players.LocalPlayer
+
+local SAVE_CANDIDATES = {
+	'PlayerTools/waypoints.json',
+	'waypoints.json',
+	'Waypoints/waypoints.json',
+}
+
+local GENV_KEY = 'SB2Waypoints'
+local GENV_GUI = 'SB2WaypointsGui'
+local GENV_CONNS = 'SB2WaypointsConns'
+
+local function say(text)
+	pcall(function()
+		game:GetService('StarterGui'):SetCore('SendNotification', {
+			Title = 'Waypoints',
+			Text = tostring(text),
+			Duration = 4,
+		})
+	end)
+	warn('[Waypoints] ' .. tostring(text))
+end
+
+local function jsonEncode(t)
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(t)
+	end)
+	if ok and type(encoded) == 'string' then
+		return encoded
+	end
+	return nil
+end
+
+local function jsonDecode(s)
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(s)
+	end)
+	if ok and type(decoded) == 'table' then
+		return decoded
+	end
+	return nil
+end
+
+local function resolveSavePath()
+	local state = getgenv()[GENV_KEY]
+	if state and type(state.path) == 'string' and state.path ~= '' then
+		return state.path
+	end
+	if type(isfile) == 'function' then
+		for _, path in ipairs(SAVE_CANDIDATES) do
+			local ok, exists = pcall(isfile, path)
+			if ok and exists then
+				return path
+			end
+		end
+	end
+	-- Prefer PlayerTools folder if it exists
+	if type(isfolder) == 'function' then
+		local ok, isDir = pcall(isfolder, 'PlayerTools')
+		if ok and isDir then
+			return 'PlayerTools/waypoints.json'
+		end
+	end
+	return 'waypoints.json'
+end
+
+local function ensureFolderFor(path)
+	local folder = path:match('^(.+)/[^/]+$')
+	if not folder or folder == '' then
+		return
+	end
+	if type(isfolder) == 'function' and type(makefolder) == 'function' then
+		local ok, exists = pcall(isfolder, folder)
+		if ok and not exists then
+			pcall(makefolder, folder)
+		end
+	end
+end
+
+local function defaultStore()
+	return {
+		version = 1,
+		waypoints = {},
+		selected = nil, -- name of the waypoint Combat solo-resume will TP to
+		guiPos = nil, -- panel { sx, ox, sy, oy }
+		guiSize = nil, -- panel { w, h }
+		widgetPos = nil, -- DEX chip { sx, ox, sy, oy }
+	}
+end
+
+local function udimFromSaved(pos, fallback)
+	if type(pos) == 'table' and type(pos.ox) == 'number' and type(pos.oy) == 'number' then
+		return UDim2.new(tonumber(pos.sx) or 0, pos.ox, tonumber(pos.sy) or 0, pos.oy)
+	end
+	return fallback
+end
+
+local MIN_PANEL_W = 240
+local MIN_PANEL_H = 220
+
+local function sizeFromSaved(size, fallbackW, fallbackH)
+	local w = fallbackW
+	local h = fallbackH
+	if type(size) == 'table' then
+		w = tonumber(size.w) or w
+		h = tonumber(size.h) or h
+	end
+	return math.max(MIN_PANEL_W, math.floor(w + 0.5)), math.max(MIN_PANEL_H, math.floor(h + 0.5))
+end
+
+local function captureGuiPos(frame)
+	local p = frame.Position
+	return {
+		sx = p.X.Scale,
+		ox = p.X.Offset,
+		sy = p.Y.Scale,
+		oy = p.Y.Offset,
+	}
+end
+
+local function loadStore()
+	local path = resolveSavePath()
+	local store = defaultStore()
+	if type(readfile) == 'function' and type(isfile) == 'function' then
+		local okExists, exists = pcall(isfile, path)
+		if okExists and exists then
+			local okRead, body = pcall(readfile, path)
+			if okRead and type(body) == 'string' and body ~= '' then
+				local decoded = jsonDecode(body)
+				if decoded and type(decoded.waypoints) == 'table' then
+					store = decoded
+					store.version = store.version or 1
+				elseif decoded and type(decoded) == 'table' and decoded[1] then
+					-- legacy array form
+					store.waypoints = decoded
+				end
+			end
+		end
+	end
+	getgenv()[GENV_KEY] = {
+		path = path,
+		store = store,
+	}
+	return store, path
+end
+
+local function saveStore()
+	local state = getgenv()[GENV_KEY]
+	if not state or type(state.store) ~= 'table' then
+		loadStore()
+		state = getgenv()[GENV_KEY]
+	end
+	local path = state.path or resolveSavePath()
+	state.path = path
+	ensureFolderFor(path)
+	local encoded = jsonEncode(state.store)
+	if not encoded then
+		say('JSON encode failed')
+		return false
+	end
+	if type(writefile) ~= 'function' then
+		say('writefile unavailable — cannot save')
+		return false
+	end
+	local ok, err = pcall(writefile, path, encoded)
+	if not ok then
+		say('save failed: ' .. tostring(err))
+		return false
+	end
+	return true
+end
+
+local function persistGuiLayout(frame)
+	local state = getgenv()[GENV_KEY]
+	if not state or type(state.store) ~= 'table' or not frame then
+		return
+	end
+	state.store.guiPos = captureGuiPos(frame)
+	local sz = frame.AbsoluteSize
+	state.store.guiSize = {
+		w = math.max(MIN_PANEL_W, math.floor((sz.X > 0 and sz.X or frame.Size.X.Offset) + 0.5)),
+		h = math.max(MIN_PANEL_H, math.floor((sz.Y > 0 and sz.Y or frame.Size.Y.Offset) + 0.5)),
+	}
+	pcall(saveStore)
+end
+
+local function persistWidgetPos(widget)
+	local state = getgenv()[GENV_KEY]
+	if not state or type(state.store) ~= 'table' then
+		return
+	end
+	state.store.widgetPos = captureGuiPos(widget)
+	pcall(saveStore)
+end
+
+local function setWaypointsPanelOpen(open)
+	local gui = getgenv()[GENV_GUI]
+	if not gui then
+		return
+	end
+	local panel = gui:FindFirstChild('Main')
+	if panel then
+		panel.Visible = open == true
+	end
+end
+
+local function getRoot()
+	local char = LocalPlayer and LocalPlayer.Character
+	if not char then
+		return nil
+	end
+	return char:FindFirstChild('HumanoidRootPart')
+		or char:FindFirstChild('Torso')
+		or char.PrimaryPart
+end
+
+local function currentCFrame()
+	local root = getRoot()
+	if root then
+		return root.CFrame
+	end
+	local char = LocalPlayer and LocalPlayer.Character
+	if char and char.GetPivot then
+		return char:GetPivot()
+	end
+	return nil
+end
+
+local function teleportTo(cf)
+	local char = LocalPlayer and LocalPlayer.Character
+	if not char then
+		return false, 'no character'
+	end
+	if type(getgenv().SB2HoldCombatAnchor) == 'function' then
+		pcall(getgenv().SB2HoldCombatAnchor, 4)
+	end
+	local root = getRoot()
+	pcall(function()
+		if root then
+			root.Anchored = false
+		end
+	end)
+	local RunService = game:GetService('RunService')
+	for _ = 1, 4 do
+		RunService.Heartbeat:Wait()
+		pcall(function()
+			if root then
+				root.Anchored = false
+			end
+		end)
+	end
+	local ok = pcall(function()
+		if char.PivotTo then
+			char:PivotTo(cf)
+		end
+		if root then
+			root.Anchored = false
+			root.CFrame = cf
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		elseif not char.PivotTo then
+			error('no root')
+		end
+	end)
+	if ok and type(getgenv().SB2HoldCombatAnchor) == 'function' then
+		pcall(getgenv().SB2HoldCombatAnchor, 4)
+	end
+	-- PlayerTools / death / spectate can leave CameraSubject on the Model → void cam.
+	task.defer(function()
+		if type(getgenv().SB2FixCamera) == 'function' then
+			pcall(getgenv().SB2FixCamera, char)
+			return
+		end
+		local cam = workspace.CurrentCamera
+		local hum = char and char:FindFirstChildOfClass('Humanoid')
+		if cam and hum then
+			pcall(function()
+				cam.CameraType = Enum.CameraType.Custom
+				cam.CameraSubject = hum
+			end)
+		end
+	end)
+	return ok, ok and nil or 'teleport failed'
+end
+
+local function normalizeName(name)
+	name = tostring(name or ''):gsub('^%s+', ''):gsub('%s+$', '')
+	if name == '' then
+		return nil
+	end
+	return name
+end
+
+local function placeId()
+	return game.PlaceId
+end
+
+local function findWaypoint(name, anyPlace)
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	name = normalizeName(name)
+	if not name then
+		return nil, nil
+	end
+	local lname = string.lower(name)
+	local pid = placeId()
+	for i, wp in ipairs(store.waypoints) do
+		if type(wp) == 'table' and type(wp.name) == 'string' and string.lower(wp.name) == lname then
+			if anyPlace or tonumber(wp.placeId) == pid or wp.placeId == nil then
+				return wp, i
+			end
+		end
+	end
+	-- second pass: same name any place
+	for i, wp in ipairs(store.waypoints) do
+		if type(wp) == 'table' and type(wp.name) == 'string' and string.lower(wp.name) == lname then
+			return wp, i
+		end
+	end
+	return nil, nil
+end
+
+local function listForPlace(showAll)
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	local pid = placeId()
+	local out = {}
+	for _, wp in ipairs(store.waypoints) do
+		if type(wp) == 'table' and type(wp.name) == 'string' then
+			if showAll or tonumber(wp.placeId) == pid or wp.placeId == nil then
+				out[#out + 1] = wp
+			end
+		end
+	end
+	table.sort(out, function(a, b)
+		return string.lower(a.name) < string.lower(b.name)
+	end)
+	return out
+end
+
+local function upsertWaypoint(name, cf, extra)
+	name = normalizeName(name)
+	if not name then
+		return false, 'name required'
+	end
+	if not cf then
+		cf = currentCFrame()
+	end
+	if not cf then
+		return false, 'no position'
+	end
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	local existing, idx = findWaypoint(name, false)
+	local entry = {
+		name = name,
+		x = cf.Position.X,
+		y = cf.Position.Y,
+		z = cf.Position.Z,
+		placeId = placeId(),
+		updated = os.time(),
+	}
+	if extra and type(extra) == 'table' then
+		for k, v in pairs(extra) do
+			entry[k] = v
+		end
+	end
+	if existing and idx then
+		store.waypoints[idx] = entry
+	else
+		store.waypoints[#store.waypoints + 1] = entry
+	end
+	if not saveStore() then
+		return false, 'save failed'
+	end
+	return true, entry
+end
+
+local function deleteWaypoint(name)
+	name = normalizeName(name)
+	if not name then
+		return false, 'name required'
+	end
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	local _, idx = findWaypoint(name, true)
+	if not idx then
+		return false, 'not found'
+	end
+	table.remove(store.waypoints, idx)
+	if not saveStore() then
+		return false, 'save failed'
+	end
+	return true
+end
+
+local function clearPlaceWaypoints()
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	local pid = placeId()
+	local kept = {}
+	local removed = 0
+	for _, wp in ipairs(store.waypoints) do
+		if type(wp) == 'table' and tonumber(wp.placeId) == pid then
+			removed += 1
+		else
+			kept[#kept + 1] = wp
+		end
+	end
+	store.waypoints = kept
+	saveStore()
+	return removed
+end
+
+local function wpCFrame(wp)
+	return CFrame.new(tonumber(wp.x) or 0, tonumber(wp.y) or 0, tonumber(wp.z) or 0)
+end
+
+local refreshGui
+
+local function teleportNamed(name)
+	local wp = findWaypoint(name, true)
+	if not wp then
+		return false, 'waypoint not found'
+	end
+	local ok, err = teleportTo(wpCFrame(wp))
+	return ok, err
+end
+
+local function getSelectedName()
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	local name = normalizeName(store.selected)
+	if not name then
+		return nil
+	end
+	local wp = findWaypoint(name, false)
+	if not wp then
+		wp = findWaypoint(name, true)
+	end
+	return wp and wp.name or name, wp
+end
+
+local function setSelectedName(name, skipCallback)
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	name = normalizeName(name)
+	if store.selected == name then
+		return name
+	end
+	store.selected = name
+	pcall(saveStore)
+	if refreshGui and getgenv()[GENV_GUI] and getgenv()[GENV_GUI].Parent then
+		pcall(refreshGui)
+	end
+	if not skipCallback then
+		local cb = getgenv().SB2OnWaypointSelected
+		if type(cb) == 'function' then
+			pcall(cb, name)
+		end
+	end
+	return name
+end
+
+local function teleportSelected()
+	local name, wp = getSelectedName()
+	if not wp then
+		return false, 'no waypoint selected'
+	end
+	return teleportTo(wpCFrame(wp))
+end
+
+-- ── GUI ──────────────────────────────────────────────────────────────────────
+
+local function disconnectOld()
+	local conns = getgenv()[GENV_CONNS]
+	if type(conns) == 'table' then
+		for _, c in ipairs(conns) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+	end
+	getgenv()[GENV_CONNS] = {}
+end
+
+local function track(conn)
+	local conns = getgenv()[GENV_CONNS]
+	if type(conns) ~= 'table' then
+		conns = {}
+		getgenv()[GENV_CONNS] = conns
+	end
+	conns[#conns + 1] = conn
+	return conn
+end
+
+local function destroyGui()
+	disconnectOld()
+	local gui = getgenv()[GENV_GUI]
+	if gui and gui.Parent then
+		pcall(function()
+			gui:Destroy()
+		end)
+	end
+	getgenv()[GENV_GUI] = nil
+end
+
+local showAllPlaces = false
+
+local function parentGui()
+	local ok, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and hui then
+		return hui
+	end
+	local cg = game:GetService('CoreGui')
+	local pg = LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui')
+	return cg or pg
+end
+
+local function loadPillDock()
+	if type(getgenv().SB2RegisterPill) == 'function' then
+		return true
+	end
+	for _, path in ipairs({ 'PlayerTools/PillDock.lua', 'PillDock.lua' }) do
+		local ok, src = pcall(function()
+			return readfile(path)
+		end)
+		if ok and type(src) == 'string' and #src > 50 then
+			local okLoad = pcall(function()
+				assert(loadstring(src))()
+			end)
+			if okLoad and type(getgenv().SB2RegisterPill) == 'function' then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function registerWpPill()
+	if not loadPillDock() then
+		return nil
+	end
+	return getgenv().SB2RegisterPill({
+		id = 'WP',
+		text = 'WP',
+		textColor = Color3.fromRGB(180, 230, 190),
+		strokeColor = Color3.fromRGB(70, 110, 80),
+		onClick = function()
+			local toggle = getgenv().SB2WaypointsToggleGui
+			if type(toggle) == 'function' then
+				toggle()
+				return
+			end
+			-- Fallback if toggle not exported yet.
+			local gui = getgenv()[GENV_GUI]
+			local frame = gui and gui:FindFirstChild('Main')
+			if frame then
+				frame.Visible = not frame.Visible
+			end
+		end,
+	})
+end
+
+local function makeResizable(frame, onEnd)
+	local grip = Instance.new('TextButton')
+	grip.Name = 'Resize'
+	grip.Size = UDim2.fromOffset(18, 18)
+	grip.Position = UDim2.new(1, -20, 1, -20)
+	grip.BackgroundColor3 = Color3.fromRGB(50, 56, 66)
+	grip.BorderSizePixel = 0
+	grip.AutoButtonColor = true
+	grip.Text = ''
+	grip.ZIndex = 5
+	grip.Parent = frame
+	Instance.new('UICorner', grip).CornerRadius = UDim.new(0, 4)
+	local mark = Instance.new('TextLabel')
+	mark.BackgroundTransparency = 1
+	mark.Size = UDim2.fromScale(1, 1)
+	mark.Font = Enum.Font.GothamBold
+	mark.TextSize = 11
+	mark.TextColor3 = Color3.fromRGB(160, 170, 185)
+	mark.Text = '⌟'
+	mark.ZIndex = 6
+	mark.Parent = grip
+
+	local resizing = false
+	local dragStart, startSize
+	local function endResize()
+		if not resizing then
+			return
+		end
+		resizing = false
+		if onEnd then
+			onEnd()
+		end
+	end
+	track(grip.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			resizing = true
+			dragStart = input.Position
+			startSize = frame.AbsoluteSize
+		end
+	end))
+	track(grip.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endResize()
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endResize()
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if not resizing or not dragStart or not startSize then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			local cam = workspace.CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+			local w = math.clamp(startSize.X + delta.X, MIN_PANEL_W, math.max(MIN_PANEL_W, vp.X - 16))
+			local h = math.clamp(startSize.Y + delta.Y, MIN_PANEL_H, math.max(MIN_PANEL_H, vp.Y - 16))
+			frame.Size = UDim2.fromOffset(math.floor(w + 0.5), math.floor(h + 0.5))
+		end
+	end))
+	return grip
+end
+
+local function buildGui()
+	destroyGui()
+	loadStore()
+
+	local gui = Instance.new('ScreenGui')
+	gui.Name = 'SB2WaypointsGui'
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.DisplayOrder = 100
+	pcall(function()
+		gui.Parent = parentGui()
+	end)
+	if not gui.Parent then
+		gui.Parent = LocalPlayer:WaitForChild('PlayerGui')
+	end
+	getgenv()[GENV_GUI] = gui
+	pcall(registerWpPill)
+
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or defaultStore()
+
+	-- Pill lives in shared SB2PillDock — panel only here.
+	local frame = Instance.new('Frame')
+	frame.Name = 'Main'
+	local savedW, savedH = sizeFromSaved(store.guiSize, 320, 420)
+	frame.Size = UDim2.fromOffset(savedW, savedH)
+	frame.Position = udimFromSaved(store.guiPos, UDim2.new(1, -340, 0, 114))
+	frame.BackgroundColor3 = Color3.fromRGB(22, 24, 28)
+	frame.BorderSizePixel = 0
+	frame.Active = true
+	frame.Visible = false
+	frame.Parent = gui
+
+	local corner = Instance.new('UICorner')
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = frame
+
+	local stroke = Instance.new('UIStroke')
+	stroke.Color = Color3.fromRGB(55, 60, 70)
+	stroke.Thickness = 1
+	stroke.Parent = frame
+
+	local title = Instance.new('TextButton')
+	title.Name = 'Title'
+	title.BackgroundTransparency = 1
+	title.AutoButtonColor = false
+	title.Size = UDim2.new(1, -90, 0, 36)
+	title.Position = UDim2.fromOffset(14, 6)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = Color3.fromRGB(235, 238, 245)
+	title.Text = 'Waypoints  (drag · ⌟ resize)'
+	title.Parent = frame
+
+	local pathLabel = Instance.new('TextLabel')
+	pathLabel.Name = 'Path'
+	pathLabel.BackgroundTransparency = 1
+	pathLabel.Size = UDim2.new(1, -20, 0, 16)
+	pathLabel.Position = UDim2.fromOffset(14, 34)
+	pathLabel.Font = Enum.Font.Gotham
+	pathLabel.TextSize = 11
+	pathLabel.TextXAlignment = Enum.TextXAlignment.Left
+	pathLabel.TextColor3 = Color3.fromRGB(140, 148, 160)
+	pathLabel.Text = tostring((getgenv()[GENV_KEY] and getgenv()[GENV_KEY].path) or '')
+	pathLabel.Parent = frame
+
+	local closeBtn = Instance.new('TextButton')
+	closeBtn.Name = 'Close'
+	closeBtn.Size = UDim2.fromOffset(28, 28)
+	closeBtn.Position = UDim2.new(1, -36, 0, 8)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+	closeBtn.Text = 'X'
+	closeBtn.Font = Enum.Font.GothamBold
+	closeBtn.TextSize = 14
+	closeBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+	closeBtn.Parent = frame
+	Instance.new('UICorner', closeBtn).CornerRadius = UDim.new(0, 6)
+	track(closeBtn.MouseButton1Click:Connect(function()
+		setWaypointsPanelOpen(false)
+	end))
+
+	-- Destroy leftover solo WP chip from older builds.
+	pcall(function()
+		local old = gui:FindFirstChild('Widget')
+		if old then
+			old:Destroy()
+		end
+	end)
+
+	local nameBox = Instance.new('TextBox')
+	nameBox.Name = 'NameBox'
+	nameBox.Size = UDim2.new(1, -20, 0, 30)
+	nameBox.Position = UDim2.fromOffset(10, 56)
+	nameBox.BackgroundColor3 = Color3.fromRGB(32, 36, 44)
+	nameBox.PlaceholderText = 'waypoint name'
+	nameBox.Text = ''
+	nameBox.ClearTextOnFocus = false
+	nameBox.Font = Enum.Font.Gotham
+	nameBox.TextSize = 14
+	nameBox.TextColor3 = Color3.fromRGB(230, 230, 240)
+	nameBox.PlaceholderColor3 = Color3.fromRGB(110, 118, 130)
+	nameBox.Parent = frame
+	Instance.new('UICorner', nameBox).CornerRadius = UDim.new(0, 6)
+
+	local addBtn = Instance.new('TextButton')
+	addBtn.Name = 'Add'
+	addBtn.Size = UDim2.new(0.5, -14, 0, 30)
+	addBtn.Position = UDim2.fromOffset(10, 92)
+	addBtn.BackgroundColor3 = Color3.fromRGB(46, 120, 84)
+	addBtn.Text = 'Save here'
+	addBtn.Font = Enum.Font.GothamMedium
+	addBtn.TextSize = 13
+	addBtn.TextColor3 = Color3.fromRGB(240, 245, 240)
+	addBtn.Parent = frame
+	Instance.new('UICorner', addBtn).CornerRadius = UDim.new(0, 6)
+
+	local allBtn = Instance.new('TextButton')
+	allBtn.Name = 'ShowAll'
+	allBtn.Size = UDim2.new(0.5, -14, 0, 30)
+	allBtn.Position = UDim2.new(0.5, 4, 0, 92)
+	allBtn.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+	allBtn.Text = 'This place'
+	allBtn.Font = Enum.Font.GothamMedium
+	allBtn.TextSize = 13
+	allBtn.TextColor3 = Color3.fromRGB(220, 225, 235)
+	allBtn.Parent = frame
+	Instance.new('UICorner', allBtn).CornerRadius = UDim.new(0, 6)
+
+	local list = Instance.new('ScrollingFrame')
+	list.Name = 'List'
+	list.Size = UDim2.new(1, -20, 1, -158)
+	list.Position = UDim2.fromOffset(10, 130)
+	list.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 4
+	list.CanvasSize = UDim2.new(0, 0, 0, 0)
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Parent = frame
+	Instance.new('UICorner', list).CornerRadius = UDim.new(0, 8)
+
+	local layout = Instance.new('UIListLayout')
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	local pad = Instance.new('UIPadding')
+	pad.PaddingTop = UDim.new(0, 6)
+	pad.PaddingBottom = UDim.new(0, 6)
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.Parent = list
+
+	local status = Instance.new('TextLabel')
+	status.Name = 'Status'
+	status.BackgroundTransparency = 1
+	status.Size = UDim2.new(1, -40, 0, 18)
+	status.Position = UDim2.new(0, 10, 1, -42)
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 11
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.TextColor3 = Color3.fromRGB(140, 148, 160)
+	status.Text = ''
+	status.Parent = frame
+
+	-- Drag (position saved on release)
+	do
+		local dragging = false
+		local dragStart, startPos
+		local function endDrag()
+			if not dragging then
+				return
+			end
+			dragging = false
+			persistGuiLayout(frame)
+		end
+		track(title.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				dragStart = input.Position
+				startPos = frame.Position
+			end
+		end))
+		track(title.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				endDrag()
+			end
+		end))
+		track(UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				endDrag()
+			end
+		end))
+		track(UserInputService.InputChanged:Connect(function(input)
+			if not dragging then
+				return
+			end
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				local delta = input.Position - dragStart
+				frame.Position = UDim2.new(
+					startPos.X.Scale,
+					startPos.X.Offset + delta.X,
+					startPos.Y.Scale,
+					startPos.Y.Offset + delta.Y
+				)
+			end
+		end))
+	end
+
+	makeResizable(frame, function()
+		persistGuiLayout(frame)
+	end)
+
+	local function setStatus(t)
+		status.Text = tostring(t or '')
+	end
+
+	refreshGui = function()
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA('Frame') then
+				child:Destroy()
+			end
+		end
+		local items = listForPlace(showAllPlaces)
+		allBtn.Text = showAllPlaces and 'All places' or 'This place'
+		pathLabel.Text = tostring((getgenv()[GENV_KEY] and getgenv()[GENV_KEY].path) or '')
+		setStatus(('%d saved · PlaceId %s'):format(#items, tostring(placeId())))
+
+		local selectedName = select(1, getSelectedName())
+		for i, wp in ipairs(items) do
+			local isSelected = selectedName and string.lower(wp.name) == string.lower(selectedName)
+			local row = Instance.new('Frame')
+			row.Name = 'WP_' .. wp.name
+			row.Size = UDim2.new(1, -4, 0, 64)
+			row.BackgroundColor3 = isSelected and Color3.fromRGB(42, 72, 58) or Color3.fromRGB(36, 40, 48)
+			row.BorderSizePixel = 0
+			row.LayoutOrder = i
+			row.Parent = list
+			Instance.new('UICorner', row).CornerRadius = UDim.new(0, 6)
+			if isSelected then
+				local stroke = Instance.new('UIStroke')
+				stroke.Color = Color3.fromRGB(70, 170, 110)
+				stroke.Thickness = 1
+				stroke.Parent = row
+			end
+
+			local coords = string.format('%.0f, %.0f, %.0f', wp.x or 0, wp.y or 0, wp.z or 0)
+			local otherPlace = showAllPlaces and wp.placeId and tonumber(wp.placeId) ~= placeId()
+
+			local nameLabel = Instance.new('TextButton')
+			nameLabel.Name = 'Name'
+			nameLabel.BackgroundTransparency = 1
+			nameLabel.Size = UDim2.new(1, -12, 0, 18)
+			nameLabel.Position = UDim2.fromOffset(8, 4)
+			nameLabel.Font = Enum.Font.GothamBold
+			nameLabel.TextSize = 13
+			nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+			nameLabel.TextColor3 = otherPlace and Color3.fromRGB(170, 175, 190) or Color3.fromRGB(235, 238, 245)
+			nameLabel.Text = wp.name
+				.. (isSelected and '  · selected' or '')
+				.. (otherPlace and '  (other place)' or '')
+			nameLabel.AutoButtonColor = false
+			nameLabel.Parent = row
+
+			local coordLabel = Instance.new('TextLabel')
+			coordLabel.Name = 'Coords'
+			coordLabel.BackgroundTransparency = 1
+			coordLabel.Size = UDim2.new(1, -12, 0, 14)
+			coordLabel.Position = UDim2.fromOffset(8, 22)
+			coordLabel.Font = Enum.Font.Gotham
+			coordLabel.TextSize = 11
+			coordLabel.TextXAlignment = Enum.TextXAlignment.Left
+			coordLabel.TextColor3 = Color3.fromRGB(140, 148, 160)
+			coordLabel.Text = coords
+			coordLabel.Parent = row
+
+			local tp = Instance.new('TextButton')
+			tp.Name = 'Teleport'
+			tp.Size = UDim2.new(0.5, -10, 0, 22)
+			tp.Position = UDim2.fromOffset(6, 38)
+			tp.BackgroundColor3 = Color3.fromRGB(46, 120, 84)
+			tp.Text = 'Teleport'
+			tp.Font = Enum.Font.GothamMedium
+			tp.TextSize = 12
+			tp.TextColor3 = Color3.fromRGB(240, 245, 240)
+			tp.AutoButtonColor = true
+			tp.Parent = row
+			Instance.new('UICorner', tp).CornerRadius = UDim.new(0, 5)
+
+			local del = Instance.new('TextButton')
+			del.Name = 'Delete'
+			del.Size = UDim2.new(0.5, -10, 0, 22)
+			del.Position = UDim2.new(0.5, 4, 0, 38)
+			del.BackgroundColor3 = Color3.fromRGB(140, 55, 60)
+			del.Text = 'Delete'
+			del.Font = Enum.Font.GothamMedium
+			del.TextSize = 12
+			del.TextColor3 = Color3.fromRGB(245, 230, 230)
+			del.AutoButtonColor = true
+			del.Parent = row
+			Instance.new('UICorner', del).CornerRadius = UDim.new(0, 5)
+
+			track(nameLabel.MouseButton1Click:Connect(function()
+				setSelectedName(wp.name)
+				setStatus('Selected → ' .. wp.name)
+			end))
+
+			track(tp.MouseButton1Click:Connect(function()
+				local ok, err = teleportTo(wpCFrame(wp))
+				if ok then
+					setStatus('Teleported → ' .. wp.name)
+				else
+					setStatus(tostring(err))
+					say(err)
+				end
+			end))
+
+			track(del.MouseButton1Click:Connect(function()
+				local ok, err = deleteWaypoint(wp.name)
+				if ok then
+					setStatus('Deleted ' .. wp.name)
+					refreshGui()
+				else
+					setStatus(tostring(err))
+				end
+			end))
+		end
+	end
+
+	track(addBtn.MouseButton1Click:Connect(function()
+		local name = normalizeName(nameBox.Text)
+		if not name then
+			name = 'wp_' .. tostring(os.time() % 100000)
+			nameBox.Text = name
+		end
+		local ok, result = upsertWaypoint(name)
+		if ok then
+			setStatus('Saved ' .. name)
+			refreshGui()
+		else
+			setStatus(tostring(result))
+			say(result)
+		end
+	end))
+
+	track(allBtn.MouseButton1Click:Connect(function()
+		showAllPlaces = not showAllPlaces
+		refreshGui()
+	end))
+
+	refreshGui()
+	return gui
+end
+
+local function toggleGui()
+	local gui = getgenv()[GENV_GUI]
+	if not (gui and gui.Parent) then
+		buildGui()
+	else
+		pcall(registerWpPill)
+		pcall(function()
+			local old = gui:FindFirstChild('Widget')
+			if old then
+				old:Destroy()
+			end
+		end)
+	end
+	gui = getgenv()[GENV_GUI]
+	local panel = gui and gui:FindFirstChild('Main')
+	local open = not (panel and panel.Visible)
+	setWaypointsPanelOpen(open)
+	if open and refreshGui then
+		refreshGui()
+	end
+	return open
+end
+
+getgenv().SB2WaypointsRefreshGui = function()
+	if refreshGui and getgenv()[GENV_GUI] and getgenv()[GENV_GUI].Parent then
+		refreshGui()
+	end
+end
+getgenv().SB2WaypointsGetSelected = getSelectedName
+getgenv().SB2WaypointsSetSelected = setSelectedName
+getgenv().SB2WaypointsTeleportSelected = teleportSelected
+getgenv().SB2WaypointsTeleportNamed = teleportNamed
+getgenv().SB2WaypointsListForPlace = function()
+	local names = {}
+	for _, wp in ipairs(listForPlace(false)) do
+		names[#names + 1] = wp.name
+	end
+	return names
+end
+
+getgenv().SB2WaypointsToggleGui = toggleGui
+getgenv().SB2WaypointsOpenGui = function()
+	local gui = getgenv()[GENV_GUI]
+	if not (gui and gui.Parent) then
+		buildGui()
+	else
+		pcall(registerWpPill)
+		pcall(function()
+			local old = gui:FindFirstChild('Widget')
+			if old then
+				old:Destroy()
+			end
+		end)
+	end
+	-- Boot / open = ensure chip exists; keep panel collapsed unless already open.
+	return true
+end
+
+-- Load store on plugin load
+loadStore()
+
+-- Boot: register WP into shared pill dock (even if an old GUI already exists).
+do
+	getgenv().SB2WaypointsBooted = true
+	task.defer(function()
+		pcall(saveStore)
+		pcall(buildGui)
+		setWaypointsPanelOpen(false)
+	end)
+end
+
+local Plugin = {
+	['PluginName'] = 'Waypoints',
+	['PluginDescription'] = 'Device-saved waypoints + click-to-TP GUI (replaces IY session waypoints)',
+	['Commands'] = {
+		['wpgui'] = {
+			['ListName'] = 'wpgui / waypointsgui',
+			['Description'] = 'Toggle waypoints panel (or click the WP chip)',
+			['Aliases'] = { 'waypointsgui', 'wpg', 'waypointgui' },
+			['Function'] = function()
+				if toggleGui() then
+					say('waypoints panel open')
+				else
+					say('waypoints panel closed')
+				end
+			end,
+		},
+		['setwp'] = {
+			['ListName'] = 'setwp / swp / setwaypoint [name]',
+			['Description'] = 'Save your current position to disk',
+			['Aliases'] = { 'swp', 'setwaypoint', 'savewp', 'addwp' },
+			['Function'] = function(args)
+				local name = args and args[1]
+				if not name or name == '' then
+					say('usage: setwp [name]')
+					return
+				end
+				local ok, result = upsertWaypoint(name)
+				if ok then
+					say(('saved "%s" → %.1f, %.1f, %.1f'):format(name, result.x, result.y, result.z))
+					if getgenv().SB2WaypointsRefreshGui then
+						getgenv().SB2WaypointsRefreshGui()
+					end
+				else
+					say(tostring(result))
+				end
+			end,
+		},
+		['waypoint'] = {
+			['ListName'] = 'waypoint / wp [name]',
+			['Description'] = 'Teleport to a saved waypoint',
+			['Aliases'] = { 'wp', 'gotowp', 'tptowp' },
+			['Function'] = function(args)
+				local name = args and args[1]
+				if not name or name == '' then
+					toggleGui()
+					say('usage: waypoint [name] (opened GUI)')
+					return
+				end
+				local ok, err = teleportNamed(name)
+				if ok then
+					say('teleported → ' .. name)
+				else
+					say(tostring(err))
+				end
+			end,
+		},
+		['waypoints'] = {
+			['ListName'] = 'waypoints / wps',
+			['Description'] = 'List saved waypoints and open the GUI',
+			['Aliases'] = { 'wps', 'listwp', 'listwaypoints' },
+			['Function'] = function()
+				local items = listForPlace(false)
+				if #items == 0 then
+					say('no waypoints for this place — use setwp [name]')
+				else
+					local names = {}
+					for i = 1, math.min(12, #items) do
+						names[#names + 1] = items[i].name
+					end
+					say(('this place (%d): %s%s'):format(
+						#items,
+						table.concat(names, ', '),
+						#items > 12 and '…' or ''
+					))
+				end
+				buildGui()
+			end,
+		},
+		['deletewp'] = {
+			['ListName'] = 'deletewp / dwp [name]',
+			['Description'] = 'Delete a saved waypoint from disk',
+			['Aliases'] = { 'dwp', 'delwp', 'removewp', 'deletewaypoint' },
+			['Function'] = function(args)
+				local name = args and args[1]
+				if not name or name == '' then
+					say('usage: deletewp [name]')
+					return
+				end
+				local ok, err = deleteWaypoint(name)
+				if ok then
+					say('deleted ' .. name)
+					if getgenv().SB2WaypointsRefreshGui then
+						getgenv().SB2WaypointsRefreshGui()
+					end
+				else
+					say(tostring(err))
+				end
+			end,
+		},
+		['clearwps'] = {
+			['ListName'] = 'clearwps',
+			['Description'] = 'Delete all waypoints for the current PlaceId',
+			['Aliases'] = { 'clearwaypoints', 'wpclear' },
+			['Function'] = function()
+				local n = clearPlaceWaypoints()
+				say(('cleared %d waypoints for this place'):format(n))
+				if getgenv().SB2WaypointsRefreshGui then
+					getgenv().SB2WaypointsRefreshGui()
+				end
+			end,
+		},
+		['wpexport'] = {
+			['ListName'] = 'wpexport',
+			['Description'] = 'Print the save path and waypoint count',
+			['Aliases'] = { 'wppath' },
+			['Function'] = function()
+				local store, path = loadStore()
+				say(('%s — %d waypoints'):format(path, #(store.waypoints or {})))
+			end,
+		},
+	},
+}
+
+return Plugin

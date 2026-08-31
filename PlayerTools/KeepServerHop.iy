@@ -1,0 +1,24 @@
+--[[
+    KeepServerHop.iy — legacy stub
+    Old ServerHop used this to resume hop-until-fresh after teleport.
+    New ServerHop is one-shot (join F11) and no longer needs resume.
+
+    Safe to leave installed: it only clears leftover hop state.
+]]
+
+pcall(function()
+	if type(writefile) == 'function' then
+		local body = '{"active":false}'
+		pcall(writefile, 'PlayerTools/serverhop_state.json', body)
+		pcall(writefile, 'serverhop_state.json', body)
+	end
+	if type(getgenv) == 'function' then
+		getgenv().SB2ServerHop = { active = false }
+	end
+end)
+
+return {
+	['PluginName'] = 'KeepServerHop',
+	['PluginDescription'] = 'Legacy — clears old auto-hop state (join is one-shot now)',
+	['Commands'] = {},
+}

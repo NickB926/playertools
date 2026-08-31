@@ -1,0 +1,1186 @@
+--[[
+    ServerHop.iy — Infinite Yield plugin (Swordburst 2)
+    One-shot join any floor/place. No auto-rejoin / hop loop.
+
+    Install: workspace/ServerHop.iy → IY Plugins → Add → ServerHop
+
+    Examples:
+      join F11
+      join F1
+      hop Hypersiddia
+      join 5287433115
+      shlist / shgui     — toggle Join panel (DEX-style chip on load)
+]]
+
+local Players = game:GetService('Players')
+local TeleportService = game:GetService('TeleportService')
+local UserInputService = game:GetService('UserInputService')
+
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
+	or Players.LocalPlayer
+
+-- Kill any leftover "hop until fresh" state from older ServerHop versions.
+pcall(function()
+	if type(writefile) == 'function' then
+		local body = '{"active":false}'
+		pcall(writefile, 'PlayerTools/serverhop_state.json', body)
+		pcall(writefile, 'serverhop_state.json', body)
+	end
+	getgenv().SB2ServerHop = { active = false }
+end)
+
+local function say(text)
+	pcall(function()
+		game:GetService('StarterGui'):SetCore('SendNotification', {
+			Title = 'Join',
+			Text = tostring(text),
+			Duration = 4,
+		})
+	end)
+	warn('[Join] ' .. tostring(text))
+end
+
+local catalog = {
+	byAlias = {},
+	floors = {}, -- story F1..Fn (Main, excluding hubs)
+	all = {},
+	byCategory = {}, -- category -> { rec, ... }
+	placeIds = {}, -- [placeId] = true
+}
+
+-- Fallback only if Database.Locations can't be required this session.
+local HARD_STORY_FLOORS = {
+	{ placeId = 542351431, name = 'Virhst Woodlands', floor = 1 },
+	{ placeId = 548231754, name = 'Redveil Grove', floor = 2 },
+	{ placeId = 555980327, name = 'Avalanche Expanse', floor = 3 },
+	{ placeId = 572487908, name = 'Hidden Wilds', floor = 4 },
+	{ placeId = 580239979, name = 'Desolate Dunes', floor = 5 },
+	{ placeId = 566212942, name = 'Helmfirth', floor = 6 },
+	{ placeId = 582198062, name = 'Entoloma Gloomlands', floor = 7 },
+	{ placeId = 548878321, name = 'Blooming Plateau', floor = 8 },
+	{ placeId = 573267292, name = "Va' Rok", floor = 9 },
+	{ placeId = 2659143505, name = 'Transylvania', floor = 10 },
+	{ placeId = 5287433115, name = 'Hypersiddia', floor = 11 },
+	{ placeId = 6144637080, name = 'Sector - 235', floor = 12 },
+}
+
+local HUB_NAMES = {
+	['arcadia'] = true,
+	['battle arena'] = true,
+}
+
+local function addAlias(alias, entry)
+	if not alias or alias == '' then
+		return
+	end
+	catalog.byAlias[string.lower(tostring(alias))] = entry
+end
+
+local function requireLocationsModule()
+	local rs = game:GetService('ReplicatedStorage')
+	local db = rs:FindFirstChild('Database') or rs:WaitForChild('Database', 5)
+	local loc = db and (db:FindFirstChild('Locations') or db:WaitForChild('Locations', 5))
+	if not loc then
+		return nil, 'Database.Locations missing'
+	end
+	if not loc:IsA('ModuleScript') then
+		return loc, nil
+	end
+	local requirers = {}
+	pcall(function()
+		if getrenv and type(getrenv().require) == 'function' then
+			requirers[#requirers + 1] = getrenv().require
+		end
+	end)
+	if type(require) == 'function' then
+		requirers[#requirers + 1] = require
+	end
+	pcall(function()
+		if getrenv and getrenv().shared and type(getrenv().shared.require) == 'function' then
+			requirers[#requirers + 1] = getrenv().shared.require
+		end
+	end)
+	local lastErr = 'require failed'
+	for _, req in ipairs(requirers) do
+		local ok, res = pcall(req, loc)
+		if ok and type(res) == 'table' then
+			return res, nil
+		end
+		lastErr = tostring(res)
+	end
+	if typeof(decompile) == 'function' then
+		local okd, src = pcall(decompile, loc)
+		if okd and type(src) == 'string' and src ~= '' then
+			local fn, err = (loadstring or load)(src)
+			if fn then
+				local okr, res = pcall(fn)
+				if okr and type(res) == 'table' then
+					return res, nil
+				end
+				lastErr = tostring(res)
+			else
+				lastErr = tostring(err)
+			end
+		end
+	end
+	return nil, lastErr
+end
+
+local function collectPlaceEntries(data, into, seen)
+	if type(data) ~= 'table' or type(into) ~= 'table' then
+		return
+	end
+	seen = seen or {}
+	if seen[data] then
+		return
+	end
+	seen[data] = true
+
+	local function add(entry, keyName)
+		if typeof(entry) == 'Instance' then
+			local pidInst = entry:FindFirstChild('PlaceId')
+				or entry:FindFirstChild('placeId')
+				or entry:FindFirstChild('PlaceID')
+			local pid = pidInst and pidInst:IsA('ValueBase') and tonumber(pidInst.Value)
+			if pid then
+				local nameInst = entry:FindFirstChild('Name')
+				local catInst = entry:FindFirstChild('Category')
+				into[#into + 1] = {
+					PlaceId = pid,
+					Name = (nameInst and nameInst:IsA('ValueBase') and tostring(nameInst.Value)) or entry.Name,
+					Category = (catInst and catInst:IsA('ValueBase') and tostring(catInst.Value)) or '',
+					Hidden = false,
+					Locked = false,
+				}
+			end
+			return
+		end
+		if type(entry) ~= 'table' then
+			return
+		end
+		local pid = tonumber(entry.PlaceId or entry.placeId or entry.PlaceID or entry.Id or entry.id)
+		if pid then
+			into[#into + 1] = {
+				PlaceId = pid,
+				Name = entry.Name or entry.name or keyName or ('Place ' .. pid),
+				Category = entry.Category or entry.category or '',
+				Hidden = entry.Hidden == true or entry.hidden == true,
+				Locked = entry.Locked == true or entry.locked == true,
+				Unlocked = entry.Unlocked == true or entry.unlocked == true,
+			}
+			return
+		end
+		collectPlaceEntries(entry, into, seen)
+	end
+
+	if typeof(data) == 'Instance' then
+		for _, child in ipairs(data:GetChildren()) do
+			add(child, child.Name)
+		end
+		return
+	end
+
+	-- Prefer ordered floors array from Database.Locations (includes Event/Rotating/Boss).
+	local floors = data.floors or data.Floors
+	if type(floors) == 'table' then
+		local maxIdx = 0
+		for k in pairs(floors) do
+			if type(k) == 'number' and k > maxIdx then
+				maxIdx = k
+			end
+		end
+		if maxIdx > 0 then
+			for i = 1, maxIdx do
+				if floors[i] ~= nil then
+					add(floors[i], tostring(i))
+				end
+			end
+		else
+			for k, v in pairs(floors) do
+				add(v, type(k) == 'string' and k or nil)
+			end
+		end
+	end
+
+	local nested = data.Locations or data.places or data.Places
+	if type(nested) == 'table' then
+		for k, v in pairs(nested) do
+			add(v, type(k) == 'string' and k or nil)
+		end
+	end
+	for k, v in pairs(data) do
+		if k ~= 'floors' and k ~= 'Floors' and k ~= 'Locations' and k ~= 'places' and k ~= 'Places' then
+			add(v, type(k) == 'string' and k or nil)
+		end
+	end
+end
+
+local function rebuildCategories()
+	catalog.byCategory = {}
+	for _, rec in ipairs(catalog.all) do
+		local cat = tostring(rec.category or 'Other')
+		if cat == '' then
+			cat = 'Other'
+		end
+		local bag = catalog.byCategory[cat]
+		if not bag then
+			bag = {}
+			catalog.byCategory[cat] = bag
+		end
+		bag[#bag + 1] = rec
+	end
+end
+
+local function loadLocations()
+	catalog.byAlias = {}
+	catalog.floors = {}
+	catalog.all = {}
+	catalog.byCategory = {}
+	catalog.placeIds = {}
+
+	local data, err = requireLocationsModule()
+	if not data then
+		return false, err or 'Database.Locations missing'
+	end
+
+	local raw = {}
+	collectPlaceEntries(data, raw)
+
+	local mainFloor = 0
+	local seenPlace = {}
+	for _, entry in ipairs(raw) do
+		local placeId = tonumber(entry.PlaceId)
+		if placeId and not seenPlace[placeId] then
+			seenPlace[placeId] = true
+			local name = tostring(entry.Name or ('Place ' .. placeId))
+			local category = tostring(entry.Category or '')
+			local rec = {
+				placeId = placeId,
+				name = name,
+				category = category,
+				floor = nil,
+				hidden = entry.Hidden == true,
+				locked = entry.Locked == true,
+			}
+			catalog.placeIds[placeId] = true
+			local isHub = HUB_NAMES[string.lower(name)] == true
+			if category == 'Main' and not isHub then
+				mainFloor += 1
+				rec.floor = mainFloor
+				catalog.floors[mainFloor] = rec
+				addAlias('f' .. mainFloor, rec)
+				addAlias('floor' .. mainFloor, rec)
+				addAlias('floor ' .. mainFloor, rec)
+				addAlias(tostring(mainFloor), rec)
+			end
+			catalog.all[#catalog.all + 1] = rec
+			addAlias(name, rec)
+			addAlias(placeId, rec)
+			addAlias((name:gsub('%W', '')), rec)
+		end
+	end
+
+	rebuildCategories()
+
+	if #catalog.all == 0 then
+		return false, 'Locations module empty'
+	end
+	return true, #catalog.all
+end
+
+local function applyHardFloors()
+	for _, rec in ipairs(HARD_STORY_FLOORS) do
+		catalog.placeIds[rec.placeId] = true
+		if not catalog.floors[rec.floor] then
+			catalog.floors[rec.floor] = rec
+			addAlias('f' .. rec.floor, rec)
+			addAlias('floor' .. rec.floor, rec)
+			addAlias('floor ' .. rec.floor, rec)
+			addAlias(tostring(rec.floor), rec)
+			addAlias(rec.name, rec)
+			addAlias(rec.placeId, rec)
+			local seen = false
+			for _, existing in ipairs(catalog.all) do
+				if existing.placeId == rec.placeId then
+					seen = true
+					break
+				end
+			end
+			if not seen then
+				catalog.all[#catalog.all + 1] = rec
+			end
+		end
+	end
+	rebuildCategories()
+end
+
+local function publishCatalog()
+	getgenv().SB2ServerHopCatalog = catalog
+	getgenv().SB2LocationsPlaceIds = catalog.placeIds
+	getgenv().SB2IsSb2LocationPlace = function(placeId)
+		placeId = tonumber(placeId)
+		if not placeId then
+			return false
+		end
+		if catalog.placeIds[placeId] then
+			return true
+		end
+		-- Refresh once if empty / stale.
+		if #catalog.all == 0 then
+			loadLocations()
+			applyHardFloors()
+			getgenv().SB2ServerHopCatalog = catalog
+			getgenv().SB2LocationsPlaceIds = catalog.placeIds
+		end
+		return catalog.placeIds[placeId] == true
+	end
+end
+
+local function resolveTarget(raw)
+	if raw == nil or tostring(raw) == '' then
+		say('usage: join F11  (or shlist)')
+		return nil
+	end
+	local key = string.lower(tostring(raw):gsub('^%s+', ''):gsub('%s+$', ''))
+	local fnum = key:match('^f%-?(%d+)$') or key:match('^floor%-?(%d+)$') or key:match('^floor%s+(%d+)$')
+	if fnum then
+		local rec = catalog.floors[tonumber(fnum)]
+		if rec then
+			return rec
+		end
+		say('unknown floor F' .. tostring(fnum) .. ' — try shlist')
+		return nil
+	end
+	local rec = catalog.byAlias[key] or catalog.byAlias[key:gsub('%W', '')]
+	if rec then
+		return rec
+	end
+	local asNum = tonumber(key)
+	if asNum then
+		return catalog.byAlias[tostring(asNum)] or {
+			placeId = asNum,
+			name = 'Place ' .. asNum,
+			floor = nil,
+			category = '',
+		}
+	end
+	return nil
+end
+
+local function joinPlace(target)
+	if not target or not target.placeId then
+		return false
+	end
+	if tonumber(target.placeId) == game.PlaceId then
+		say('already on ' .. tostring(target.name))
+		return false
+	end
+	local label = target.floor and ('F' .. target.floor .. ' ' .. target.name) or target.name
+	say('joining ' .. label .. '...')
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	local ok, err = pcall(function()
+		TeleportService:Teleport(target.placeId, LocalPlayer)
+	end)
+	if not ok then
+		say('teleport failed: ' .. tostring(err))
+		return false
+	end
+	return true
+end
+
+local function joinFromArgs(args)
+	local raw = args and table.concat(args, ' ') or ''
+	local target = resolveTarget(raw)
+	if not target then
+		if raw ~= '' then
+			say('unknown: ' .. tostring(raw) .. ' — try shlist')
+		end
+		return
+	end
+	joinPlace(target)
+end
+
+getgenv().SB2ServerHopBooted = true
+local okLoad, loadInfo = loadLocations()
+applyHardFloors()
+publishCatalog()
+getgenv().SB2ServerHopResolveTarget = resolveTarget
+getgenv().SB2EnsureServerHopCatalog = function()
+	if #catalog.all == 0 then
+		okLoad, loadInfo = loadLocations()
+	end
+	applyHardFloors()
+	publishCatalog()
+	return catalog
+end
+if okLoad then
+	warn(('[Join] Database.Locations — %s places, %s story floors'):format(
+		tostring(loadInfo),
+		tostring(#catalog.floors)
+	))
+else
+	okLoad = #catalog.floors > 0
+	loadInfo = okLoad and 'hardcoded floors' or loadInfo
+	warn('[Join] ' .. tostring(loadInfo))
+end
+
+local function parentGui()
+	local ok, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and hui then
+		return hui
+	end
+	return game:GetService('CoreGui') or (LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui'))
+end
+
+local function loadPillDock()
+	if type(getgenv().SB2RegisterPill) == 'function' then
+		return true
+	end
+	for _, path in ipairs({ 'PlayerTools/PillDock.lua', 'PillDock.lua' }) do
+		local ok, src = pcall(function()
+			return readfile(path)
+		end)
+		if ok and type(src) == 'string' and #src > 50 then
+			local okLoad = pcall(function()
+				assert(loadstring(src))()
+			end)
+			if okLoad and type(getgenv().SB2RegisterPill) == 'function' then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function registerJoinPill()
+	if not loadPillDock() then
+		return nil
+	end
+	return getgenv().SB2RegisterPill({
+		id = 'Join',
+		text = 'Join',
+		textColor = Color3.fromRGB(200, 220, 255),
+		strokeColor = Color3.fromRGB(70, 90, 120),
+		onClick = function()
+			local toggle = getgenv().SB2ServerHopToggleGui
+			if type(toggle) == 'function' then
+				toggle()
+			end
+		end,
+	})
+end
+
+local GUI_POS_PATHS = {
+	'PlayerTools/serverhop_gui.json',
+	'serverhop_gui.json',
+}
+
+local MIN_PANEL_W = 260
+local MIN_PANEL_H = 220
+
+local function ensureGuiFolder()
+	if type(makefolder) ~= 'function' or type(isfolder) ~= 'function' then
+		return
+	end
+	pcall(function()
+		if not isfolder('PlayerTools') then
+			makefolder('PlayerTools')
+		end
+	end)
+end
+
+local function udimFromSaved(pos, fallback)
+	if type(pos) == 'table' and type(pos.ox) == 'number' and type(pos.oy) == 'number' then
+		return UDim2.new(tonumber(pos.sx) or 0, pos.ox, tonumber(pos.sy) or 0, pos.oy)
+	end
+	return fallback
+end
+
+local function sizeFromSaved(size, fallbackW, fallbackH)
+	local w = fallbackW
+	local h = fallbackH
+	if type(size) == 'table' then
+		w = tonumber(size.w) or w
+		h = tonumber(size.h) or h
+	end
+	return math.max(MIN_PANEL_W, math.floor(w + 0.5)), math.max(MIN_PANEL_H, math.floor(h + 0.5))
+end
+
+local function loadGuiPos()
+	if type(readfile) ~= 'function' then
+		return nil
+	end
+	for _, path in ipairs(GUI_POS_PATHS) do
+		local okExists, exists = pcall(function()
+			return isfile and isfile(path)
+		end)
+		if okExists and exists then
+			local okRead, body = pcall(readfile, path)
+			if okRead and type(body) == 'string' and body ~= '' then
+				local okJson, data = pcall(function()
+					return game:GetService('HttpService'):JSONDecode(body)
+				end)
+				if okJson and type(data) == 'table' then
+					if data.widget or data.panel or data.size then
+						return data
+					end
+					-- Legacy flat {sx,ox,sy,oy} → widget position.
+					if type(data.ox) == 'number' then
+						return { widget = data }
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function saveGuiLayout(widget, panel)
+	if type(writefile) ~= 'function' then
+		return
+	end
+	ensureGuiFolder()
+	local prev = loadGuiPos() or {}
+	local data = {
+		widget = prev.widget,
+		panel = prev.panel,
+		size = prev.size,
+	}
+	if widget then
+		local p = widget.Position
+		data.widget = { sx = p.X.Scale, ox = p.X.Offset, sy = p.Y.Scale, oy = p.Y.Offset }
+	end
+	if panel then
+		local abs = panel.AbsolutePosition
+		local sz = panel.AbsoluteSize
+		data.panel = {
+			sx = 0,
+			ox = math.floor((abs and abs.X or panel.Position.X.Offset) + 0.5),
+			sy = 0,
+			oy = math.floor((abs and abs.Y or panel.Position.Y.Offset) + 0.5),
+		}
+		data.size = {
+			w = math.max(MIN_PANEL_W, math.floor((sz and sz.X or panel.Size.X.Offset) + 0.5)),
+			h = math.max(MIN_PANEL_H, math.floor((sz and sz.Y or panel.Size.Y.Offset) + 0.5)),
+		}
+	end
+	local okJson, payload = pcall(function()
+		return game:GetService('HttpService'):JSONEncode(data)
+	end)
+	if not okJson or type(payload) ~= 'string' then
+		return
+	end
+	for _, path in ipairs(GUI_POS_PATHS) do
+		pcall(writefile, path, payload)
+	end
+end
+
+local function makeDraggable(handle, frame, onEnd)
+	local dragging = false
+	local dragStart, startPos
+	local function endDrag()
+		if not dragging then
+			return
+		end
+		dragging = false
+		if onEnd then
+			onEnd()
+		end
+	end
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+		end
+	end)
+	handle.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endDrag()
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endDrag()
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+local function makeResizable(frame, onEnd)
+	local grip = Instance.new('TextButton')
+	grip.Name = 'Resize'
+	grip.Size = UDim2.fromOffset(18, 18)
+	grip.Position = UDim2.new(1, -20, 1, -20)
+	grip.BackgroundColor3 = Color3.fromRGB(50, 56, 66)
+	grip.BorderSizePixel = 0
+	grip.AutoButtonColor = true
+	grip.Text = ''
+	grip.ZIndex = 5
+	grip.Parent = frame
+	Instance.new('UICorner', grip).CornerRadius = UDim.new(0, 4)
+	local mark = Instance.new('TextLabel')
+	mark.BackgroundTransparency = 1
+	mark.Size = UDim2.fromScale(1, 1)
+	mark.Font = Enum.Font.GothamBold
+	mark.TextSize = 11
+	mark.TextColor3 = Color3.fromRGB(160, 170, 185)
+	mark.Text = '⌟'
+	mark.ZIndex = 6
+	mark.Parent = grip
+
+	local resizing = false
+	local dragStart, startSize
+	local function endResize()
+		if not resizing then
+			return
+		end
+		resizing = false
+		if onEnd then
+			onEnd()
+		end
+	end
+	grip.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			resizing = true
+			dragStart = input.Position
+			startSize = frame.AbsoluteSize
+		end
+	end)
+	grip.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endResize()
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endResize()
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not resizing or not dragStart or not startSize then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			local cam = workspace.CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+			local w = math.clamp(startSize.X + delta.X, MIN_PANEL_W, math.max(MIN_PANEL_W, vp.X - 16))
+			local h = math.clamp(startSize.Y + delta.Y, MIN_PANEL_H, math.max(MIN_PANEL_H, vp.Y - 16))
+			frame.Size = UDim2.fromOffset(math.floor(w + 0.5), math.floor(h + 0.5))
+		end
+	end)
+	return grip
+end
+
+local function destroyFloorGui()
+	local gui = getgenv().SB2ServerHopGui
+	if gui and gui.Parent then
+		pcall(function()
+			gui:Destroy()
+		end)
+	end
+	getgenv().SB2ServerHopGui = nil
+end
+
+local function setFloorPanelOpen(open)
+	local gui = getgenv().SB2ServerHopGui
+	if not gui then
+		return
+	end
+	local panel = gui:FindFirstChild('Root')
+	if panel then
+		panel.Visible = open == true
+	end
+end
+
+local function fillFloorList(list)
+	applyHardFloors()
+	for _, child in ipairs(list:GetChildren()) do
+		if not child:IsA('UIListLayout') and not child:IsA('UIPadding') then
+			child:Destroy()
+		end
+	end
+
+	local function addHeader(text, order)
+		local h = Instance.new('TextLabel')
+		h.Size = UDim2.new(1, -4, 0, 36)
+		h.BackgroundTransparency = 1
+		h.Font = Enum.Font.GothamBold
+		h.TextSize = 12
+		h.TextWrapped = true
+		h.TextXAlignment = Enum.TextXAlignment.Left
+		h.TextYAlignment = Enum.TextYAlignment.Top
+		h.TextColor3 = Color3.fromRGB(160, 200, 255)
+		h.Text = '  ' .. tostring(text)
+		h.LayoutOrder = order
+		h.Parent = list
+	end
+
+	local function addRow(rec, label, order)
+		local row = Instance.new('TextButton')
+		row.Size = UDim2.new(1, -4, 0, 40)
+		row.BackgroundColor3 = Color3.fromRGB(36, 40, 48)
+		row.BorderSizePixel = 0
+		row.AutoButtonColor = true
+		row.Font = Enum.Font.GothamMedium
+		row.TextSize = 13
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.TextColor3 = Color3.fromRGB(235, 238, 245)
+		row.Text = '  ' .. label .. '\n  ' .. tostring(rec.placeId)
+		row.LayoutOrder = order
+		row.Parent = list
+		Instance.new('UICorner', row).CornerRadius = UDim.new(0, 6)
+		row.MouseButton1Click:Connect(function()
+			setFloorPanelOpen(false)
+			joinPlace(rec)
+		end)
+	end
+
+	local order = 1
+	if #catalog.floors == 0 and #catalog.all == 0 then
+		addHeader('No floors loaded — ' .. tostring(loadInfo), order)
+		order += 1
+		local retry = Instance.new('TextButton')
+		retry.Size = UDim2.new(1, -4, 0, 36)
+		retry.BackgroundColor3 = Color3.fromRGB(50, 70, 100)
+		retry.BorderSizePixel = 0
+		retry.Font = Enum.Font.GothamBold
+		retry.TextSize = 13
+		retry.TextColor3 = Color3.fromRGB(235, 238, 245)
+		retry.Text = 'Retry load'
+		retry.LayoutOrder = order
+		retry.Parent = list
+		Instance.new('UICorner', retry).CornerRadius = UDim.new(0, 6)
+		retry.MouseButton1Click:Connect(function()
+			okLoad, loadInfo = loadLocations()
+			applyHardFloors()
+			publishCatalog()
+			fillFloorList(list)
+		end)
+		return
+	end
+
+	-- Mirror Database.Locations categories (Main / Boss / Rotating / Event / …).
+	local function storyPlaceSet()
+		local set = {}
+		for _, f in ipairs(catalog.floors) do
+			if f and f.placeId then
+				set[f.placeId] = true
+			end
+		end
+		return set
+	end
+
+	local storySet = storyPlaceSet()
+	if #catalog.floors > 0 then
+		addHeader('Story floors (F1–F' .. tostring(#catalog.floors) .. ')', order)
+		order += 1
+		for i, rec in ipairs(catalog.floors) do
+			addRow(rec, string.format('F%d  %s', i, rec.name), order)
+			order += 1
+		end
+	end
+
+	local catOrder = { 'Main', 'Boss', 'Rotating', 'Event' }
+	local seenCat = {}
+	local function emitCategory(catName)
+		if seenCat[catName] then
+			return
+		end
+		seenCat[catName] = true
+		local bag = catalog.byCategory and catalog.byCategory[catName]
+		if type(bag) ~= 'table' or #bag == 0 then
+			return
+		end
+		local rows = {}
+		for _, rec in ipairs(bag) do
+			-- Story F# already listed under Story floors.
+			if not (catName == 'Main' and storySet[rec.placeId]) then
+				rows[#rows + 1] = rec
+			end
+		end
+		if #rows == 0 then
+			return
+		end
+		table.sort(rows, function(a, b)
+			return tostring(a.name):lower() < tostring(b.name):lower()
+		end)
+		addHeader(catName, order)
+		order += 1
+		for _, rec in ipairs(rows) do
+			local suffix = ''
+			if rec.locked then
+				suffix = suffix .. ' [locked]'
+			end
+			if rec.hidden then
+				suffix = suffix .. ' [hidden]'
+			end
+			addRow(rec, rec.name .. suffix, order)
+			order += 1
+		end
+	end
+
+	for _, catName in ipairs(catOrder) do
+		emitCategory(catName)
+	end
+	if type(catalog.byCategory) == 'table' then
+		local rest = {}
+		for catName in pairs(catalog.byCategory) do
+			if not seenCat[catName] then
+				rest[#rest + 1] = catName
+			end
+		end
+		table.sort(rest)
+		for _, catName in ipairs(rest) do
+			emitCategory(catName)
+		end
+	end
+end
+
+local function clampOnScreen(guiObject, fallback)
+	fallback = fallback or UDim2.fromOffset(16, 114)
+	if not guiObject then
+		return
+	end
+	local size = guiObject.AbsoluteSize
+	if size.X < 40 or size.Y < 40 then
+		return
+	end
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+	local abs = guiObject.AbsolutePosition
+	local maxX = math.max(8, vp.X - size.X - 8)
+	local maxY = math.max(8, vp.Y - size.Y - 8)
+	local x = math.clamp(abs.X, 8, maxX)
+	local y = math.clamp(abs.Y, 8, maxY)
+	if math.abs(x - abs.X) > 2 or math.abs(y - abs.Y) > 2 then
+		guiObject.Position = UDim2.fromOffset(x, y)
+	end
+end
+
+-- Panel ScreenGui only — Join pill lives in the shared PillDock stack.
+local function ensureFloorGui()
+	local existing = getgenv().SB2ServerHopGui
+	pcall(registerJoinPill)
+	if existing and existing.Parent then
+		existing.Enabled = true
+		pcall(function()
+			local old = existing:FindFirstChild('Widget')
+			if old then
+				old:Destroy()
+			end
+		end)
+		return existing
+	end
+	if existing then
+		getgenv().SB2ServerHopGui = nil
+	end
+
+	okLoad, loadInfo = loadLocations()
+	local layout = loadGuiPos() or {}
+
+	local gui = Instance.new('ScreenGui')
+	gui.Name = 'SB2ServerHopGui'
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.DisplayOrder = 1000
+	gui.IgnoreGuiInset = true
+	pcall(function()
+		gui.Parent = parentGui()
+	end)
+	if not gui.Parent and LocalPlayer then
+		gui.Parent = LocalPlayer:WaitForChild('PlayerGui')
+	end
+	getgenv().SB2ServerHopGui = gui
+
+	local frame = Instance.new('Frame')
+	frame.Name = 'Root'
+	local savedW, savedH = sizeFromSaved(layout.size, 360, 460)
+	frame.Size = UDim2.fromOffset(savedW, savedH)
+	frame.Position = udimFromSaved(layout.panel, UDim2.new(0, 100, 0, 80))
+	frame.BackgroundColor3 = Color3.fromRGB(22, 24, 28)
+	frame.BorderSizePixel = 0
+	frame.Active = true
+	frame.Visible = false
+	frame.Parent = gui
+	Instance.new('UICorner', frame).CornerRadius = UDim.new(0, 10)
+	task.defer(function()
+		clampOnScreen(frame, UDim2.fromOffset(100, 80))
+	end)
+
+	local title = Instance.new('TextButton')
+	title.Name = 'Drag'
+	title.BackgroundTransparency = 1
+	title.AutoButtonColor = false
+	title.AutomaticSize = Enum.AutomaticSize.X
+	title.Size = UDim2.fromOffset(0, 32)
+	title.Position = UDim2.fromOffset(12, 6)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = Color3.fromRGB(235, 238, 245)
+	title.Text = 'Join floor'
+	title.Parent = frame
+
+	local rejoin = Instance.new('TextButton')
+	rejoin.Name = 'Rejoin'
+	rejoin.Size = UDim2.fromOffset(62, 26)
+	rejoin.Position = UDim2.fromOffset(120, 9)
+	rejoin.BackgroundColor3 = Color3.fromRGB(45, 70, 95)
+	rejoin.BorderSizePixel = 0
+	rejoin.AutoButtonColor = true
+	rejoin.Font = Enum.Font.GothamBold
+	rejoin.TextSize = 12
+	rejoin.TextColor3 = Color3.fromRGB(220, 224, 232)
+	rejoin.Text = 'Rejoin'
+	rejoin.Parent = frame
+	Instance.new('UICorner', rejoin).CornerRadius = UDim.new(0, 6)
+	local function layoutRejoin()
+		rejoin.Position = UDim2.fromOffset(12 + math.ceil(title.AbsoluteSize.X) + 8, 9)
+	end
+	title:GetPropertyChangedSignal('AbsoluteSize'):Connect(layoutRejoin)
+	task.defer(layoutRejoin)
+	rejoin.MouseButton1Click:Connect(function()
+		if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
+			pcall(getgenv().SB2PlayerToolsArmTeleport)
+		end
+		say('rejoining…')
+		if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+			pcall(getgenv().SB2CloseAllPillPanels)
+		end
+		task.spawn(function()
+			local placeId = game.PlaceId
+			local jobId = game.JobId
+			local ok = false
+			if type(jobId) == 'string' and jobId ~= '' then
+				ok = pcall(function()
+					TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+				end)
+			end
+			if not ok then
+				ok = pcall(function()
+					TeleportService:Teleport(placeId, LocalPlayer)
+				end)
+			end
+			if not ok then
+				say('rejoin failed')
+			end
+		end)
+	end)
+
+	local close = Instance.new('TextButton')
+	close.Size = UDim2.fromOffset(28, 28)
+	close.Position = UDim2.new(1, -36, 0, 8)
+	close.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+	close.Text = 'X'
+	close.Font = Enum.Font.GothamBold
+	close.TextSize = 14
+	close.TextColor3 = Color3.fromRGB(230, 230, 240)
+	close.Parent = frame
+	Instance.new('UICorner', close).CornerRadius = UDim.new(0, 6)
+	close.MouseButton1Click:Connect(function()
+		setFloorPanelOpen(false)
+	end)
+
+	makeDraggable(title, frame, function()
+		saveGuiLayout(nil, frame)
+	end)
+	makeResizable(frame, function()
+		saveGuiLayout(nil, frame)
+	end)
+
+	local hint = Instance.new('TextLabel')
+	hint.BackgroundTransparency = 1
+	hint.Size = UDim2.new(1, -20, 0, 18)
+	hint.Position = UDim2.fromOffset(12, 34)
+	hint.Font = Enum.Font.Gotham
+	hint.TextSize = 11
+	hint.TextXAlignment = Enum.TextXAlignment.Left
+	hint.TextColor3 = Color3.fromRGB(140, 148, 160)
+	hint.Text = 'Click once to join — also: join F11'
+	hint.Parent = frame
+
+	local list = Instance.new('ScrollingFrame')
+	list.Name = 'List'
+	list.Size = UDim2.new(1, -20, 1, -64)
+	list.Position = UDim2.fromOffset(10, 56)
+	list.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 5
+	list.CanvasSize = UDim2.new(0, 0, 0, 0)
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Parent = frame
+	Instance.new('UICorner', list).CornerRadius = UDim.new(0, 8)
+
+	local layoutList = Instance.new('UIListLayout')
+	layoutList.Padding = UDim.new(0, 6)
+	layoutList.SortOrder = Enum.SortOrder.LayoutOrder
+	layoutList.Parent = list
+
+	local pad = Instance.new('UIPadding')
+	pad.PaddingTop = UDim.new(0, 6)
+	pad.PaddingBottom = UDim.new(0, 6)
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.Parent = list
+
+	fillFloorList(list)
+	return gui
+end
+
+local function showFloorGui()
+	ensureFloorGui()
+	okLoad, loadInfo = loadLocations()
+	local gui = getgenv().SB2ServerHopGui
+	local list = gui and gui:FindFirstChild('Root') and gui.Root:FindFirstChild('List')
+	if list then
+		fillFloorList(list)
+	end
+	setFloorPanelOpen(true)
+	say(('locations — %d places (%d story)'):format(#catalog.all, #catalog.floors))
+end
+
+local function toggleFloorGui()
+	ensureFloorGui()
+	local gui = getgenv().SB2ServerHopGui
+	local panel = gui and gui:FindFirstChild('Root')
+	local open = not (panel and panel.Visible)
+	if open then
+		showFloorGui()
+	else
+		setFloorPanelOpen(false)
+	end
+	return open
+end
+
+getgenv().SB2ServerHopOpenGui = showFloorGui
+getgenv().SB2ServerHopToggleGui = toggleFloorGui
+
+-- Boot: pill only. Panel stays closed until you click Join (closes again once a server is found).
+do
+	task.defer(function()
+		pcall(ensureFloorGui)
+		pcall(setFloorPanelOpen, false)
+	end)
+	task.spawn(function()
+		-- Fill floor list once DB is ready; chip already visible.
+		for _ = 1, 80 do
+			local loaded = select(1, loadLocations())
+			applyHardFloors()
+			publishCatalog()
+			if loaded and (#catalog.floors > 0 or #catalog.all > 0) then
+				local gui = getgenv().SB2ServerHopGui
+				local list = gui and gui:FindFirstChild('Root') and gui.Root:FindFirstChild('List')
+				if list then
+					pcall(fillFloorList, list)
+				end
+				return
+			end
+			task.wait(0.15)
+		end
+		applyHardFloors()
+		publishCatalog()
+		local gui = getgenv().SB2ServerHopGui
+		local list = gui and gui:FindFirstChild('Root') and gui.Root:FindFirstChild('List')
+		if list then
+			pcall(fillFloorList, list)
+		end
+	end)
+end
+
+local Plugin = {
+	['PluginName'] = 'ServerHop',
+	['PluginDescription'] = 'Join any Database.Locations place (story / event / rotating) — one-shot, no auto-rejoin',
+	['Commands'] = {
+		['join'] = {
+			['ListName'] = 'join / hop / serverhop [F11|name|placeId]',
+			['Description'] = 'Teleport to a floor once (no rejoin loop)',
+			['Aliases'] = { 'hop', 'serverhop', 'shop', 'sh', 'gotofloor', 'floor' },
+			['Function'] = function(args)
+				if not okLoad then
+					okLoad, loadInfo = loadLocations()
+				end
+				applyHardFloors()
+				local raw = args and table.concat(args, ' ') or ''
+				local low = string.lower(raw)
+				if low == 'floors' or low == 'list' or low == 'gui' then
+					showFloorGui()
+					return
+				end
+				joinFromArgs(args)
+			end,
+		},
+		['shlist'] = {
+			['ListName'] = 'shlist / shfloors / shgui',
+			['Description'] = 'Toggle Join widget panel (or click the Join chip)',
+			['Aliases'] = { 'shfloors', 'floorslist', 'shgui', 'joinlist' },
+			['Function'] = function()
+				-- Force recreate if pill missing.
+				local gui = getgenv().SB2ServerHopGui
+				if not (gui and gui.Parent) then
+					getgenv().SB2ServerHopGui = nil
+				end
+				ensureFloorGui()
+				if toggleFloorGui() then
+					say('join panel open')
+				else
+					say('join panel closed')
+				end
+			end,
+		},
+		['shpill'] = {
+			['ListName'] = 'shpill / joinchip',
+			['Description'] = 'Show the shared pill dock (Join/WP/JL stack)',
+			['Aliases'] = { 'joinchip', 'showjoin' },
+			['Function'] = function()
+				ensureFloorGui()
+				pcall(registerJoinPill)
+				if type(getgenv().SB2EnsurePillDock) == 'function' then
+					local dock = getgenv().SB2EnsurePillDock()
+					if dock and dock.stack then
+						dock.stack.Position = UDim2.fromOffset(16, 80)
+						pcall(writefile, 'PlayerTools/pill_dock.json', '{"sx":0,"ox":16,"sy":0,"oy":80}')
+					end
+				end
+				say('pill dock ready — drag the stack to move Join/WP/JL together')
+			end,
+		},
+		['shstop'] = {
+			['ListName'] = 'shstop',
+			['Description'] = 'Clears old auto-hop state (new join is one-shot)',
+			['Aliases'] = { 'shopstop', 'stopshop' },
+			['Function'] = function()
+				pcall(function()
+					if type(writefile) == 'function' then
+						local body = '{"active":false}'
+						pcall(writefile, 'PlayerTools/serverhop_state.json', body)
+						pcall(writefile, 'serverhop_state.json', body)
+					end
+					getgenv().SB2ServerHop = { active = false }
+				end)
+				say('old hop state cleared — use: join F11')
+			end,
+		},
+	},
+}
+
+return Plugin

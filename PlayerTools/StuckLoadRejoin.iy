@@ -1,0 +1,583 @@
+--[[
+    StuckLoadRejoin.iy — Infinite Yield plugin (Swordburst 2)
+
+    Owns "rejoin if stuck loading" (moved out of PlayerTools so it runs early with IY).
+    Same overlay checks as PlayerTools LoadSkip. If the session loader stays up for
+    more than 15s (after ready grace), hop off and back to the same JobId.
+
+    Install: IY Plugins → Add → StuckLoadRejoin.iy
+    Commands: stuckloadon | stuckloadoff | stuckloadnow | stuckloadstatus
+
+    Shared:
+      PlayerTools/autoskip_load
+      getgenv().SB2StuckLoadIyOwner / SB2SetStuckLoadRejoin / SB2ForceFinishLoad
+]]
+
+local Players = game:GetService('Players')
+local TeleportService = game:GetService('TeleportService')
+local StarterGui = game:GetService('StarterGui')
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
+	or Players.LocalPlayer
+
+local GENV_STOP = 'SB2StuckLoadIyStop'
+local FOLDER = 'PlayerTools'
+local PATH = FOLDER .. '/autoskip_load'
+local AUTOBLOCK_PATH = FOLDER .. '/autoblock'
+
+local STUCK_SECS = 15
+local STUCK_SECS_AUTOBLOCK = 28
+local STUCK_SECS_FRESH = 9
+local READY_GRACE = 8
+local READY_GRACE_AUTOBLOCK = 12
+local READY_GRACE_FRESH = 3
+
+local TELEPORT_STUB =
+	"if isfile and isfile('PlayerTools/manual_unload') then local ok,b=pcall(readfile,'PlayerTools/manual_unload'); if ok and tostring(b)=='true' then return end end;"
+	.. "if getgenv().SB2PlayerToolsManualUnload then return end;"
+	.. "getgenv().SB2PlayerTools=false;"
+	.. "getgenv().SB2PlayerToolsInstance=nil;"
+	.. "getgenv().SB2PlayerToolsLibrary=nil;"
+	.. "local ok,err=pcall(function()"
+	.. "local p=(isfile and isfile('PlayerTools/launch.lua') and 'PlayerTools/launch.lua')"
+	.. "or(isfile and isfile('PlayerTools/PlayerTools.lua') and 'PlayerTools/PlayerTools.lua')"
+	.. "or(isfile and isfile('PlayerTools.lua') and 'PlayerTools.lua');"
+	.. "assert(p,'PlayerTools.lua missing from workspace');"
+	.. "local compile=loadstring or load;"
+	.. "local src=readfile(p);"
+	.. "local fn,cerr=compile(src,p);"
+	.. "if not fn then error('PlayerTools compile: '..tostring(cerr)) end;"
+	.. "fn()"
+	.. "end);if not ok then warn('[StuckLoadRejoin] rejoin reload failed: '..tostring(err)) end"
+
+if getgenv()[GENV_STOP] then
+	pcall(getgenv()[GENV_STOP])
+end
+
+getgenv().SB2StuckLoadIyOwner = true
+
+local queueTeleport = (type(queueteleport) == 'function' and queueteleport)
+	or (type(queue_on_teleport) == 'function' and queue_on_teleport)
+	or (type(queueonteleport) == 'function' and queueonteleport)
+	or (getgenv() and type(getgenv().queueteleport) == 'function' and getgenv().queueteleport)
+
+local enabled = true
+local watchThread = nil
+
+local function say(text)
+	pcall(function()
+		StarterGui:SetCore('SendNotification', {
+			Title = 'StuckLoadRejoin',
+			Text = tostring(text),
+			Duration = 4,
+		})
+	end)
+	warn('[StuckLoadRejoin] ' .. tostring(text))
+end
+
+local function ensureFolder()
+	if type(makefolder) == 'function' and type(isfolder) == 'function' then
+		if not isfolder(FOLDER) then
+			pcall(makefolder, FOLDER)
+		end
+	end
+end
+
+local function fileOn()
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, PATH)
+		if ok and exists then
+			local okRead, body = pcall(readfile, PATH)
+			if okRead and tostring(body) == 'false' then
+				return false
+			end
+		end
+	end
+	return true
+end
+
+local function writeFile(on)
+	if type(writefile) ~= 'function' then
+		return
+	end
+	ensureFolder()
+	pcall(writefile, PATH, on and 'true' or 'false')
+end
+
+local function freshFinderWanted()
+	local fsf = getgenv().SB2FreshServerFinder
+	return type(fsf) == 'table' and fsf.active == true
+end
+
+local function autoBlockWanted()
+	if getgenv().SB2AutoBlockWanted == true then
+		return true
+	end
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, AUTOBLOCK_PATH)
+		if ok and exists then
+			local okRead, body = pcall(readfile, AUTOBLOCK_PATH)
+			if okRead and tostring(body) == 'true' then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function loadSkipReady()
+	if getgenv().SB2PlayerToolsLoading == true then
+		return false
+	end
+	if getgenv().SB2AutoBlockBusy == true or getgenv().SB2AutoBlockHopping == true then
+		return false
+	end
+	if getgenv().SB2LoadRejoining then
+		return false
+	end
+	if autoBlockWanted() then
+		local iyReady = getgenv().SB2AutoBlockIyOwner == true
+			and (getgenv().SB2AutoBlockIyReady == true or getgenv().SB2AutoBlockJoinConn ~= nil)
+		if not iyReady then
+			return false
+		end
+	end
+	return true
+end
+
+local function stuckLimit()
+	if freshFinderWanted() then
+		return STUCK_SECS_FRESH
+	end
+	if autoBlockWanted() then
+		return STUCK_SECS_AUTOBLOCK
+	end
+	return STUCK_SECS
+end
+
+local function readyGrace()
+	if freshFinderWanted() then
+		return READY_GRACE_FRESH
+	end
+	if autoBlockWanted() then
+		return READY_GRACE_AUTOBLOCK
+	end
+	return READY_GRACE
+end
+
+local function skipGuiName(name)
+	local n = string.lower(tostring(name or ''))
+	return string.find(n, 'playertools', 1, true)
+		or string.find(n, 'obsidian', 1, true)
+		or string.find(n, 'linoria', 1, true)
+end
+
+local LOAD_PHRASES = {
+	'session is loading',
+	'your session is',
+	'loading session',
+	'joining server',
+	'joining game',
+	'joining the',
+	'joining floor',
+	'please wait',
+	'teleporting',
+	'connecting',
+	'waiting for server',
+	'waiting for players',
+	'getting your',
+	'preparing',
+	'loading map',
+	'loading world',
+	'loading...',
+}
+
+local function textLooksLoading(raw)
+	local t = string.lower((tostring(raw or ''):gsub('%s+', ' ')))
+	if t == '' or #t > 140 then
+		return false
+	end
+	for i = 1, #LOAD_PHRASES do
+		if string.find(t, LOAD_PHRASES[i], 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function isShown(inst)
+	local cur = inst
+	for _ = 1, 14 do
+		if not cur or cur == game then
+			return false
+		end
+		local vis = true
+		pcall(function()
+			if cur:IsA('LayerCollector') then
+				vis = cur.Enabled ~= false
+			elseif cur:IsA('GuiObject') then
+				vis = cur.Visible ~= false
+			end
+		end)
+		if not vis then
+			return false
+		end
+		if cur:IsA('PlayerGui') or cur:IsA('CoreGui') then
+			return true
+		end
+		cur = cur.Parent
+	end
+	return false
+end
+
+local function nameLooksLoader(name)
+	local n = string.lower(tostring(name or ''))
+	return string.find(n, 'loadingcircle', 1, true)
+		or string.find(n, 'loadingspinner', 1, true)
+		or string.find(n, 'loadcircle', 1, true)
+		or n == 'spinner'
+		or n == 'throbber'
+		or n == 'loadingring'
+end
+
+local function instLooksLoader(inst)
+	if not inst or skipGuiName(inst.Name) then
+		return false
+	end
+	if nameLooksLoader(inst.Name) and isShown(inst) then
+		return true
+	end
+	if (inst:IsA('TextLabel') or inst:IsA('TextButton') or inst:IsA('TextBox')) and isShown(inst) then
+		local raw = inst.Text
+		pcall(function()
+			if inst.ContentText and inst.ContentText ~= '' then
+				raw = inst.ContentText
+			end
+		end)
+		if textLooksLoading(raw) then
+			return true
+		end
+	end
+	return false
+end
+
+local function treeLooksLoading(root, budget)
+	if not root then
+		return false
+	end
+	if instLooksLoader(root) then
+		return true
+	end
+	local left = budget or 600
+	local ok, desc = pcall(function()
+		return root:GetDescendants()
+	end)
+	if not ok or type(desc) ~= 'table' then
+		return false
+	end
+	for i = 1, #desc do
+		if i > left then
+			break
+		end
+		if instLooksLoader(desc[i]) then
+			return true
+		end
+	end
+	return false
+end
+
+local function overlayUp()
+	local loaded = true
+	pcall(function()
+		loaded = game:IsLoaded()
+	end)
+	if not loaded then
+		return true
+	end
+	local pg = LocalPlayer:FindFirstChild('PlayerGui')
+	if not pg then
+		return true
+	end
+	local gui = pg:FindFirstChild('Gui')
+	local cui = pg:FindFirstChild('CardinalUI')
+	local hudOn = cui and cui:IsA('LayerCollector') and cui.Enabled == true
+
+	if gui and gui:IsA('LayerCollector') then
+		if treeLooksLoading(gui) then
+			return true
+		end
+		if gui.Enabled and not hudOn then
+			return true
+		end
+	end
+
+	for _, g in ipairs(pg:GetChildren()) do
+		if g ~= gui and g ~= cui and g:IsA('LayerCollector') and g.Enabled and not skipGuiName(g.Name) then
+			local n = string.lower(g.Name)
+			if string.find(n, 'load', 1, true)
+				or string.find(n, 'join', 1, true)
+				or string.find(n, 'teleport', 1, true)
+				or string.find(n, 'fade', 1, true)
+				or string.find(n, 'splash', 1, true)
+			then
+				return true
+			end
+			if treeLooksLoading(g, 250) then
+				return true
+			end
+		end
+	end
+
+	local coreHit = false
+	pcall(function()
+		local cg = game:GetService('CoreGui')
+		for _, g in ipairs(cg:GetChildren()) do
+			if g:IsA('LayerCollector') and g.Enabled and not skipGuiName(g.Name) then
+				local n = string.lower(g.Name)
+				if string.find(n, 'load', 1, true) or string.find(n, 'teleport', 1, true) then
+					coreHit = true
+					return
+				end
+			end
+		end
+	end)
+	return coreHit
+end
+
+local function rejoin(reason)
+	if getgenv().SB2LoadRejoining then
+		return false
+	end
+	if getgenv().SB2PlayerToolsLoading == true
+		or getgenv().SB2AutoBlockBusy == true
+		or (autoBlockWanted() and getgenv().SB2AutoBlockIyOwner ~= true)
+		or (autoBlockWanted() and not getgenv().SB2AutoBlockJoinConn and not getgenv().SB2AutoBlockIyReady)
+	then
+		warn('[StuckLoadRejoin] deferred (tools/block not ready)')
+		return false
+	end
+	getgenv().SB2LoadRejoining = true
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	local limit = stuckLimit()
+	say(('Stuck loading >%ds — rejoining (%s)'):format(limit, tostring(reason or '?')))
+	local placeId = game.PlaceId
+	local jobId = tostring(game.JobId or '')
+	local hopPlace = 659222129
+	if placeId == hopPlace then
+		hopPlace = 1818
+	end
+	local returnScript = string.format(
+		'task.defer(function()\n'
+			.. 'local ts=game:GetService("TeleportService")\n'
+			.. 'local lp=game:GetService("Players").LocalPlayer\n'
+			.. 'local q=(type(queueteleport)=="function" and queueteleport) or (type(queue_on_teleport)=="function" and queue_on_teleport) or (type(queueonteleport)=="function" and queueonteleport)\n'
+			.. 'if q then pcall(q,%s) end\n'
+			.. 'pcall(function() ts:TeleportToPlaceInstance(%d,%s,lp) end)\n'
+			.. 'end)\n',
+		string.format('%q', TELEPORT_STUB),
+		placeId,
+		string.format('%q', jobId)
+	)
+	task.spawn(function()
+		task.wait(((tonumber(LocalPlayer.UserId) or 0) % 9) * 0.45)
+		if queueTeleport then
+			pcall(queueTeleport, returnScript)
+		end
+		local ok = pcall(function()
+			TeleportService:Teleport(hopPlace, LocalPlayer)
+		end)
+		if not ok then
+			ok = pcall(function()
+				if jobId ~= '' then
+					TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+				else
+					TeleportService:Teleport(placeId, LocalPlayer)
+				end
+			end)
+		end
+		if not ok then
+			getgenv().SB2LoadRejoining = false
+		end
+	end)
+	task.delay(15, function()
+		getgenv().SB2LoadRejoining = false
+	end)
+	return true
+end
+
+local function stopWatch()
+	enabled = false
+	if watchThread then
+		pcall(task.cancel, watchThread)
+		watchThread = nil
+	end
+end
+
+local function startWatch()
+	if watchThread then
+		return
+	end
+	enabled = true
+	watchThread = task.spawn(function()
+		local overlaySince = nil
+		local clearSince = nil
+		local readyAt = nil
+		while getgenv().SB2StuckLoadIyOwner == true and enabled do
+			if getgenv().SB2AutoSkipLoad == false or getgenv().SB2LoadRejoining then
+				overlaySince = nil
+				clearSince = nil
+				readyAt = nil
+				task.wait(1)
+			elseif not loadSkipReady() then
+				overlaySince = nil
+				clearSince = nil
+				readyAt = nil
+				task.wait(0.4)
+			elseif overlayUp() then
+				clearSince = nil
+				if not readyAt then
+					readyAt = os.clock()
+				end
+				if (os.clock() - readyAt) < readyGrace() then
+					overlaySince = nil
+					task.wait(0.35)
+				else
+					if not overlaySince then
+						overlaySince = os.clock()
+					elseif (os.clock() - overlaySince) >= stuckLimit() then
+						if getgenv().SB2AutoBlockBusy == true then
+							overlaySince = os.clock()
+						else
+							rejoin('auto')
+							overlaySince = nil
+							readyAt = nil
+						end
+					end
+					task.wait(0.35)
+				end
+			else
+				if overlaySince then
+					if not clearSince then
+						clearSince = os.clock()
+					elseif (os.clock() - clearSince) >= 2.5 then
+						overlaySince = nil
+						clearSince = nil
+					end
+				end
+				task.wait(0.5)
+			end
+		end
+		watchThread = nil
+	end)
+end
+
+local function setEnabled(on, silent, opts)
+	opts = type(opts) == 'table' and opts or {}
+	on = on == true
+	if opts.persist ~= false then
+		writeFile(on)
+	end
+	getgenv().SB2AutoSkipLoad = on
+	if on then
+		startWatch()
+		if not silent then
+			say(('on — rejoin if stuck >%ds'):format(STUCK_SECS))
+		end
+	else
+		stopWatch()
+		if not silent then
+			say('off')
+		end
+	end
+	return on
+end
+
+getgenv().SB2SetStuckLoadRejoin = setEnabled
+getgenv().SB2GetStuckLoadRejoin = function()
+	return enabled == true and getgenv().SB2AutoSkipLoad ~= false
+end
+getgenv().SB2ForceFinishLoad = rejoin
+getgenv().SB2LoadOverlayUp = overlayUp
+getgenv().SB2LoadStuckSecs = STUCK_SECS
+getgenv().SB2StuckLoadRejoin = rejoin
+
+local function stopPlugin()
+	stopWatch()
+	getgenv().SB2StuckLoadIyOwner = nil
+	if getgenv().SB2SetStuckLoadRejoin == setEnabled then
+		getgenv().SB2SetStuckLoadRejoin = nil
+	end
+	if getgenv().SB2ForceFinishLoad == rejoin then
+		getgenv().SB2ForceFinishLoad = nil
+	end
+	if getgenv().SB2LoadOverlayUp == overlayUp then
+		getgenv().SB2LoadOverlayUp = nil
+	end
+	getgenv()[GENV_STOP] = nil
+	say('stopped')
+end
+getgenv()[GENV_STOP] = stopPlugin
+
+-- Boot from sidecar (default ON).
+do
+	local on = fileOn()
+	getgenv().SB2AutoSkipLoad = on
+	if on then
+		setEnabled(true, true, { persist = false })
+		say(('watching — hop if stuck loading >%ds'):format(STUCK_SECS))
+	else
+		setEnabled(false, true, { persist = false })
+	end
+end
+
+local Plugin = {
+	['PluginName'] = 'StuckLoadRejoin',
+	['PluginDescription'] = 'Rejoin same server if session loading hangs >15s (IY-owned)',
+	['Commands'] = {
+		['stuckloadon'] = {
+			['ListName'] = 'stuckloadon / slron',
+			['Description'] = 'Enable stuck-load rejoin (writes PlayerTools/autoskip_load)',
+			['Aliases'] = { 'slron', 'autoskipon' },
+			['Function'] = function()
+				setEnabled(true, false, { persist = true })
+			end,
+		},
+		['stuckloadoff'] = {
+			['ListName'] = 'stuckloadoff / slroff',
+			['Description'] = 'Disable stuck-load rejoin',
+			['Aliases'] = { 'slroff', 'autoskipoff' },
+			['Function'] = function()
+				setEnabled(false, false, { persist = true })
+			end,
+		},
+		['stuckloadnow'] = {
+			['ListName'] = 'stuckloadnow / slrnow',
+			['Description'] = 'Rejoin now if loading overlay is up',
+			['Aliases'] = { 'slrnow', 'stuckrejoin' },
+			['Function'] = function()
+				if overlayUp() then
+					rejoin('manual')
+				else
+					say('loading overlay is not up')
+				end
+			end,
+		},
+		['stuckloadstatus'] = {
+			['ListName'] = 'stuckloadstatus / slrstat',
+			['Description'] = 'Show stuck-load watcher status',
+			['Aliases'] = { 'slrstat' },
+			['Function'] = function()
+				say(('enabled=%s overlay=%s limit=%ds ready=%s'):format(
+					tostring(getgenv().SB2AutoSkipLoad ~= false),
+					tostring(overlayUp()),
+					stuckLimit(),
+					tostring(loadSkipReady())
+				))
+			end,
+		},
+	},
+}
+
+return Plugin

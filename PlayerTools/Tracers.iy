@@ -1,0 +1,791 @@
+--[[
+    Tracers.iy — Infinite Yield plugin
+    ESP from other players → you: line, stud distance, and chams (Highlight).
+
+    - Line + distance text via Drawing API (Beam/Billboard fallback)
+    - AlwaysOnTop Highlight chams on other players
+    - Uses Player.Character or workspace.Characters.<Name> (SB2)
+
+    Install: workspace/Tracers.iy → IY Plugins → Add → Tracers
+    Commands: tracers | tracersoff | tracerstoggle | tracerscolor [r g b]
+]]
+
+local Players = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local StarterGui = game:GetService('StarterGui')
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
+	or Players.LocalPlayer
+
+local GENV = 'SB2Tracers'
+local GENV_STOP = 'SB2TracersStop'
+local GENV_CONN = 'SB2TracersConn'
+
+local DEFAULT_COLOR = Color3.fromRGB(255, 70, 70)
+local MAX_DIST_LABEL = 50000
+
+if type(getgenv()[GENV_STOP]) == 'function' then
+	pcall(getgenv()[GENV_STOP])
+end
+
+local state = getgenv()[GENV]
+if type(state) ~= 'table' then
+	state = {}
+	getgenv()[GENV] = state
+end
+state.enabled = state.enabled == true
+state.color = typeof(state.color) == 'Color3' and state.color or DEFAULT_COLOR
+state.chams = state.chams ~= false
+state.lines = state.lines ~= false
+state.distance = state.distance ~= false
+
+local entries = {} -- userId -> { line, text, highlight, folder, conns }
+
+local hasDrawing = typeof(Drawing) == 'table' and type(Drawing.new) == 'function'
+
+local function say(text)
+	pcall(function()
+		StarterGui:SetCore('SendNotification', {
+			Title = 'Tracers',
+			Text = tostring(text),
+			Duration = 3,
+		})
+	end)
+	warn('[Tracers] ' .. tostring(text))
+end
+
+local function parentGui()
+	local ok, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and hui then
+		return hui
+	end
+	local cg = game:GetService('CoreGui')
+	if cg then
+		return cg
+	end
+	return LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui')
+end
+
+local function getMyRoot()
+	local char = LocalPlayer and LocalPlayer.Character
+	if not char then
+		local folder = workspace:FindFirstChild('Characters')
+		char = folder and LocalPlayer and folder:FindFirstChild(LocalPlayer.Name)
+	end
+	if not char then
+		return nil
+	end
+	return char:FindFirstChild('HumanoidRootPart')
+		or char:FindFirstChild('UpperTorso')
+		or char:FindFirstChild('Torso')
+		or char.PrimaryPart
+end
+
+local function getPlayerCharacter(plr)
+	if not plr then
+		return nil
+	end
+	local char = plr.Character
+	if char and char.Parent then
+		return char
+	end
+	local folder = workspace:FindFirstChild('Characters')
+	local alt = folder and folder:FindFirstChild(plr.Name)
+	if alt and alt.Parent then
+		return alt
+	end
+	return nil
+end
+
+local function getRoot(char)
+	if not char then
+		return nil
+	end
+	return char:FindFirstChild('HumanoidRootPart')
+		or char:FindFirstChild('UpperTorso')
+		or char:FindFirstChild('Torso')
+		or char.PrimaryPart
+end
+
+local function getHead(char)
+	if not char then
+		return nil
+	end
+	return char:FindFirstChild('Head')
+end
+
+local function headWorldPos(char, root)
+	local head = getHead(char)
+	if head then
+		return head.Position + Vector3.new(0, 1.25, 0)
+	end
+	if root then
+		return root.Position + Vector3.new(0, 3.5, 0)
+	end
+	return nil
+end
+
+-- Camera object space: look direction is -Z, so "in front" => Z < 0.
+-- Clip segments to the near plane so behind-you targets project to the correct
+-- screen edge ("out the back") instead of flipped garbage coords.
+local CAM_NEAR = -0.2 -- object-space Z; more negative = further in front
+
+local function camObjectPos(worldPos)
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return nil
+	end
+	return cam.CFrame:PointToObjectSpace(worldPos)
+end
+
+local function objectToScreen(objPos)
+	local cam = workspace.CurrentCamera
+	if not cam or not objPos then
+		return Vector2.zero, false
+	end
+	local world = cam.CFrame:PointToWorldSpace(objPos)
+	local v = cam:WorldToViewportPoint(world)
+	return Vector2.new(v.X, v.Y), v.Z > 0
+end
+
+local function isInFront(objPos)
+	return objPos ~= nil and objPos.Z < CAM_NEAR
+end
+
+-- Clip camera-space segment to Z = CAM_NEAR. Returns two object-space points, or nil.
+local function clipSegmentToNear(p0, p1)
+	if not p0 or not p1 then
+		return nil
+	end
+	local f0, f1 = isInFront(p0), isInFront(p1)
+	if f0 and f1 then
+		return p0, p1
+	end
+	if f0 == f1 then
+		-- Both behind: ray from camera origin through p1 hits near plane —
+		-- that point is the correct "out the back" screen direction.
+		if math.abs(p1.Z) < 1e-4 then
+			return nil
+		end
+		local t = CAM_NEAR / p1.Z
+		if t <= 0 then
+			return nil
+		end
+		local onNear = p1 * t
+		-- Start slightly further in front along the same ray so the line has length.
+		local start = onNear * 0.15
+		if start.Z >= CAM_NEAR then
+			start = Vector3.new(onNear.X, onNear.Y, CAM_NEAR - 0.05)
+		end
+		return start, onNear
+	end
+	-- One in front, one behind — intersect Z = CAM_NEAR
+	local denom = p1.Z - p0.Z
+	if math.abs(denom) < 1e-6 then
+		return nil
+	end
+	local t = (CAM_NEAR - p0.Z) / denom
+	local hit = p0:Lerp(p1, t)
+	if f0 then
+		return p0, hit
+	end
+	return hit, p1
+end
+
+local function worldToScreen(worldPos)
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return Vector2.zero, false, -1
+	end
+	local v = cam:WorldToViewportPoint(worldPos)
+	return Vector2.new(v.X, v.Y), v.Z > 0, v.Z
+end
+
+-- Stable tracer endpoints in screen space (handles behind-camera correctly).
+local function tracerScreenPoints(fromWorld, toWorld)
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return nil
+	end
+	local p0 = camObjectPos(fromWorld)
+	local p1 = camObjectPos(toWorld)
+	-- Third-person: local HRP is often behind the cam — use a point in front of the lens.
+	if not isInFront(p0) then
+		p0 = Vector3.new(0, 0, CAM_NEAR - 0.5)
+	end
+	local c0, c1 = clipSegmentToNear(p0, p1)
+	if not c0 or not c1 then
+		return nil
+	end
+	local a = objectToScreen(c0)
+	local b = objectToScreen(c1)
+	return a, b
+end
+
+-- Push a screen point out to the viewport border along the ray from center
+-- (so behind-you labels sit on the edge, not floating mid-view).
+local function clampToScreenEdge(screenPos)
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return screenPos
+	end
+	local vp = cam.ViewportSize
+	local margin = 10
+	local cx, cy = vp.X * 0.5, vp.Y * 0.5
+	local dx = screenPos.X - cx
+	local dy = screenPos.Y - cy
+	if math.abs(dx) < 0.5 and math.abs(dy) < 0.5 then
+		-- Directly behind camera — pin to bottom center.
+		return Vector2.new(cx, vp.Y - margin)
+	end
+	local scaleX = (dx >= 0) and ((vp.X - margin - cx) / dx) or ((margin - cx) / dx)
+	local scaleY = (dy >= 0) and ((vp.Y - margin - cy) / dy) or ((margin - cy) / dy)
+	local scale = math.min(scaleX, scaleY)
+	return Vector2.new(cx + dx * scale, cy + dy * scale)
+end
+
+-- Head label: in front = above head. Behind = near-plane direction, clamped to
+-- screen edge so the name pops out the back (not mid-terrain in front of you).
+local function headScreenPoint(char, root)
+	local above = headWorldPos(char, root)
+	if not above then
+		return nil, false
+	end
+	local obj = camObjectPos(above)
+	if not obj then
+		return nil, false
+	end
+	if isInFront(obj) then
+		local screen, ok = objectToScreen(obj)
+		return screen, ok
+	end
+	if math.abs(obj.Z) < 1e-4 then
+		return nil, false
+	end
+	local t = CAM_NEAR / obj.Z
+	if t <= 0 then
+		return nil, false
+	end
+	local onNear = obj * t
+	local screen = objectToScreen(onNear)
+	return clampToScreenEdge(screen), true
+end
+
+local function destroyDrawing(obj)
+	if not obj then
+		return
+	end
+	pcall(function()
+		obj.Visible = false
+	end)
+	pcall(function()
+		obj:Remove()
+	end)
+end
+
+local function clearEntry(userId)
+	local e = entries[userId]
+	if not e then
+		return
+	end
+	destroyDrawing(e.line)
+	destroyDrawing(e.text)
+	if e.highlight then
+		pcall(function()
+			e.highlight:Destroy()
+		end)
+	end
+	if e.folder then
+		pcall(function()
+			e.folder:Destroy()
+		end)
+	end
+	if type(e.conns) == 'table' then
+		for _, c in ipairs(e.conns) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+	end
+	entries[userId] = nil
+end
+
+local function clearAll()
+	for userId in pairs(entries) do
+		clearEntry(userId)
+	end
+end
+
+local function ensureHighlight(plr, char)
+	local e = entries[plr.UserId]
+	if not e or not state.chams then
+		if e and e.highlight then
+			pcall(function()
+				e.highlight:Destroy()
+			end)
+			e.highlight = nil
+		end
+		return
+	end
+	if e.highlight and e.highlight.Parent == char then
+		e.highlight.FillColor = state.color
+		e.highlight.OutlineColor = state.color
+		e.highlight.Enabled = true
+		return
+	end
+	if e.highlight then
+		pcall(function()
+			e.highlight:Destroy()
+		end)
+		e.highlight = nil
+	end
+	local h = Instance.new('Highlight')
+	h.Name = 'SB2TracersChams'
+	h.Adornee = char
+	h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	h.FillColor = state.color
+	h.OutlineColor = state.color
+	h.FillTransparency = 0.55
+	h.OutlineTransparency = 0
+	h.Parent = char
+	e.highlight = h
+end
+
+local function ensureFallbackFolder(plr, myRoot, theirRoot, char)
+	local e = entries[plr.UserId]
+	if not e then
+		return
+	end
+	local folder = e.folder
+	if not folder or not folder.Parent then
+		local parent = parentGui()
+		if not parent then
+			return
+		end
+		folder = Instance.new('Folder')
+		folder.Name = 'SB2Tracers_' .. tostring(plr.UserId)
+		folder.Parent = parent
+		e.folder = folder
+
+		local billboard = Instance.new('BillboardGui')
+		billboard.Name = 'Dist'
+		billboard.Size = UDim2.fromOffset(120, 28)
+		billboard.StudsOffset = Vector3.new(0, 1.5, 0)
+		billboard.AlwaysOnTop = true
+		billboard.MaxDistance = MAX_DIST_LABEL
+		billboard.Parent = folder
+
+		local label = Instance.new('TextLabel')
+		label.Name = 'Label'
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 14
+		label.TextColor3 = state.color
+		label.TextStrokeTransparency = 0.4
+		label.Text = ''
+		label.Parent = billboard
+		e.billboard = billboard
+		e.label = label
+
+		-- Beam needs Attachments in workspace; park under Camera folder via parts.
+		local a0 = Instance.new('Attachment')
+		local a1 = Instance.new('Attachment')
+		local holder = Instance.new('Part')
+		holder.Name = 'BeamHold'
+		holder.Anchored = true
+		holder.CanCollide = false
+		holder.CanQuery = false
+		holder.CanTouch = false
+		holder.Transparency = 1
+		holder.Size = Vector3.new(0.1, 0.1, 0.1)
+		holder.Parent = workspace.CurrentCamera or workspace
+		a0.Parent = holder
+		a1.Parent = holder
+		local beam = Instance.new('Beam')
+		beam.Attachment0 = a0
+		beam.Attachment1 = a1
+		beam.Width0 = 0.08
+		beam.Width1 = 0.08
+		beam.FaceCamera = true
+		beam.LightEmission = 1
+		beam.Color = ColorSequence.new(state.color)
+		beam.Parent = holder
+		e.holder = holder
+		e.att0 = a0
+		e.att1 = a1
+		e.beam = beam
+	end
+
+	if e.billboard and theirRoot then
+		local head = getHead(char)
+		e.billboard.Adornee = head or theirRoot
+		e.billboard.StudsOffset = head and Vector3.new(0, 1.5, 0) or Vector3.new(0, 3.5, 0)
+	end
+	if e.holder and myRoot and theirRoot then
+		e.holder.CFrame = CFrame.new((myRoot.Position + theirRoot.Position) * 0.5)
+		e.att0.WorldPosition = myRoot.Position
+		e.att1.WorldPosition = theirRoot.Position
+		if e.beam then
+			e.beam.Enabled = state.lines == true
+			e.beam.Color = ColorSequence.new(state.color)
+		end
+	end
+	if e.label then
+		e.label.TextColor3 = state.color
+		e.label.Visible = state.distance == true
+	end
+end
+
+local function ensureEntry(plr)
+	local uid = plr.UserId
+	local e = entries[uid]
+	if e then
+		return e
+	end
+	e = { conns = {} }
+	entries[uid] = e
+
+	if hasDrawing then
+		local line = Drawing.new('Line')
+		line.Thickness = 1.5
+		line.Color = state.color
+		line.Transparency = 1
+		line.Visible = false
+		e.line = line
+
+		local text = Drawing.new('Text')
+		text.Size = 16
+		text.Center = true
+		text.Outline = true
+		text.Color = state.color
+		text.Visible = false
+		e.text = text
+	end
+
+	e.conns[#e.conns + 1] = plr.CharacterAdded:Connect(function()
+		task.defer(function()
+			if entries[uid] and state.enabled then
+				local char = getPlayerCharacter(plr)
+				if char then
+					ensureHighlight(plr, char)
+				end
+			end
+		end)
+	end)
+
+	return e
+end
+
+local function formatDist(studs)
+	if studs >= 1000 then
+		return string.format('%.1fk', studs / 1000)
+	end
+	return string.format('%.0f', studs)
+end
+
+-- When several names land on the same screen spot (players stacked / behind-cam
+-- edge clamp), push extras upward so they stay readable.
+local LABEL_STACK_PX = 17
+local LABEL_CLUSTER_PX = 16
+
+local function staggerNameLabels()
+	if not hasDrawing then
+		return
+	end
+	local list = {}
+	for uid, e in pairs(entries) do
+		if e.text and e.text.Visible and e._basePos then
+			e._uid = uid
+			list[#list + 1] = e
+		end
+	end
+	if #list < 2 then
+		if list[1] then
+			list[1].text.Position = list[1]._basePos
+		end
+		return
+	end
+	table.sort(list, function(a, b)
+		local ay, by = a._basePos.Y, b._basePos.Y
+		if math.abs(ay - by) > 0.5 then
+			return ay < by
+		end
+		local ax, bx = a._basePos.X, b._basePos.X
+		if math.abs(ax - bx) > 0.5 then
+			return ax < bx
+		end
+		return (a._uid or 0) < (b._uid or 0)
+	end)
+
+	local cam = workspace.CurrentCamera
+	local vpY = cam and cam.ViewportSize.Y or 1080
+	local margin = 10
+	local placed = {}
+	local clusterSq = LABEL_CLUSTER_PX * LABEL_CLUSTER_PX
+
+	for _, e in ipairs(list) do
+		local base = e._basePos
+		local stack = 0
+		local pos
+		while true do
+			pos = Vector2.new(base.X, base.Y - stack * LABEL_STACK_PX)
+			local hit = false
+			for i = 1, #placed do
+				local p = placed[i]
+				local dx = pos.X - p.X
+				local dy = pos.Y - p.Y
+				if dx * dx + dy * dy < clusterSq then
+					hit = true
+					break
+				end
+			end
+			if not hit then
+				break
+			end
+			stack += 1
+			if stack > 40 then
+				break
+			end
+		end
+		pos = Vector2.new(pos.X, math.clamp(pos.Y, margin + 8, vpY - margin))
+		e.text.Position = pos
+		placed[#placed + 1] = pos
+	end
+end
+
+local function updateOne(plr, myRoot)
+	if not plr or plr == LocalPlayer then
+		return
+	end
+	local char = getPlayerCharacter(plr)
+	local theirRoot = getRoot(char)
+	if not char or not theirRoot or not myRoot then
+		clearEntry(plr.UserId)
+		return
+	end
+
+	local e = ensureEntry(plr)
+	ensureHighlight(plr, char)
+
+	local dist = (theirRoot.Position - myRoot.Position).Magnitude
+	local label = string.format('%s [%s]', plr.Name, formatDist(dist))
+
+	if hasDrawing then
+		local a, b = tracerScreenPoints(myRoot.Position, theirRoot.Position)
+		local headScreen, headOk = headScreenPoint(char, theirRoot)
+
+		if e.line then
+			e.line.Color = state.color
+			if state.lines and a and b then
+				e.line.From = a
+				e.line.To = b
+				e.line.Visible = true
+			else
+				e.line.Visible = false
+			end
+		end
+		if e.text then
+			e.text.Color = state.color
+			e.text.Text = label
+			if state.distance and headOk and headScreen then
+				e._basePos = headScreen
+				e.text.Visible = true
+				-- Final Position set in staggerNameLabels after all players update.
+			else
+				e._basePos = nil
+				e.text.Visible = false
+			end
+		end
+		-- Hide fallback if Drawing is active
+		if e.folder then
+			pcall(function()
+				e.folder:Destroy()
+			end)
+			e.folder = nil
+		end
+		if e.holder then
+			pcall(function()
+				e.holder:Destroy()
+			end)
+			e.holder = nil
+		end
+	else
+		-- Beam always connects world positions (works behind you in 3D).
+		-- Billboard names only when the head is in front — behind would float mid-view.
+		local headObj = camObjectPos(headWorldPos(char, theirRoot) or theirRoot.Position)
+		local headFront = isInFront(headObj)
+		ensureFallbackFolder(plr, myRoot, theirRoot, char)
+		if e.beam then
+			e.beam.Enabled = state.lines == true
+		end
+		if e.label then
+			e.label.Text = label
+		end
+		if e.billboard then
+			e.billboard.Enabled = state.distance == true and headFront
+			-- World-space stack when several heads share nearly the same spot.
+			if e.billboard.Enabled then
+				local stack = 0
+				local myHead = headWorldPos(char, theirRoot) or theirRoot.Position
+				for otherId, other in pairs(entries) do
+					if otherId ~= plr.UserId and other.billboard and other.billboard.Enabled and other._worldLabel then
+						if (other._worldLabel - myHead).Magnitude < 4 then
+							stack += 1
+						end
+					end
+				end
+				e._worldLabel = myHead
+				local base = getHead(char) and 1.5 or 3.5
+				e.billboard.StudsOffset = Vector3.new(0, base + stack * 1.35, 0)
+			else
+				e._worldLabel = nil
+			end
+		end
+	end
+end
+
+local function step()
+	if not state.enabled then
+		return
+	end
+	local myRoot = getMyRoot()
+	if not myRoot then
+		return
+	end
+	local seen = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			seen[plr.UserId] = true
+			updateOne(plr, myRoot)
+		end
+	end
+	for userId in pairs(entries) do
+		if not seen[userId] then
+			clearEntry(userId)
+		end
+	end
+	staggerNameLabels()
+end
+
+local function setEnabled(on)
+	state.enabled = on == true
+	if not state.enabled then
+		clearAll()
+		say('tracers off')
+		return
+	end
+	say(hasDrawing and 'tracers on (Drawing)' or 'tracers on (Beam/Highlight fallback)')
+end
+
+local function stopPlugin()
+	state.enabled = false
+	if getgenv()[GENV_CONN] then
+		pcall(function()
+			getgenv()[GENV_CONN]:Disconnect()
+		end)
+		getgenv()[GENV_CONN] = nil
+	end
+	clearAll()
+end
+
+getgenv()[GENV_STOP] = stopPlugin
+
+if getgenv()[GENV_CONN] then
+	pcall(function()
+		getgenv()[GENV_CONN]:Disconnect()
+	end)
+	getgenv()[GENV_CONN] = nil
+end
+getgenv()[GENV_CONN] = RunService.RenderStepped:Connect(function()
+	pcall(step)
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	clearEntry(plr.UserId)
+end)
+
+local Plugin = {
+	['PluginName'] = 'Tracers',
+	['PluginDescription'] = 'Lines + stud distance from other players to you, plus Highlight chams',
+	['Commands'] = {
+		['tracers'] = {
+			['ListName'] = 'tracers',
+			['Description'] = 'Enable tracers (line + distance + chams) on other players',
+			['Aliases'] = { 'espplayers', 'playertracers', 'ptracers' },
+			['Function'] = function()
+				setEnabled(true)
+			end,
+		},
+		['tracersoff'] = {
+			['ListName'] = 'tracersoff',
+			['Description'] = 'Disable tracers / chams',
+			['Aliases'] = { 'notracers', 'traceroff' },
+			['Function'] = function()
+				setEnabled(false)
+			end,
+		},
+		['tracerstoggle'] = {
+			['ListName'] = 'tracerstoggle',
+			['Description'] = 'Toggle tracers on/off',
+			['Aliases'] = { 'tracerstog', 'toggleracers' },
+			['Function'] = function()
+				setEnabled(not state.enabled)
+			end,
+		},
+		['tracerscolor'] = {
+			['ListName'] = 'tracerscolor [r g b]',
+			['Description'] = 'Set tracer/chams color 0-255 (default 255 70 70). Example: tracerscolor 0 255 120',
+			['Aliases'] = { 'tracercolour', 'espcolor' },
+			['Function'] = function(args)
+				local r = tonumber(args and args[1])
+				local g = tonumber(args and args[2])
+				local b = tonumber(args and args[3])
+				if not r or not g or not b then
+					say('usage: tracerscolor [r g b]  (0-255)')
+					return
+				end
+				state.color = Color3.fromRGB(
+					math.clamp(math.floor(r + 0.5), 0, 255),
+					math.clamp(math.floor(g + 0.5), 0, 255),
+					math.clamp(math.floor(b + 0.5), 0, 255)
+				)
+				say(('color set to %d %d %d'):format(
+					math.floor(state.color.R * 255 + 0.5),
+					math.floor(state.color.G * 255 + 0.5),
+					math.floor(state.color.B * 255 + 0.5)
+				))
+			end,
+		},
+		['tracerschams'] = {
+			['ListName'] = 'tracerschams [on|off]',
+			['Description'] = 'Toggle Highlight chams only (lines/distance stay)',
+			['Aliases'] = { 'chams', 'playerchams' },
+			['Function'] = function(args)
+				local raw = args and tostring(args[1] or ''):lower()
+				if raw == 'off' or raw == '0' or raw == 'false' then
+					state.chams = false
+				elseif raw == 'on' or raw == '1' or raw == 'true' then
+					state.chams = true
+				else
+					state.chams = not state.chams
+				end
+				if not state.chams then
+					for _, e in pairs(entries) do
+						if e.highlight then
+							pcall(function()
+								e.highlight:Destroy()
+							end)
+							e.highlight = nil
+						end
+					end
+				end
+				say('chams ' .. (state.chams and 'on' or 'off'))
+			end,
+		},
+	},
+}
+
+return Plugin

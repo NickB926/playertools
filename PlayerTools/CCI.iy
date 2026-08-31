@@ -1,0 +1,3404 @@
+--[[
+    CCI.iy (ClearCharItems) — Infinite Yield plugin
+    - Waits 10s after plugin load before heavy start (lets map/stream settle)
+    - Deletes children of every folder under workspace.CharacterItems
+      except YOUR folder (LocalPlayer.UserId) and optionally 105008790 (NickB926)
+    - Clears workspace.ActiveBats (visual bats) as they spawn
+    - Clears workspace.HitEffects (damage particles)
+    - Clears workspace.MobSpawnEffects (mob spawn VFX)
+    - Clears workspace.ShadowClones
+    - Clears workspace.Lava (Meteor Strike pools)
+    - Clears mob death VFX (KillFade suppress + HighlightModel soft-strip; never ResetEffect)
+    - Does NOT wipe ResetEffect (needed for player death/respawn)
+    - Clears ParticleEmitters under workspace (skips ResetEffect / Characters / your CharacterItems)
+    - Hides "Vel Obtained" chat lines (ChatVelTemplate)
+    - Removes AnimationController from mobs under workspace.Mobs only
+      (no per-frame Motor6D freeze; CharacterItems keep folders untouched except BladeTrail)
+    - Deletes all Accessories under workspace.Characters (hair/hats/wings/etc.)
+      except LocalPlayer + EXTRA_KEEP (NickB926)
+    - Deletes workspace.OptimizedGame.Wind (and keeps clearing if it respawns)
+    - Perf mode: low graphics + mute lights under VFX folders only (never Destroy map/world lights)
+    - Sets Roblox volume to 1 bar (all volume sliders) and mouse sensitivity to 0.2 (locked)
+    - MAP-SAFE: never Destroy workspace roots outside HitEffects/ActiveBats/MobSpawnEffects/ShadowClones/Lava
+    - Menu click relay so HUD.Menu / MenuButton still open inventory if GuiButton hits fail
+    - Sets exposure / maxzoom / Invisicam / mouse sens once after the 10s delay; destroys Lighting.MenuBlur once (no blur pin)
+    - Strips BladeTrail under your + NickB926 CharacterItems RightWeapon.Tool.Blade
+    - Runs IY loop fullbright (loopfb) after the 10s delay
+    - Runs CCI antilag once after the 10s delay (one budgeted map strip; keeps icons; no stream catch-up)
+    - Enables 2022 materials only via command (antilag keeps them off for flatter map)
+    - Auto hideiy on load (prefix key still works)
+    - Does not touch mouse cursor / CoreGui
+
+    Install: workspace/CCI.iy (or ClearCharItems.iy) → IY Plugins → Add → CCI
+    Commands: setexposure [value] | maxzoom [num|off] | sensitivity [num|off] | cci | ccioff | clearbats | clearhits | clearmobfx | clearclones | clearlava | clearvel | clearanims | cleardeath | clearparticles | perfmode | openinv | fixmouse | clearblur | 2022materials | un2022materials | autohideiyon | autohideiyoff | antilag
+]]
+
+local EXTRA_KEEP = {
+	['105008790'] = true, -- NickB926
+}
+
+local DEFAULT_EXPOSURE = -1.5
+local DEFAULT_MAX_ZOOM = 4000
+local DEFAULT_MOUSE_SENSITIVITY = 0.2
+local CCI_LOAD_DELAY = 10 -- seconds after plugin add before heavy binds / antilag
+local AUTOHIDE_IY_PATH = 'PlayerTools/autohide_iy'
+
+local Players = game:GetService('Players')
+local Lighting = game:GetService('Lighting')
+local UserInputService = game:GetService('UserInputService')
+local RunService = game:GetService('RunService')
+local MaterialService = game:GetService('MaterialService')
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait() or Players.LocalPlayer
+
+local sethidden = sethiddenproperty or set_hidden_property or set_hidden_prop
+local gethidden = gethiddenproperty or get_hidden_property or get_hidden_prop
+
+local function keepIds()
+	local keep = {}
+	for id in pairs(EXTRA_KEEP) do
+		keep[tostring(id)] = true
+	end
+	if LocalPlayer then
+		keep[tostring(LocalPlayer.UserId)] = true
+	end
+	return keep
+end
+
+local function shouldKeepFolder(folder)
+	if not folder then
+		return true
+	end
+	return keepIds()[tostring(folder.Name)] == true
+end
+
+-- Workspace roots SB2 uses for death / respawn / camera recovery.
+-- NEVER destroy these or strip their particles/lights — that voids the cam + kills Reset.
+-- NOTE: Do NOT put CharacterItems / Mobs here — CCI manages those via dedicated binds.
+local CRITICAL_WORKSPACE_NAMES = {
+	ResetEffect = true,
+	HighlightModel = true,
+	Characters = true,
+	Terrain = true,
+	Camera = true,
+	OptimizedGame = true,
+}
+
+-- Only these workspace roots may have their *children* wiped by CCI VFX nukes.
+local SAFE_WIPE_ROOT_NAMES = {
+	ActiveBats = true,
+	HitEffects = true,
+	MobSpawnEffects = true,
+	ShadowClones = true,
+	Lava = true,
+}
+
+-- Roots CCI is allowed to touch (VFX wipe / CharacterItems clear / mob anim strip).
+-- Everything else under Workspace is treated as map and is untouchable.
+local CCI_MANAGED_ROOT_NAMES = {
+	ActiveBats = true,
+	HitEffects = true,
+	MobSpawnEffects = true,
+	ShadowClones = true,
+	Lava = true,
+	CharacterItems = true,
+	Mobs = true,
+	Characters = true, -- Accessories only; never wipe the root / body parts
+}
+
+local function isCriticalWorkspace(inst)
+	if not inst then
+		return true
+	end
+	local ok, critical = pcall(function()
+		for name in pairs(CRITICAL_WORKSPACE_NAMES) do
+			local root = workspace:FindFirstChild(name)
+			if root and (inst == root or inst:IsDescendantOf(root)) then
+				return true
+			end
+		end
+		local cur = inst
+		while cur and cur ~= game do
+			if cur.Parent == workspace and CRITICAL_WORKSPACE_NAMES[cur.Name] then
+				return true
+			end
+			cur = cur.Parent
+		end
+		return false
+	end)
+	return ok and critical == true
+end
+
+-- True if this instance is (or is under) map content — never Destroy these.
+local function isMapProtected(inst)
+	if not inst then
+		return true
+	end
+	local ok, protected = pcall(function()
+		if inst == workspace or inst == workspace.Terrain then
+			return true
+		end
+		local cur = inst
+		if inst.Parent == workspace then
+			cur = inst
+		else
+			while cur and cur.Parent and cur.Parent ~= workspace and cur.Parent ~= game do
+				cur = cur.Parent
+			end
+		end
+		if cur and cur.Parent == workspace then
+			-- Managed by CCI binds — not "map".
+			if CCI_MANAGED_ROOT_NAMES[cur.Name] then
+				return false
+			end
+			-- Critical roots + any other workspace folder (teleporters, traps, map chunks…).
+			return true
+		end
+		return false
+	end)
+	return ok and protected == true
+end
+
+local function isSafeWipeChild(inst)
+	if not inst or not inst.Parent then
+		return false
+	end
+	local parent = inst.Parent
+	return parent.Parent == workspace and SAFE_WIPE_ROOT_NAMES[parent.Name] == true
+end
+
+-- Never strip anims / particles from your character, Characters, death FX, map, or your CharacterItems.
+local function isPlayerProtected(inst)
+	if not inst then
+		return true
+	end
+	if isCriticalWorkspace(inst) then
+		return true
+	end
+	if isMapProtected(inst) then
+		return true
+	end
+	local ok, protected = pcall(function()
+		local char = LocalPlayer and LocalPlayer.Character
+		if char and (inst == char or inst:IsDescendantOf(char)) then
+			return true
+		end
+		local characters = workspace:FindFirstChild('Characters')
+		if characters and (inst == characters or inst:IsDescendantOf(characters)) then
+			return true
+		end
+		local items = workspace:FindFirstChild('CharacterItems')
+		if items and LocalPlayer then
+			local mine = items:FindFirstChild(tostring(LocalPlayer.UserId))
+			if mine and (inst == mine or inst:IsDescendantOf(mine)) then
+				return true
+			end
+			for id in pairs(keepIds()) do
+				local keepFolder = items:FindFirstChild(tostring(id))
+				if keepFolder and (inst == keepFolder or inst:IsDescendantOf(keepFolder)) then
+					return true
+				end
+			end
+		end
+		return false
+	end)
+	return ok and protected == true
+end
+
+local function isUnderMobs(inst)
+	if not inst then
+		return false
+	end
+	local mobs = workspace:FindFirstChild('Mobs')
+	return mobs ~= nil and (inst == mobs or inst:IsDescendantOf(mobs))
+end
+
+local function say(msg)
+	msg = tostring(msg)
+	print('[CCI] ' .. msg)
+	pcall(function()
+		if type(notify) == 'function' then
+			notify(msg)
+		end
+	end)
+	pcall(function()
+		game:GetService('StarterGui'):SetCore('SendNotification', {
+			Title = 'CCI',
+			Text = msg,
+			Duration = 4,
+		})
+	end)
+end
+
+local function runFullbright()
+	pcall(function()
+		if type(execCmd) == 'function' then
+			execCmd('loopfb')
+			return
+		end
+		-- Fallback when execCmd is unavailable — same as IY loopfb
+		if getgenv().SB2CciBrightLoop then
+			pcall(function()
+				getgenv().SB2CciBrightLoop:Disconnect()
+			end)
+			getgenv().SB2CciBrightLoop = nil
+		end
+		local function brightFunc()
+			Lighting.Brightness = 2
+			Lighting.ClockTime = 14
+			Lighting.FogEnd = 100000
+			Lighting.GlobalShadows = false
+			Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+		end
+		brightFunc()
+		getgenv().SB2CciBrightLoop = RunService.RenderStepped:Connect(brightFunc)
+	end)
+end
+
+-- CCI antilag — IY-style boost, but do NOT scan game:GetDescendants().
+-- IY blanks every Decal in the DataModel, including ReplicatedStorage.Database
+-- item icon sources — that turns inventory tiles into ? until you rejoin.
+-- We only strip workspace (map/VFX) + lighting/quality, and never touch GUIs / Database.
+-- Also clears MeshPart.TextureID (IY plastic alone leaves those map textures visible).
+-- One budgeted workspace walk after the load delay — no DescendantAdded stream catch-up.
+local function runAntilag()
+	pcall(function()
+		if getgenv().SB2CciAntilagConn then
+			pcall(function()
+				getgenv().SB2CciAntilagConn:Disconnect()
+			end)
+			getgenv().SB2CciAntilagConn = nil
+		end
+		if getgenv().SB2CciAntilagFlushConn then
+			pcall(function()
+				getgenv().SB2CciAntilagFlushConn:Disconnect()
+			end)
+			getgenv().SB2CciAntilagFlushConn = nil
+		end
+		getgenv().SB2CciAntilagGen = (tonumber(getgenv().SB2CciAntilagGen) or 0) + 1
+		local gen = getgenv().SB2CciAntilagGen
+
+		local terrain = workspace:FindFirstChildWhichIsA('Terrain') or workspace.Terrain
+		if terrain then
+			pcall(function()
+				terrain.WaterWaveSize = 0
+				terrain.WaterWaveSpeed = 0
+				terrain.WaterReflectance = 0
+				terrain.WaterTransparency = 1
+			end)
+			-- Roblox terrain grass blades — Decoration is hidden on some clients.
+			if type(sethidden) == 'function' then
+				pcall(sethidden, terrain, 'Decoration', false)
+				pcall(sethidden, terrain, 'GrassLength', 0)
+			end
+			-- Terrain voxels cannot be Plastic (remaps to Grass); Salt looked fleshy.
+			-- Do not Clear() — map Parts are plasticized by the DFS strip below.
+		end
+
+		pcall(function()
+			-- Cheapest lighting pipeline (Future was hitching with 300+ lights).
+			pcall(function()
+				Lighting.Technology = Enum.Technology.Compatibility
+			end)
+			if Lighting.Technology ~= Enum.Technology.Compatibility then
+				pcall(function()
+					Lighting.Technology = Enum.Technology.Voxel
+				end)
+			end
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 9e9
+			Lighting.FogStart = 9e9
+			Lighting.Brightness = math.min(Lighting.Brightness, 2)
+			pcall(function()
+				Lighting.EnvironmentDiffuseScale = 0
+				Lighting.EnvironmentSpecularScale = 0
+				Lighting.ShadowSoftness = 0
+			end)
+		end)
+		-- Do not force Rendering.QualityLevel / SavedQualityLevel — leave user's graphics setting alone.
+		-- Flat materials (no 2022 variants) so plastic parts look less textured.
+		if type(sethidden) == 'function' then
+			pcall(sethidden, MaterialService, 'Use2022Materials', false)
+		end
+		getgenv().SB2Use2022Materials = false
+
+		for _, v in ipairs(Lighting:GetDescendants()) do
+			if v:IsA('PostEffect') then
+				pcall(function()
+					v.Enabled = false
+				end)
+			elseif v:IsA('Atmosphere') then
+				pcall(function()
+					v.Density = 0
+					v.Haze = 0
+					v.Glare = 0
+				end)
+			end
+		end
+
+		-- Mute world lights (huge cost under Future; still helps on Compatibility/Voxel).
+		-- Skip Characters / CharacterItems / Mobs so gear glows stay.
+		task.spawn(function()
+			if getgenv().SB2CciAntilagGen ~= gen then
+				return
+			end
+			local skip = {
+				Characters = true,
+				CharacterItems = true,
+				Mobs = true,
+				Camera = true,
+			}
+			local function underSkip(inst)
+				local p = inst
+				while p and p ~= game do
+					if skip[p.Name] then
+						return true
+					end
+					p = p.Parent
+				end
+				return false
+			end
+			local n = 0
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if getgenv().SB2CciAntilagGen ~= gen then
+					return
+				end
+				if (d:IsA('PointLight') or d:IsA('SpotLight') or d:IsA('SurfaceLight'))
+					and d.Enabled
+					and not underSkip(d)
+				then
+					pcall(function()
+						d.Enabled = false
+					end)
+					n += 1
+					if n % 200 == 0 then
+						task.wait()
+					end
+				end
+			end
+		end)
+
+		-- Do not descend into these workspace roots (characters/icons/mobs stay intact).
+		local SKIP_ROOT = {
+			Characters = true,
+			CharacterItems = true,
+			Camera = true,
+			Terrain = true,
+			Mobs = true,
+		}
+
+		local function skipInstance(inst)
+			if not inst then
+				return true
+			end
+			if inst:IsA('ImageLabel') or inst:IsA('ImageButton') or inst:IsA('VideoFrame') then
+				return true
+			end
+			local p = inst
+			while p and p ~= game do
+				if p:IsA('PlayerGui') or p:IsA('CoreGui') or p:IsA('StarterGui') then
+					return true
+				end
+				if p:IsA('LayerCollector') or p:IsA('GuiObject') or p:IsA('GuiBase2d') then
+					return true
+				end
+				if p:IsA('ReplicatedStorage') or p:IsA('ReplicatedFirst') or p:IsA('Players') then
+					return true
+				end
+				if p.Name == 'Database' or p.Name == 'Profiles' then
+					return true
+				end
+				if SKIP_ROOT[p.Name] then
+					return true
+				end
+				if p == LocalPlayer.Character then
+					return true
+				end
+				p = p.Parent
+			end
+			return false
+		end
+
+		local function stripBasePart(v)
+			pcall(function()
+				v.CastShadow = false
+				v.Material = Enum.Material.SmoothPlastic
+				v.Reflectance = 0
+				v.MaterialVariant = ''
+				v.BackSurface = Enum.SurfaceType.SmoothNoOutlines
+				v.BottomSurface = Enum.SurfaceType.SmoothNoOutlines
+				v.FrontSurface = Enum.SurfaceType.SmoothNoOutlines
+				v.LeftSurface = Enum.SurfaceType.SmoothNoOutlines
+				v.RightSurface = Enum.SurfaceType.SmoothNoOutlines
+				v.TopSurface = Enum.SurfaceType.SmoothNoOutlines
+			end)
+			-- SmoothPlastic alone does not remove MeshPart / SpecialMesh baked textures.
+			if v:IsA('MeshPart') then
+				pcall(function()
+					v.TextureID = ''
+				end)
+			end
+			for _, child in ipairs(v:GetChildren()) do
+				if child:IsA('SpecialMesh') then
+					pcall(function()
+						child.TextureId = ''
+					end)
+				elseif child:IsA('SurfaceAppearance') then
+					pcall(function()
+						child:Destroy()
+					end)
+				elseif child:IsA('MaterialVariant') then
+					pcall(function()
+						child:Destroy()
+					end)
+				elseif child:IsA('Decal') or child:IsA('Texture') then
+					pcall(function()
+						child.Transparency = 1
+						if child:IsA('Decal') then
+							child.Texture = ''
+						else
+							child.Texture = ''
+						end
+					end)
+				end
+			end
+		end
+
+		local function stripDecal(v)
+			pcall(function()
+				v.Transparency = 1
+				v.Texture = ''
+			end)
+		end
+
+		local function stripParticle(v)
+			pcall(function()
+				v.Lifetime = NumberRange.new(0)
+			end)
+		end
+
+		local function alreadyStripped(v)
+			if not v:IsA('BasePart') then
+				return false
+			end
+			if (v.Material ~= Enum.Material.SmoothPlastic and v.Material ~= Enum.Material.Plastic) or v.CastShadow then
+				return false
+			end
+			if v:IsA('MeshPart') and tostring(v.TextureID) ~= '' then
+				return false
+			end
+			return true
+		end
+
+		local GRASS_NAMES = {
+			Grass = true,
+			TallGrass = true,
+			Foliage = true,
+			Leaves = true,
+			Leaf = true,
+			Bush = true,
+			Bushes = true,
+		}
+
+		local function removeGrass(v)
+			if not v or not GRASS_NAMES[v.Name] then
+				return false
+			end
+			if skipInstance(v) then
+				return false
+			end
+			pcall(function()
+				v:Destroy()
+			end)
+			return true
+		end
+
+		local function applyOne(v)
+			if removeGrass(v) then
+				return
+			end
+			if skipInstance(v) then
+				return
+			end
+			if v:IsA('ForceField')
+				or v:IsA('Sparkles')
+				or v:IsA('Smoke')
+				or v:IsA('Fire')
+				or v:IsA('Beam')
+			then
+				pcall(function()
+					v:Destroy()
+				end)
+				return
+			end
+			if v:IsA('BasePart') then
+				if not alreadyStripped(v) then
+					stripBasePart(v)
+				end
+			elseif v:IsA('Decal') or v:IsA('Texture') then
+				stripDecal(v)
+			elseif v:IsA('SpecialMesh') then
+				pcall(function()
+					v.TextureId = ''
+				end)
+			elseif v:IsA('SurfaceAppearance') then
+				pcall(function()
+					v:Destroy()
+				end)
+			elseif v:IsA('ParticleEmitter') or v:IsA('Trail') then
+				stripParticle(v)
+			end
+		end
+
+		-- One budgeted DFS of workspace (skips Characters / CharacterItems / Mobs / Camera / Terrain).
+		-- No DescendantAdded — later streamed map keeps textures.
+		local stack = {}
+		for _, child in ipairs(workspace:GetChildren()) do
+			if not SKIP_ROOT[child.Name] then
+				stack[#stack + 1] = child
+			end
+		end
+
+		getgenv().SB2CciAntilagFlushConn = RunService.Heartbeat:Connect(function()
+			if getgenv().SB2CciAntilagGen ~= gen then
+				return
+			end
+			local budget = 80
+			local t0 = os.clock()
+			while #stack > 0 and budget > 0 and (os.clock() - t0) < 0.002 do
+				local inst = table.remove(stack)
+				budget -= 1
+				if not inst or not inst.Parent then
+					continue
+				end
+				if SKIP_ROOT[inst.Name] then
+					continue
+				end
+				applyOne(inst)
+				local kids = inst:GetChildren()
+				for i = 1, #kids do
+					local k = kids[i]
+					if not SKIP_ROOT[k.Name] then
+						stack[#stack + 1] = k
+					end
+				end
+			end
+			if #stack == 0 then
+				pcall(function()
+					getgenv().SB2CciAntilagFlushConn:Disconnect()
+				end)
+				getgenv().SB2CciAntilagFlushConn = nil
+			end
+		end)
+
+		-- Entity shadows are CastShadow on Characters / Mobs / CharacterItems parts
+		-- (no separate Shadow instances). Antilag DFS skips those roots, so strip here.
+		local function clearCastShadow(inst)
+			if inst and inst:IsA('BasePart') then
+				pcall(function()
+					inst.CastShadow = false
+				end)
+			end
+		end
+		local function clearEntityShadows(root)
+			if not root then
+				return
+			end
+			for _, d in ipairs(root:GetDescendants()) do
+				clearCastShadow(d)
+			end
+		end
+		clearEntityShadows(workspace:FindFirstChild('Characters'))
+		clearEntityShadows(workspace:FindFirstChild('Mobs'))
+		clearEntityShadows(workspace:FindFirstChild('CharacterItems'))
+		if type(getgenv().SB2CciEntityShadowConns) == 'table' then
+			for _, c in ipairs(getgenv().SB2CciEntityShadowConns) do
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+		end
+		local shadowConns = {}
+		getgenv().SB2CciEntityShadowConns = shadowConns
+		local function watchEntityRoot(root)
+			if not root then
+				return
+			end
+			shadowConns[#shadowConns + 1] = root.DescendantAdded:Connect(function(inst)
+				if getgenv().SB2CciAntilagGen ~= gen then
+					return
+				end
+				clearCastShadow(inst)
+			end)
+		end
+		watchEntityRoot(workspace:FindFirstChild('Characters'))
+		watchEntityRoot(workspace:FindFirstChild('Mobs'))
+		watchEntityRoot(workspace:FindFirstChild('CharacterItems'))
+		shadowConns[#shadowConns + 1] = workspace.ChildAdded:Connect(function(child)
+			if getgenv().SB2CciAntilagGen ~= gen then
+				return
+			end
+			if child.Name == 'Characters' or child.Name == 'Mobs' or child.Name == 'CharacterItems' then
+				clearEntityShadows(child)
+				watchEntityRoot(child)
+			end
+		end)
+
+		getgenv().SB2CciAntilagOn = true
+	end)
+end
+
+-- IY `2022materials` — packed into CCI so it is not a separate plugin.
+local function set2022Materials(on)
+	if type(sethidden) ~= 'function' then
+		return false, 'sethiddenproperty unavailable'
+	end
+	local ok = pcall(sethidden, MaterialService, 'Use2022Materials', on == true)
+	if not ok then
+		return false, 'sethidden failed'
+	end
+	getgenv().SB2Use2022Materials = on == true
+	return true
+end
+
+local function run2022Materials()
+	local ok, err = set2022Materials(true)
+	if not ok then
+		say('2022 materials skipped: ' .. tostring(err))
+	end
+end
+
+-- Auto hideiy — packed into CCI (was AutoHideIY.iy).
+local function readAutoHideIY()
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		for _, path in ipairs({ AUTOHIDE_IY_PATH, 'autohide_iy' }) do
+			local ok, exists = pcall(isfile, path)
+			if ok and exists then
+				local okRead, body = pcall(readfile, path)
+				if okRead then
+					local s = tostring(body):lower():gsub('%s+', '')
+					if s == 'false' or s == '0' or s == 'off' then
+						return false
+					end
+					return true
+				end
+			end
+		end
+	end
+	return true -- default ON
+end
+
+local function writeAutoHideIY(on)
+	if type(writefile) ~= 'function' then
+		return
+	end
+	pcall(function()
+		if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('PlayerTools') then
+			makefolder('PlayerTools')
+		end
+	end)
+	pcall(writefile, AUTOHIDE_IY_PATH, on and 'true' or 'false')
+end
+
+local function hideIYNow(silent)
+	if type(execCmd) == 'function' then
+		pcall(execCmd, silent and 'hideiy nonotify' or 'hideiy')
+		return true
+	end
+	return false
+end
+
+local function runAutoHideIY()
+	if not readAutoHideIY() then
+		getgenv().SB2AutoHideIY = false
+		return
+	end
+	getgenv().SB2AutoHideIY = true
+	hideIYNow(true)
+	task.defer(function()
+		hideIYNow(true)
+	end)
+	task.delay(0.35, function()
+		if readAutoHideIY() then
+			hideIYNow(true)
+		end
+	end)
+	task.delay(1.25, function()
+		if readAutoHideIY() then
+			hideIYNow(true)
+		end
+	end)
+end
+
+-- Floors/teleport menu blur — destroy once per load (game does not need continuous pin).
+local function clearMenuBlur()
+	local blur = Lighting:FindFirstChild('MenuBlur')
+	if not blur then
+		return false
+	end
+	local ok = pcall(function()
+		blur:Destroy()
+	end)
+	return ok
+end
+getgenv().SB2ClearMenuBlurs = clearMenuBlur
+getgenv().SB2ClearMenuBlur = clearMenuBlur
+
+local function setExposure(value)
+	local target = value
+	if type(target) ~= 'number' then
+		target = getgenv().SB2ExposureTarget
+	end
+	if type(target) ~= 'number' then
+		target = DEFAULT_EXPOSURE
+	end
+	getgenv().SB2ExposureTarget = target
+	getgenv().SB2ExposureLock = true
+
+	local ok, err = pcall(function()
+		Lighting.ExposureCompensation = target
+	end)
+	-- Also nudge bloom down a bit so the change is more visible on this floor.
+	pcall(function()
+		local bloom = Lighting:FindFirstChildWhichIsA('BloomEffect')
+		if bloom then
+			bloom.Intensity = math.min(bloom.Intensity, 0.35)
+		end
+	end)
+	return ok, err, target, Lighting.ExposureCompensation
+end
+
+local function clearMaxZoomCharConns()
+	local packs = getgenv().SB2MaxZoomCharConns
+	if type(packs) ~= 'table' then
+		getgenv().SB2MaxZoomCharConns = {}
+		return
+	end
+	for _, pack in ipairs(packs) do
+		for _, c in ipairs(pack) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+	end
+	getgenv().SB2MaxZoomCharConns = {}
+end
+
+local function applyMaxZoomDistance(target)
+	if type(target) ~= 'number' or target < 0.5 then
+		return false
+	end
+	local ok = pcall(function()
+		if LocalPlayer.CameraMaxZoomDistance ~= target then
+			LocalPlayer.CameraMaxZoomDistance = target
+		end
+	end)
+	return ok, target
+end
+
+local function maxZoomStreamAssist()
+	if not getgenv().SB2MaxZoomLock then
+		return
+	end
+	local char = LocalPlayer.Character
+	if not char then
+		return
+	end
+	local hrp = char:FindFirstChild('HumanoidRootPart')
+	local cam = workspace.CurrentCamera
+	if not hrp or not cam then
+		return
+	end
+	local dist = (cam.CFrame.Position - hrp.Position).Magnitude
+	if dist < 90 then
+		return
+	end
+	if type(getgenv().SB2LockReplicationFocus) == 'function' then
+		pcall(getgenv().SB2LockReplicationFocus, char)
+	end
+	if type(getgenv().SB2RequestStreamAround) == 'function' then
+		pcall(getgenv().SB2RequestStreamAround, char, true)
+		return
+	end
+	pcall(function()
+		if LocalPlayer.ReplicationFocus ~= hrp then
+			LocalPlayer.ReplicationFocus = hrp
+		end
+		local radius = math.clamp(math.floor(dist * 0.12 + 40), 40, 280)
+		LocalPlayer:RequestStreamAroundAsync(hrp.Position, radius)
+	end)
+end
+
+local function bindMaxZoomCharacter(char)
+	if not char or not getgenv().SB2MaxZoomLock then
+		return
+	end
+	local target = getgenv().SB2MaxZoomTarget
+	if type(target) ~= 'number' then
+		target = DEFAULT_MAX_ZOOM
+	end
+	applyMaxZoomDistance(target)
+	local pack = {}
+	pack[#pack + 1] = LocalPlayer:GetPropertyChangedSignal('CameraMaxZoomDistance'):Connect(function()
+		if not getgenv().SB2MaxZoomLock then
+			return
+		end
+		local t = getgenv().SB2MaxZoomTarget or DEFAULT_MAX_ZOOM
+		if math.abs((LocalPlayer.CameraMaxZoomDistance or 0) - t) > 0.01 then
+			applyMaxZoomDistance(t)
+		end
+	end)
+	getgenv().SB2MaxZoomCharConns = getgenv().SB2MaxZoomCharConns or {}
+	getgenv().SB2MaxZoomCharConns[#getgenv().SB2MaxZoomCharConns + 1] = pack
+end
+
+local function setMaxZoom(value)
+	if type(value) == 'string' and value:lower() == 'off' then
+		getgenv().SB2MaxZoomLock = false
+		getgenv().SB2MaxZoomPending = false
+		clearMaxZoomCharConns()
+		return true, nil, nil, LocalPlayer and LocalPlayer.CameraMaxZoomDistance
+	end
+	local target = value
+	if type(target) ~= 'number' then
+		target = getgenv().SB2MaxZoomTarget
+	end
+	if type(target) ~= 'number' then
+		target = DEFAULT_MAX_ZOOM
+	end
+	getgenv().SB2MaxZoomTarget = target
+	getgenv().SB2MaxZoomLock = true
+	applyMaxZoomDistance(target)
+	clearMaxZoomCharConns()
+	if LocalPlayer.Character then
+		bindMaxZoomCharacter(LocalPlayer.Character)
+	end
+	return true, nil, target, LocalPlayer.CameraMaxZoomDistance
+end
+getgenv().SB2SetMaxZoom = setMaxZoom
+
+-- Built-in wall see-through only (no custom LocalTransparencyModifier camsee).
+local function applyInvisicam()
+	pcall(function()
+		if LocalPlayer.DevCameraOcclusionMode ~= Enum.DevCameraOcclusionMode.Invisicam then
+			LocalPlayer.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam
+		end
+	end)
+end
+getgenv().SB2ApplyInvisicam = applyInvisicam
+
+local function applyMouseSensitivity(target)
+	if type(target) ~= 'number' or target < 0 then
+		return false
+	end
+	pcall(function()
+		local gs = UserSettings():GetService('UserGameSettings')
+		if math.abs((gs.MouseSensitivity or 0) - target) > 0.001 then
+			gs.MouseSensitivity = target
+		end
+		-- Match Roblox settings slider only — do NOT touch MouseDeltaSensitivity
+		-- (that is a separate multiplier; writing 0.52 there feels nothing like the slider).
+		pcall(function()
+			local v = Vector2.new(target, target)
+			if gs.MouseSensitivityFirstPerson ~= v then
+				gs.MouseSensitivityFirstPerson = v
+			end
+		end)
+		pcall(function()
+			local v = Vector2.new(target, target)
+			if gs.MouseSensitivityThirdPerson ~= v then
+				gs.MouseSensitivityThirdPerson = v
+			end
+		end)
+	end)
+	pcall(function()
+		-- Keep delta multiplier at default so pinned sens matches the settings UI.
+		if math.abs((UserInputService.MouseDeltaSensitivity or 1) - 1) > 0.001 then
+			UserInputService.MouseDeltaSensitivity = 1
+		end
+	end)
+	return true, target
+end
+
+local function setMouseSensitivity(value)
+	if type(value) == 'string' and value:lower() == 'off' then
+		getgenv().SB2MouseSensLock = false
+		local now
+		pcall(function()
+			now = UserSettings():GetService('UserGameSettings').MouseSensitivity
+		end)
+		return true, nil, nil, now
+	end
+	local target = value
+	if type(target) ~= 'number' then
+		target = getgenv().SB2MouseSensTarget
+	end
+	if type(target) ~= 'number' then
+		target = DEFAULT_MOUSE_SENSITIVITY
+	end
+	getgenv().SB2MouseSensTarget = target
+	getgenv().SB2MouseSensLock = true
+	applyMouseSensitivity(target)
+	local now
+	pcall(function()
+		now = UserSettings():GetService('UserGameSettings').MouseSensitivity
+	end)
+	return true, nil, target, now
+end
+getgenv().SB2SetMouseSensitivity = setMouseSensitivity
+
+local function restoreMouse()
+	getgenv().SB2DefaultCursorLock = true
+	pcall(function()
+		UserInputService.MouseIconEnabled = true
+	end)
+	pcall(function()
+		local mouse = LocalPlayer and LocalPlayer:GetMouse()
+		if mouse then
+			mouse.Icon = ''
+		end
+	end)
+end
+
+-- SB2 sets MouseIconEnabled=false (shows + crosshair). Apply default OS cursor once on load.
+-- No Heartbeat locker — PlayerTools also applies once after its load.
+do
+	getgenv().SB2DefaultCursorLock = true
+	if getgenv().SB2DefaultCursorLockConn then
+		pcall(function()
+			getgenv().SB2DefaultCursorLockConn:Disconnect()
+		end)
+		getgenv().SB2DefaultCursorLockConn = nil
+	end
+	restoreMouse()
+end
+
+-- Stop a previous instance of this plugin if reloaded.
+if getgenv().SB2ClearCharItemsStop then
+	pcall(getgenv().SB2ClearCharItemsStop)
+end
+
+-- Always drop stale bind markers so the first load re-hooks (IY reload / partial stop
+-- used to leave genv set → bind* early-returned with no ChildAdded connections).
+do
+	local g = getgenv()
+	g.SB2ClearCharItemsBound = nil
+	g.SB2ClearVelChatBound = nil
+	g.SB2ClearMobAnimsBound = nil
+	g.SB2ClearDeathFxBound = nil
+	g.SB2ClearParticlesBound = nil
+	g.SB2ClearActiveBatsBound = nil
+	g.SB2ClearHitEffectsBound = nil
+	g.SB2ClearMobSpawnEffectsBound = nil
+	g.SB2ClearShadowClonesBound = nil
+	g.SB2PerfBound = nil
+	g.SB2ClearSweepConn = nil
+	g.SB2ClearVelEnabled = true
+end
+
+local tracked = {}
+local bladeTrailTracked = {}
+local characterHatTracked = {} -- Characters model -> ChildAdded conn
+local characterHatsHooked = nil
+local optimizedGameWindHooked = nil
+local rootConns = {}
+local wipeTargets = {}
+local velConns = {}
+local mobAnimConns = {}
+local mobTrackConns = {} -- [mob] = connection
+local charItemsHooked = nil -- local session root; genv alone is not enough after reload
+local sweepConn = nil
+local particleConn = nil
+local particleSweepThread = nil
+local velUiRetryThread = nil
+local enabled = false -- flipped true after CCI_LOAD_DELAY
+local velEnabled = true
+local mobAnimEnabled = true
+local deathFxEnabled = true
+local particlesEnabled = true
+local perfEnabled = true
+local cciLoadToken = 0
+local DEATH_FX_NAMES = {
+	-- HighlightModel = mob death flash (safe to clear). NEVER ResetEffect.
+	HighlightModel = true,
+	Lava = true, -- Meteor Strike ground pools
+}
+
+-- UI stashing disabled — it broke inventory/menu open (game uses Activated handlers
+-- that expect full CardinalUI hierarchy). Perf mode keeps graphics/lights only.
+local HEAVY_TAB_NAMES = {}
+local HEAVY_UI_NAMES = {}
+
+local function makeWipeTarget(folderName, genvBoundKey)
+	local target = {
+		name = folderName,
+		genvKey = genvBoundKey,
+		enabled = true,
+		conns = {},
+	}
+	wipeTargets[#wipeTargets + 1] = target
+	return target
+end
+
+local batsTarget = makeWipeTarget('ActiveBats', 'SB2ClearActiveBatsBound')
+local hitsTarget = makeWipeTarget('HitEffects', 'SB2ClearHitEffectsBound')
+local mobFxTarget = makeWipeTarget('MobSpawnEffects', 'SB2ClearMobSpawnEffectsBound')
+local clonesTarget = makeWipeTarget('ShadowClones', 'SB2ClearShadowClonesBound')
+
+local function isLiveVelFrame(frame)
+	if not frame or frame.Name ~= 'ChatVelTemplate' then
+		return false
+	end
+	-- Live spam lines sit under chat ScrollContent. Never touch a prototype still
+	-- nested under a Templates / Storage folder outside Chat.
+	local parent = frame.Parent
+	if not parent then
+		return false
+	end
+	if parent.Name == 'ScrollContent' then
+		return true
+	end
+	-- Fallback: visible clone anywhere under PlayerGui Chat.
+	local ok, underChat = pcall(function()
+		local cur = frame
+		while cur and cur ~= game do
+			if cur.Name == 'Chat' and cur:FindFirstAncestorOfClass('PlayerGui') then
+				return frame:IsA('GuiObject') and frame.Visible
+			end
+			cur = cur.Parent
+		end
+		return false
+	end)
+	return ok and underChat == true
+end
+
+local function destroyVelFrame(frame)
+	if not isLiveVelFrame(frame) then
+		return
+	end
+	-- Match SB2 dump: hide first, wait for layout Position write, then Destroy.
+	-- Instant Destroy races the chat layout and leaves ghost "Vel Obtained" lines.
+	pcall(function()
+		frame.Visible = false
+		frame.Size = UDim2.fromOffset(0, -5)
+	end)
+	task.spawn(function()
+		pcall(function()
+			if frame.Parent then
+				frame:GetPropertyChangedSignal('Position'):Wait()
+			end
+		end)
+		pcall(function()
+			if frame.Parent then
+				frame:Destroy()
+			end
+		end)
+	end)
+end
+
+local function wipeVelTemplates(scroll)
+	if not scroll then
+		return
+	end
+	for _, child in ipairs(scroll:GetChildren()) do
+		if child.Name == 'ChatVelTemplate' then
+			destroyVelFrame(child)
+		end
+	end
+end
+
+local cachedChatScroll = nil
+local chatScrollSearchAt = 0
+
+local function findChatScroll()
+	if cachedChatScroll and cachedChatScroll.Parent then
+		return cachedChatScroll
+	end
+	cachedChatScroll = nil
+	local playerGui = LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui')
+	if not playerGui then
+		return nil
+	end
+	local cardinal = playerGui:FindFirstChild('CardinalUI')
+	local playerUI = cardinal and cardinal:FindFirstChild('PlayerUI')
+	local chat = playerUI and playerUI:FindFirstChild('Chat')
+	local scroll = chat and chat:FindFirstChild('ScrollContent')
+	if scroll then
+		cachedChatScroll = scroll
+		return scroll
+	end
+	-- Expensive fallback — at most once every 10s.
+	local now = os.clock()
+	if (now - chatScrollSearchAt) < 10 then
+		return nil
+	end
+	chatScrollSearchAt = now
+	for _, d in ipairs(playerGui:GetDescendants()) do
+		if d.Name == 'ScrollContent' and d.Parent and d.Parent.Name == 'Chat' then
+			cachedChatScroll = d
+			return d
+		end
+	end
+	return nil
+end
+
+-- Only wipe under known chat scroll — never PlayerGui:GetDescendants (28k+ hitch).
+local function wipeAllVelFrames()
+	local scroll = findChatScroll()
+	if not scroll then
+		return 0
+	end
+	wipeVelTemplates(scroll)
+	return 0
+end
+
+-- Game chat uses bottom-anchored positions (UDim2 yScale=1, negative offset).
+-- Destroying lines without reflow leaves messages stranded off-screen ("1 line chat").
+local function reflowChatScroll(scroll)
+	if not scroll then
+		return
+	end
+	local lines = {}
+	for _, child in ipairs(scroll:GetChildren()) do
+		if child:IsA('GuiObject')
+			and not child:IsA('UIListLayout')
+			and not child:IsA('UIPadding')
+			and not child:IsA('UIStroke')
+			and child.Name ~= 'UIListLayout'
+			and child.Name ~= 'UIPadding'
+			and child.Name ~= 'ChatVelTemplate'
+		then
+			lines[#lines + 1] = child
+		end
+	end
+	local yOff = 0
+	for i = #lines, 1, -1 do
+		local c = lines[i]
+		local h = c.AbsoluteSize.Y
+		if h < 1 then
+			h = (c.Name == 'ChatItemTemplate') and 60 or 25
+		end
+		yOff += h
+		pcall(function()
+			c.Position = UDim2.new(0, 0, 1, -yOff)
+		end)
+	end
+	local height = math.max(yOff, 1)
+	pcall(function()
+		scroll.CanvasSize = UDim2.new(1, 0, 0, height)
+		local win = scroll.AbsoluteWindowSize.Y
+		if win < 1 then
+			win = scroll.AbsoluteSize.Y
+		end
+		scroll.CanvasPosition = Vector2.new(0, math.max(0, height - win))
+	end)
+end
+
+local function trimChatScroll(scroll)
+	if not scroll then
+		return
+	end
+	-- Only remove Vel Obtained spam — never delete normal chat lines (breaks bottom-anchored layout).
+	wipeVelTemplates(scroll)
+	reflowChatScroll(scroll)
+end
+
+local function findGameService(serviceName)
+	local ok, objects = pcall(getgc, true)
+	if not ok or type(objects) ~= 'table' then
+		return nil
+	end
+	for _, object in next, objects do
+		if type(object) == 'table' then
+			local Services = rawget(object, 'Services')
+			local svc = Services and rawget(Services, serviceName)
+			if svc and type(rawget(svc, 'ServerEvent')) == 'function' then
+				return svc
+			end
+		end
+	end
+	return nil
+end
+
+local function installVelUIHook()
+	getgenv().SB2ClearVelEnabled = velEnabled
+	local UI = findGameService('UI')
+	if not UI or type(UI.ServerEvent) ~= 'function' then
+		return false
+	end
+	-- Already wrapping this exact function — just keep the flag on.
+	if getgenv().SB2ClearVelUIWrapped == UI.ServerEvent and getgenv().SB2ClearVelUIOld then
+		return true
+	end
+	-- Game replaced ServerEvent (or first install) — wrap whatever is live now.
+	getgenv().SB2ClearVelUIOld = UI.ServerEvent
+	local function wrapped(...)
+		if getgenv().SB2ClearVelEnabled then
+			local args = { ... }
+			local payload = args[1]
+			if type(payload) == 'table' and payload[2] == 'VelObtained' then
+				return
+			end
+		end
+		return getgenv().SB2ClearVelUIOld(...)
+	end
+	UI.ServerEvent = wrapped
+	getgenv().SB2ClearVelUIWrapped = wrapped
+	return true
+end
+
+local function ensureVelUIHook()
+	if installVelUIHook() then
+		return true
+	end
+	if velUiRetryThread then
+		return false
+	end
+	velUiRetryThread = task.spawn(function()
+		for _ = 1, 40 do
+			if not enabled or not velEnabled then
+				break
+			end
+			if installVelUIHook() then
+				say('Vel UI hook armed (late)')
+				break
+			end
+			task.wait(0.5)
+		end
+		velUiRetryThread = nil
+	end)
+	return false
+end
+
+local function restoreVelUIHook()
+	getgenv().SB2ClearVelEnabled = false
+	local old = getgenv().SB2ClearVelUIOld
+	local wrapped = getgenv().SB2ClearVelUIWrapped
+	if type(old) ~= 'function' then
+		getgenv().SB2ClearVelUIWrapped = nil
+		return
+	end
+	local UI = findGameService('UI')
+	if UI and (UI.ServerEvent == wrapped or UI.ServerEvent ~= old) then
+		pcall(function()
+			UI.ServerEvent = old
+		end)
+	end
+	getgenv().SB2ClearVelUIOld = nil
+	getgenv().SB2ClearVelUIWrapped = nil
+end
+
+local function softStripVfx(inst)
+	if not inst then
+		return
+	end
+	pcall(function()
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA('ParticleEmitter')
+				or d:IsA('Trail')
+				or d:IsA('Beam')
+				or d:IsA('Fire')
+				or d:IsA('Smoke')
+				or d:IsA('Sparkles')
+			then
+				d.Enabled = false
+			elseif d:IsA('PointLight') or d:IsA('SpotLight') or d:IsA('SurfaceLight') then
+				d.Enabled = false
+				d.Brightness = 0
+			elseif d:IsA('Sound') then
+				d:Stop()
+			end
+		end
+	end)
+end
+
+local function nukeDeathFxInstance(inst)
+	if not deathFxEnabled or not enabled or not inst then
+		return
+	end
+	-- Never touch ResetEffect / Characters / map roots.
+	if inst.Name == 'ResetEffect' then
+		return
+	end
+	if inst.Name ~= 'HighlightModel' and isCriticalWorkspace(inst) then
+		return
+	end
+	if inst.Name == 'HighlightModel' and inst.Parent == workspace then
+		-- Soft-strip first so a failed Destroy still kills the flash.
+		softStripVfx(inst)
+		pcall(function()
+			inst:Destroy()
+		end)
+		return
+	end
+	if inst.Name == 'Lava' and inst.Parent == workspace then
+		pcall(function()
+			inst:Destroy()
+		end)
+		return
+	end
+	if inst:IsA('Sound') and inst.Name == 'Fade Swoosh' then
+		pcall(function()
+			inst:Stop()
+			inst:Destroy()
+		end)
+	end
+end
+
+local function wipeExistingDeathFx()
+	for _, child in ipairs(workspace:GetChildren()) do
+		if DEATH_FX_NAMES[child.Name] then
+			nukeDeathFxInstance(child)
+		end
+	end
+end
+
+local function restoreKillFadeHook()
+	getgenv().SB2ClearDeathFxEnabled = false
+	local old = getgenv().SB2ClearGraphicsOld
+	if type(old) ~= 'function' then
+		return
+	end
+	local Graphics = findGameService('Graphics')
+	if Graphics and Graphics.ServerEvent ~= old then
+		pcall(function()
+			Graphics.ServerEvent = old
+		end)
+	end
+	getgenv().SB2ClearGraphicsOld = nil
+end
+
+local function isSafeKillFadeTarget(mob)
+	if typeof(mob) ~= 'Instance' then
+		return false
+	end
+	if isPlayerProtected(mob) then
+		return false
+	end
+	-- Extra hard stops: any player character model, anywhere.
+	if LocalPlayer and (mob == LocalPlayer.Character or mob.Name == LocalPlayer.Name) then
+		return false
+	end
+	local okPlayer, player = pcall(function()
+		return Players:GetPlayerFromCharacter(mob)
+	end)
+	if okPlayer and player then
+		return false
+	end
+	local characters = workspace:FindFirstChild('Characters')
+	if characters and (mob == characters or mob:IsDescendantOf(characters) or mob.Parent == characters) then
+		return false
+	end
+	return isUnderMobs(mob)
+end
+
+local function installKillFadeHook()
+	getgenv().SB2ClearDeathFxEnabled = deathFxEnabled
+	-- Always (re)install so hot-reloads pick up safer KillFade guards.
+	restoreKillFadeHook()
+	getgenv().SB2ClearDeathFxEnabled = deathFxEnabled
+	local Graphics = findGameService('Graphics')
+	if not Graphics then
+		return false
+	end
+	if type(getgenv().SB2ClearGraphicsOld) ~= 'function' then
+		getgenv().SB2ClearGraphicsOld = Graphics.ServerEvent
+	end
+	Graphics.ServerEvent = function(...)
+		if getgenv().SB2ClearDeathFxEnabled then
+			local args = { ... }
+			local payload = args[1]
+			if type(payload) == 'table' and payload[1] == 'KillFade' then
+				local mob = payload[2]
+				-- Only suppress mob death VFX. Never Destroy. Never swallow player KillFade
+				-- (returning without calling original broke death/respawn → void husk).
+				if isSafeKillFadeTarget(mob) then
+					return
+				end
+			end
+		end
+		return getgenv().SB2ClearGraphicsOld(...)
+	end
+	getgenv().SB2KillFadeSafe = true
+	return true
+end
+
+local function bindDeathFx()
+	deathFxEnabled = true
+	getgenv().SB2ClearDeathFxEnabled = true
+	wipeExistingDeathFx()
+	local hooked = installKillFadeHook()
+	if getgenv().SB2ClearDeathFxBound then
+		return hooked ~= false
+	end
+	getgenv().SB2ClearDeathFxBound = true
+	-- ChildAdded only — no workspace.DescendantAdded (that hitch-stuttered).
+	rootConns[#rootConns + 1] = workspace.ChildAdded:Connect(function(child)
+		if not deathFxEnabled or not enabled then
+			return
+		end
+		if DEATH_FX_NAMES[child.Name] or (child:IsA('Sound') and child.Name == 'Fade Swoosh') then
+			nukeDeathFxInstance(child)
+		end
+	end)
+	return true
+end
+
+-- Roots we never strip particles from (ResetEffect wipe = void cam / no Reset).
+local PARTICLE_DENY_ROOTS = {
+	ResetEffect = true,
+	Characters = true,
+	Camera = true,
+	Terrain = true,
+}
+
+local function isParticleProtected(inst)
+	if not inst then
+		return true
+	end
+	local ok, protected = pcall(function()
+		if inst.Name == 'ResetEffect' then
+			return true
+		end
+		-- Your character / Characters folder
+		local char = LocalPlayer and LocalPlayer.Character
+		if char and (inst == char or inst:IsDescendantOf(char)) then
+			return true
+		end
+		local characters = workspace:FindFirstChild('Characters')
+		if characters and (inst == characters or inst:IsDescendantOf(characters)) then
+			return true
+		end
+		-- Keep folders under CharacterItems (you + EXTRA_KEEP)
+		local items = workspace:FindFirstChild('CharacterItems')
+		if items and LocalPlayer then
+			for id in pairs(keepIds()) do
+				local keepFolder = items:FindFirstChild(tostring(id))
+				if keepFolder and (inst == keepFolder or inst:IsDescendantOf(keepFolder)) then
+					return true
+				end
+			end
+		end
+		-- Denied workspace roots
+		local cur = inst
+		while cur and cur ~= game do
+			if cur.Parent == workspace and PARTICLE_DENY_ROOTS[cur.Name] then
+				return true
+			end
+			cur = cur.Parent
+		end
+		return false
+	end)
+	return ok and protected == true
+end
+
+local function destroyParticleEmitter(pe)
+	if not pe or not pe:IsA('ParticleEmitter') or isParticleProtected(pe) then
+		return
+	end
+	pcall(function()
+		pe.Enabled = false
+		pe.Rate = 0
+	end)
+	pcall(function()
+		pe:Destroy()
+	end)
+end
+
+-- Kept for perf-mode light mute (VFX folders only).
+local PARTICLE_WIPE_FOLDERS = {
+	'HitEffects',
+	'ActiveBats',
+	'MobSpawnEffects',
+	'ShadowClones',
+}
+
+local function isUnderParticleWipeFolder(inst)
+	if not inst then
+		return false
+	end
+	local ok, under = pcall(function()
+		for _, name in ipairs(PARTICLE_WIPE_FOLDERS) do
+			local folder = workspace:FindFirstChild(name)
+			if folder and (inst == folder or inst:IsDescendantOf(folder)) then
+				return true
+			end
+		end
+		return false
+	end)
+	return ok and under == true
+end
+
+local function wipeParticleEmitters()
+	local n = 0
+	-- ONLY VFX wipe folders — never workspace:GetDescendants / every Model (60k+ hitch).
+	for _, name in ipairs(PARTICLE_WIPE_FOLDERS) do
+		local folder = workspace:FindFirstChild(name)
+		if folder then
+			for _, d in ipairs(folder:GetDescendants()) do
+				if d:IsA('ParticleEmitter') and not isParticleProtected(d) then
+					destroyParticleEmitter(d)
+					n += 1
+				end
+			end
+		end
+	end
+	return n
+end
+
+local function bindParticles()
+	particlesEnabled = true
+	local wiped = wipeParticleEmitters()
+	if getgenv().SB2ClearParticlesBound and particleConn then
+		return true, wiped
+	end
+	getgenv().SB2ClearParticlesBound = true
+
+	if particleConn then
+		pcall(function()
+			particleConn:Disconnect()
+		end)
+		particleConn = nil
+	end
+	particleConn = workspace.DescendantAdded:Connect(function(desc)
+		if not particlesEnabled or not enabled then
+			return
+		end
+		if not desc:IsA('ParticleEmitter') then
+			return
+		end
+		if isParticleProtected(desc) then
+			return
+		end
+		destroyParticleEmitter(desc)
+	end)
+	rootConns[#rootConns + 1] = particleConn
+
+	if particleSweepThread then
+		pcall(task.cancel, particleSweepThread)
+		particleSweepThread = nil
+	end
+	particleSweepThread = task.spawn(function()
+		while particlesEnabled and enabled do
+			task.wait(10)
+			if particlesEnabled and enabled then
+				wipeParticleEmitters()
+			end
+		end
+	end)
+
+	return true, wiped
+end
+
+local function bindVelChat(scroll)
+	if not velEnabled or not scroll then
+		return
+	end
+	-- Re-hook if this session has no live vel conns (stale genv used to skip forever).
+	if getgenv().SB2ClearVelChatBound == scroll and #velConns > 0 then
+		trimChatScroll(scroll)
+		wipeAllVelFrames()
+		return
+	end
+	for _, c in ipairs(velConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	velConns = {}
+	getgenv().SB2ClearVelChatBound = scroll
+	trimChatScroll(scroll)
+	wipeAllVelFrames()
+	velConns[#velConns + 1] = scroll.ChildAdded:Connect(function(frame)
+		if not velEnabled or not enabled then
+			return
+		end
+		if frame and frame.Name == 'ChatVelTemplate' then
+			destroyVelFrame(frame)
+			task.defer(function()
+				reflowChatScroll(scroll)
+			end)
+		end
+	end)
+	reflowChatScroll(scroll)
+end
+
+local function bindVelObtained()
+	velEnabled = true
+	getgenv().SB2ClearVelEnabled = true
+	ensureVelUIHook()
+
+	local scroll = findChatScroll()
+	if scroll then
+		bindVelChat(scroll)
+		return true
+	end
+	wipeAllVelFrames()
+	return false
+end
+
+local function killAnimator(animator)
+	if not animator or isPlayerProtected(animator) or not isUnderMobs(animator) then
+		return
+	end
+	pcall(function()
+		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+			track:Stop(0)
+			track:Destroy()
+		end
+	end)
+	pcall(function()
+		animator:Destroy()
+	end)
+end
+
+local function stripMobAnimationController(mob)
+	if not mobAnimEnabled or not enabled or not mob or not mob.Parent then
+		return
+	end
+	if isPlayerProtected(mob) or not isUnderMobs(mob) then
+		return
+	end
+	-- Skip mid-spawn mobs — game Spawn service expects Entity; stripping early spams console.
+	if not mob:FindFirstChild('Entity') then
+		return
+	end
+	-- Only strip AnimationController trees on mobs — never Characters / your gear.
+	for _, child in ipairs(mob:GetChildren()) do
+		if child:IsA('AnimationController') or child.Name == 'AnimationController' then
+			local animator = child:FindFirstChildWhichIsA('Animator')
+			if animator then
+				killAnimator(animator)
+			end
+			pcall(function()
+				child:Destroy()
+			end)
+		end
+	end
+end
+
+local function untrackMobAnims(mob)
+	local conn = mobTrackConns[mob]
+	if conn then
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	mobTrackConns[mob] = nil
+end
+
+local function trackMobAnims(mob)
+	if not mobAnimEnabled or not enabled or not mob or mobTrackConns[mob] then
+		return
+	end
+	if isPlayerProtected(mob) then
+		return
+	end
+	stripMobAnimationController(mob)
+	-- Immediate (no defer) so a replicated controller can't play a frame.
+	mobTrackConns[mob] = mob.ChildAdded:Connect(function(child)
+		if not mobAnimEnabled or not enabled or isPlayerProtected(mob) then
+			return
+		end
+		if child:IsA('AnimationController') or child.Name == 'AnimationController' then
+			local animator = child:FindFirstChildWhichIsA('Animator')
+			if animator then
+				killAnimator(animator)
+			end
+			pcall(function()
+				child:Destroy()
+			end)
+		end
+	end)
+	mob.Destroying:Once(function()
+		untrackMobAnims(mob)
+	end)
+end
+
+local function scanMobsForAnims(root)
+	if not root then
+		return
+	end
+	for _, mob in ipairs(root:GetChildren()) do
+		trackMobAnims(mob)
+	end
+end
+
+local function bindMobAnims(root)
+	if not mobAnimEnabled or not root then
+		return
+	end
+	if getgenv().SB2ClearMobAnimsBound == root and #mobAnimConns > 0 then
+		scanMobsForAnims(root)
+		return
+	end
+	for _, c in ipairs(mobAnimConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	mobAnimConns = {}
+	getgenv().SB2ClearMobAnimsBound = root
+	scanMobsForAnims(root)
+	mobAnimConns[#mobAnimConns + 1] = root.ChildAdded:Connect(function(mob)
+		trackMobAnims(mob)
+	end)
+	-- Only AnimationControllers under Mobs — never Characters / CharacterItems.
+	mobAnimConns[#mobAnimConns + 1] = root.DescendantAdded:Connect(function(desc)
+		if not mobAnimEnabled or not enabled then
+			return
+		end
+		if isPlayerProtected(desc) or not isUnderMobs(desc) then
+			return
+		end
+		if desc:IsA('AnimationController') or desc.Name == 'AnimationController' then
+			local animator = desc:FindFirstChildWhichIsA('Animator')
+			if animator then
+				killAnimator(animator)
+			end
+			pcall(function()
+				desc:Destroy()
+			end)
+		end
+	end)
+end
+
+local function rebindMobAnims()
+	mobAnimEnabled = true
+	local root = workspace:FindFirstChild('Mobs')
+	if not root then
+		say('Mobs missing')
+		return false
+	end
+	getgenv().SB2ClearMobAnimsBound = nil
+	for mob in pairs(mobTrackConns) do
+		untrackMobAnims(mob)
+	end
+	for _, c in ipairs(mobAnimConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	mobAnimConns = {}
+	bindMobAnims(root)
+	return true
+end
+
+local function nukeEffectInstance(inst)
+	-- Hard gate: only destroy direct children of known VFX roots (HitEffects etc.).
+	-- This is what was nuking the map when a wipe bind latched onto the wrong root.
+	if not inst or not isSafeWipeChild(inst) then
+		return
+	end
+	if isPlayerProtected(inst) or isCriticalWorkspace(inst) or isMapProtected(inst) then
+		return
+	end
+	pcall(function()
+		if inst:IsA('ParticleEmitter') or inst:IsA('Trail') or inst:IsA('Beam') or inst:IsA('Fire') or inst:IsA('Smoke') or inst:IsA('Sparkles') then
+			inst.Enabled = false
+		end
+	end)
+	pcall(function()
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA('ParticleEmitter') or d:IsA('Trail') or d:IsA('Beam') or d:IsA('Fire') or d:IsA('Smoke') or d:IsA('Sparkles') then
+				d.Enabled = false
+			end
+		end
+	end)
+	pcall(function()
+		inst:Destroy()
+	end)
+end
+
+local function wipeFolderChildren(root, target)
+	if not target.enabled or not enabled or not root or not root.Parent then
+		return
+	end
+	-- Never wipe unless this is an allowed VFX root under Workspace.
+	if root.Parent ~= workspace or not SAFE_WIPE_ROOT_NAMES[root.Name] then
+		return
+	end
+	if root.Name ~= target.name then
+		return
+	end
+	for _, child in ipairs(root:GetChildren()) do
+		nukeEffectInstance(child)
+	end
+end
+
+local function bindWipeFolder(root, target)
+	if not target.enabled or not root then
+		return
+	end
+	-- Refuse to bind wipe logic onto map / wrong instances (name collisions, streaming glitches).
+	if root.Parent ~= workspace or root.Name ~= target.name or not SAFE_WIPE_ROOT_NAMES[root.Name] then
+		return
+	end
+	if getgenv()[target.genvKey] == root and #target.conns > 0 then
+		wipeFolderChildren(root, target)
+		return
+	end
+	for _, c in ipairs(target.conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	target.conns = {}
+	getgenv()[target.genvKey] = root
+	wipeFolderChildren(root, target)
+	-- Wait a frame like the SB2 dump — ChildAdded often fires before the instance is ready.
+	target.conns[#target.conns + 1] = root.ChildAdded:Connect(function(child)
+		if not target.enabled or not enabled then
+			return
+		end
+		task.defer(function()
+			if not target.enabled or not enabled then
+				return
+			end
+			if child and child.Parent == root then
+				nukeEffectInstance(child)
+			end
+		end)
+	end)
+	target.conns[#target.conns + 1] = root.DescendantAdded:Connect(function(desc)
+		if not target.enabled or not enabled then
+			return
+		end
+		if isMapProtected(desc) or isPlayerProtected(desc) then
+			return
+		end
+		pcall(function()
+			if desc:IsA('ParticleEmitter') or desc:IsA('Trail') or desc:IsA('Beam') or desc:IsA('Fire') or desc:IsA('Smoke') or desc:IsA('Sparkles') then
+				desc.Enabled = false
+			end
+		end)
+	end)
+end
+
+local function rebindWipeFolder(target)
+	target.enabled = true
+	local root = workspace:FindFirstChild(target.name)
+	if not root then
+		say(target.name .. ' missing')
+		return false
+	end
+	getgenv()[target.genvKey] = nil
+	bindWipeFolder(root, target)
+	return true
+end
+
+local function wipeChildren(folder)
+	if not enabled or not folder or not folder.Parent then
+		return
+	end
+	if shouldKeepFolder(folder) then
+		return
+	end
+	local parent = folder.Parent
+	if not parent or parent.Name ~= 'CharacterItems' then
+		return
+	end
+	for _, child in ipairs(folder:GetChildren()) do
+		pcall(function()
+			child:Destroy()
+		end)
+	end
+end
+
+-- Keep folders (you + NickB926): still strip RightWeapon.Tool.Blade.BladeTrail.
+local function isRightWeaponBladeTrail(inst)
+	if not inst or inst.Name ~= 'BladeTrail' then
+		return false
+	end
+	local blade = inst.Parent
+	if not blade or blade.Name ~= 'Blade' then
+		return false
+	end
+	local tool = blade.Parent
+	if not tool or tool.Name ~= 'Tool' then
+		return false
+	end
+	local rw = tool.Parent
+	return rw ~= nil and rw.Name == 'RightWeapon'
+end
+
+local function destroyBladeTrail(inst)
+	if isRightWeaponBladeTrail(inst) then
+		pcall(function()
+			inst:Destroy()
+		end)
+		return true
+	end
+	return false
+end
+
+local function wipeBladeTrailsInKeepFolder(folder)
+	if not folder then
+		return
+	end
+	local rw = folder:FindFirstChild('RightWeapon')
+	local tool = rw and rw:FindFirstChild('Tool')
+	local blade = tool and tool:FindFirstChild('Blade')
+	if blade then
+		local trail = blade:FindFirstChild('BladeTrail')
+		if trail then
+			pcall(function()
+				trail:Destroy()
+			end)
+		end
+		for _, d in ipairs(blade:GetDescendants()) do
+			if d.Name == 'BladeTrail' then
+				pcall(function()
+					d:Destroy()
+				end)
+			end
+		end
+		return
+	end
+	for _, d in ipairs(folder:GetDescendants()) do
+		destroyBladeTrail(d)
+	end
+end
+
+local function untrackBladeTrails(folder)
+	local conn = bladeTrailTracked[folder]
+	if conn then
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	bladeTrailTracked[folder] = nil
+end
+
+local function trackKeepBladeTrails(folder)
+	if not enabled or not folder then
+		return
+	end
+	if not shouldKeepFolder(folder) then
+		return
+	end
+	wipeBladeTrailsInKeepFolder(folder)
+	if bladeTrailTracked[folder] then
+		return
+	end
+	bladeTrailTracked[folder] = folder.DescendantAdded:Connect(function(desc)
+		task.defer(function()
+			if not enabled then
+				return
+			end
+			destroyBladeTrail(desc)
+		end)
+	end)
+	folder.Destroying:Once(function()
+		untrackBladeTrails(folder)
+	end)
+end
+
+local function untrackFolder(folder)
+	local conn = tracked[folder]
+	if conn then
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	tracked[folder] = nil
+end
+
+local function trackFolder(folder)
+	if not enabled or not folder or tracked[folder] then
+		return
+	end
+	local parent = folder.Parent
+	if not parent or parent.Name ~= 'CharacterItems' then
+		return
+	end
+
+	-- Kept folders (you + NickB926): wipe BladeTrail only, leave weapons/items.
+	if shouldKeepFolder(folder) then
+		trackKeepBladeTrails(folder)
+		return
+	end
+
+	wipeChildren(folder)
+	tracked[folder] = folder.ChildAdded:Connect(function(child)
+		task.defer(function()
+			if not enabled then
+				return
+			end
+			if shouldKeepFolder(folder) then
+				return
+			end
+			if child and child.Parent == folder then
+				pcall(function()
+					child:Destroy()
+				end)
+			end
+		end)
+	end)
+	folder.Destroying:Once(function()
+		untrackFolder(folder)
+	end)
+end
+
+local function scanCharacterItems(root)
+	if not root then
+		return
+	end
+	for _, sub in ipairs(root:GetChildren()) do
+		trackFolder(sub)
+	end
+end
+
+local function bindCharacterItems(root)
+	if not enabled or not root then
+		return
+	end
+	if charItemsHooked == root then
+		scanCharacterItems(root)
+		return
+	end
+	charItemsHooked = root
+	getgenv().SB2ClearCharItemsBound = root
+	scanCharacterItems(root)
+	rootConns[#rootConns + 1] = root.ChildAdded:Connect(function(sub)
+		task.defer(function()
+			trackFolder(sub)
+		end)
+	end)
+end
+
+local function isHatAccessory(inst)
+	if not inst then
+		return false
+	end
+	-- All explorer "hat" icons are Accessories (hair, wings, face, etc.) — wipe all of them.
+	return inst:IsA('Accessory') or inst:IsA('Accoutrement') or inst.ClassName == 'Hat'
+end
+
+local function destroyHatAccessory(inst)
+	if isHatAccessory(inst) then
+		pcall(function()
+			inst:Destroy()
+		end)
+		return true
+	end
+	return false
+end
+
+-- Same keep set as CharacterItems: you + EXTRA_KEEP (NickB926).
+local function shouldKeepCharacterHats(model)
+	if not model then
+		return true
+	end
+	if LocalPlayer then
+		if model.Name == LocalPlayer.Name or model == LocalPlayer.Character then
+			return true
+		end
+	end
+	for id in pairs(EXTRA_KEEP) do
+		local uid = tonumber(id)
+		local plr = uid and Players:GetPlayerByUserId(uid)
+		if plr and model.Name == plr.Name then
+			return true
+		end
+	end
+	return false
+end
+
+local function wipeHatsOnCharacter(model)
+	if not model or shouldKeepCharacterHats(model) then
+		return
+	end
+	for _, child in ipairs(model:GetChildren()) do
+		destroyHatAccessory(child)
+	end
+end
+
+local function untrackCharacterHats(model)
+	local conn = characterHatTracked[model]
+	if conn then
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	characterHatTracked[model] = nil
+end
+
+local function trackCharacterHats(model)
+	if not enabled or not model then
+		return
+	end
+	if shouldKeepCharacterHats(model) then
+		untrackCharacterHats(model)
+		return
+	end
+	wipeHatsOnCharacter(model)
+	if characterHatTracked[model] then
+		return
+	end
+	characterHatTracked[model] = model.ChildAdded:Connect(function(child)
+		task.defer(function()
+			if not enabled or shouldKeepCharacterHats(model) then
+				return
+			end
+			destroyHatAccessory(child)
+		end)
+	end)
+	model.Destroying:Once(function()
+		untrackCharacterHats(model)
+	end)
+end
+
+local function bindCharacterHats(root)
+	if not enabled or not root then
+		return
+	end
+	if characterHatsHooked == root then
+		for _, model in ipairs(root:GetChildren()) do
+			trackCharacterHats(model)
+		end
+		return
+	end
+	characterHatsHooked = root
+	getgenv().SB2ClearCharHatsBound = root
+	for _, model in ipairs(root:GetChildren()) do
+		trackCharacterHats(model)
+	end
+	rootConns[#rootConns + 1] = root.ChildAdded:Connect(function(model)
+		task.defer(function()
+			trackCharacterHats(model)
+		end)
+	end)
+end
+
+local function destroyOptimizedWind(inst)
+	if not inst or inst.Name ~= 'Wind' then
+		return false
+	end
+	pcall(function()
+		inst:Destroy()
+	end)
+	return true
+end
+
+local function bindOptimizedGameWind(root)
+	if not enabled or not root or root.Name ~= 'OptimizedGame' then
+		return
+	end
+	local wind = root:FindFirstChild('Wind')
+	if wind then
+		destroyOptimizedWind(wind)
+	end
+	if optimizedGameWindHooked == root then
+		return
+	end
+	optimizedGameWindHooked = root
+	getgenv().SB2ClearOptimizedWindBound = root
+	rootConns[#rootConns + 1] = root.ChildAdded:Connect(function(child)
+		task.defer(function()
+			if not enabled then
+				return
+			end
+			destroyOptimizedWind(child)
+		end)
+	end)
+end
+
+local function stopPlugin()
+	cciLoadToken += 1
+	getgenv().SB2CciLoadToken = cciLoadToken
+	enabled = false
+	velEnabled = false
+	mobAnimEnabled = false
+	deathFxEnabled = false
+	particlesEnabled = false
+	perfEnabled = false
+	getgenv().SB2ClearCharItemsBound = nil
+	getgenv().SB2ClearCharHatsBound = nil
+	getgenv().SB2ClearVelChatBound = nil
+	getgenv().SB2ClearMobAnimsBound = nil
+	getgenv().SB2ClearDeathFxBound = nil
+	getgenv().SB2ClearDeathFxEnabled = false
+	getgenv().SB2ClearParticlesBound = nil
+	getgenv().SB2PerfBound = nil
+	getgenv().SB2PerfMode = nil
+	getgenv().SB2ExposureLock = false
+	getgenv().SB2MenuBlurLock = false
+	if getgenv().SB2MenuBlurChildConn then
+		pcall(function()
+			getgenv().SB2MenuBlurChildConn:Disconnect()
+		end)
+		getgenv().SB2MenuBlurChildConn = nil
+	end
+	getgenv().SB2MaxZoomLock = false
+	getgenv().SB2MaxZoomPending = false
+	clearMaxZoomCharConns()
+	if getgenv().SB2CamSeeConn then
+		pcall(function()
+			getgenv().SB2CamSeeConn:Disconnect()
+		end)
+		getgenv().SB2CamSeeConn = nil
+	end
+	getgenv().SB2CamSeeThrough = nil
+	getgenv().SB2CamSeeHidden = nil
+	charItemsHooked = nil
+	characterHatsHooked = nil
+	optimizedGameWindHooked = nil
+	getgenv().SB2ClearOptimizedWindBound = nil
+	do
+		local stashMap = getgenv().SB2UIStashMap
+		if type(stashMap) == 'table' then
+			for frame, parent in pairs(stashMap) do
+				pcall(function()
+					if frame and parent and parent.Parent then
+						frame.Parent = parent
+					end
+				end)
+				stashMap[frame] = nil
+			end
+		end
+	end
+	if particleSweepThread then
+		pcall(task.cancel, particleSweepThread)
+		particleSweepThread = nil
+	end
+	particleConn = nil
+	for _, target in ipairs(wipeTargets) do
+		target.enabled = false
+		getgenv()[target.genvKey] = nil
+		for _, c in ipairs(target.conns) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+		target.conns = {}
+	end
+	for folder in pairs(tracked) do
+		untrackFolder(folder)
+	end
+	for folder in pairs(bladeTrailTracked) do
+		untrackBladeTrails(folder)
+	end
+	for model in pairs(characterHatTracked) do
+		untrackCharacterHats(model)
+	end
+	for mob in pairs(mobTrackConns) do
+		untrackMobAnims(mob)
+	end
+	for _, c in ipairs(rootConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	rootConns = {}
+	for _, c in ipairs(velConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	velConns = {}
+	for _, c in ipairs(mobAnimConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	mobAnimConns = {}
+	if sweepConn then
+		pcall(function()
+			sweepConn:Disconnect()
+		end)
+		sweepConn = nil
+	end
+	getgenv().SB2ClearSweepConn = nil
+	if getgenv().SB2ClearSweepThread then
+		pcall(task.cancel, getgenv().SB2ClearSweepThread)
+		getgenv().SB2ClearSweepThread = nil
+	end
+	if velUiRetryThread then
+		pcall(task.cancel, velUiRetryThread)
+		velUiRetryThread = nil
+	end
+	restoreVelUIHook()
+	restoreKillFadeHook()
+	if getgenv().SB2MouseSensLockConn then
+		pcall(function()
+			getgenv().SB2MouseSensLockConn:Disconnect()
+		end)
+		getgenv().SB2MouseSensLockConn = nil
+	end
+	getgenv().SB2MouseSensLock = false
+	getgenv().SB2ClearCharItemsStop = nil
+	restoreMouse()
+	say('stopped')
+end
+
+getgenv().SB2ClearCharItemsStop = stopPlugin
+
+-- Drop legacy Heartbeat / MenuBlur ChildAdded lockers from older CCI loads.
+do
+	for _, key in ipairs({
+		'SB2MenuBlurLockConn',
+		'SB2MenuBlurChildConn',
+		'SB2ExposureLockConn',
+		'SB2MaxZoomLockConn',
+		'SB2CamSeeConn',
+		'SB2MouseSensLockConn',
+	}) do
+		local c = getgenv()[key]
+		if typeof(c) == 'RBXScriptConnection' then
+			pcall(function()
+				c:Disconnect()
+			end)
+			getgenv()[key] = nil
+		end
+	end
+	getgenv().SB2MenuBlurLock = false
+end
+
+if not getgenv().SB2MaxZoomCharAddedConn then
+	getgenv().SB2MaxZoomCharAddedConn = LocalPlayer.CharacterAdded:Connect(function(char)
+		if not getgenv().SB2MaxZoomLock then
+			return
+		end
+		task.defer(function()
+			bindMaxZoomCharacter(char)
+		end)
+	end)
+end
+
+local wipeFolderNames = {}
+for _, target in ipairs(wipeTargets) do
+	wipeFolderNames[target.name] = target
+end
+
+local function startSweep()
+	if sweepConn then
+		return
+	end
+	-- Slow backup only. A Heartbeat Motor6D/GetDescendants sweep was costing
+	-- ~5–30ms/frame and tanking FPS (measured ~29fps on → ~62fps off).
+	if getgenv().SB2ClearSweepConn then
+		pcall(function()
+			getgenv().SB2ClearSweepConn:Disconnect()
+		end)
+		getgenv().SB2ClearSweepConn = nil
+	end
+	if getgenv().SB2ClearSweepThread then
+		pcall(task.cancel, getgenv().SB2ClearSweepThread)
+		getgenv().SB2ClearSweepThread = nil
+	end
+
+	local thread = task.spawn(function()
+		while enabled do
+			for _, target in ipairs(wipeTargets) do
+				if target.enabled then
+					local folder = workspace:FindFirstChild(target.name)
+					if folder then
+						local kids = folder:GetChildren()
+						if #kids > 0 then
+							for _, child in ipairs(kids) do
+								nukeEffectInstance(child)
+							end
+						end
+					end
+				end
+			end
+			if deathFxEnabled then
+				for _, child in ipairs(workspace:GetChildren()) do
+					if DEATH_FX_NAMES[child.Name] then
+						nukeDeathFxInstance(child)
+					end
+				end
+			end
+			do
+				local optimized = workspace:FindFirstChild('OptimizedGame')
+				local wind = optimized and optimized:FindFirstChild('Wind')
+				if wind then
+					destroyOptimizedWind(wind)
+				end
+			end
+			if mobAnimEnabled then
+				local mobs = workspace:FindFirstChild('Mobs')
+				if mobs then
+					for _, mob in ipairs(mobs:GetChildren()) do
+						if not isPlayerProtected(mob) then
+							-- Direct children only — no per-frame GetDescendants / Motor6D freeze.
+							for _, child in ipairs(mob:GetChildren()) do
+								if child:IsA('AnimationController') or child.Name == 'AnimationController' then
+									local animator = child:FindFirstChildWhichIsA('Animator')
+									if animator then
+										killAnimator(animator)
+									end
+									pcall(function()
+										child:Destroy()
+									end)
+								end
+							end
+						end
+					end
+				end
+			end
+			-- Vel / CharacterItems: ChildAdded hooks own the hot path.
+			-- Do NOT GetDescendants PlayerGui or getgc() here — that stuttered every 0.25s.
+			if velEnabled then
+				local scroll = findChatScroll()
+				if scroll and (getgenv().SB2ClearVelChatBound ~= scroll or #velConns == 0) then
+					bindVelChat(scroll)
+				elseif scroll then
+					wipeVelTemplates(scroll)
+				end
+			end
+			task.wait(5)
+		end
+	end)
+	getgenv().SB2ClearSweepThread = thread
+	sweepConn = nil
+	getgenv().SB2ClearSweepConn = true -- marker: sweep loop active
+end
+
+local function bindAllNow()
+	local root = workspace:FindFirstChild('CharacterItems')
+	if root and enabled then
+		bindCharacterItems(root)
+	end
+	local chars = workspace:FindFirstChild('Characters')
+	if chars and enabled then
+		bindCharacterHats(chars)
+	end
+	local optimized = workspace:FindFirstChild('OptimizedGame')
+	if optimized and enabled then
+		bindOptimizedGameWind(optimized)
+	end
+	for _, target in ipairs(wipeTargets) do
+		local folder = workspace:FindFirstChild(target.name)
+		if folder and target.enabled then
+			bindWipeFolder(folder, target)
+		end
+	end
+	local mobs = workspace:FindFirstChild('Mobs')
+	if mobs and mobAnimEnabled then
+		bindMobAnims(mobs)
+	end
+	-- Mob death FX: KillFade suppress + HighlightModel clear. Never ResetEffect.
+	bindDeathFx()
+	bindParticles()
+	bindVelObtained()
+	startSweep()
+end
+
+local function bindPerfMode()
+	perfEnabled = true
+	getgenv().SB2PerfMode = true
+
+	-- Stash folder keeps UI instances alive but out of PlayerGui (no layout/render cost).
+	local stash = getgenv().SB2UIStash
+	if not stash or typeof(stash) ~= 'Instance' or not stash.Parent then
+		stash = Instance.new('Folder')
+		stash.Name = 'SB2UIStash'
+		stash.Parent = game:GetService('ReplicatedStorage')
+		getgenv().SB2UIStash = stash
+	end
+	local stashMap = getgenv().SB2UIStashMap
+	if type(stashMap) ~= 'table' then
+		stashMap = {}
+		getgenv().SB2UIStashMap = stashMap
+	end
+
+	local function getPlayerUI()
+		local pg = LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui')
+		local cardinal = pg and pg:FindFirstChild('CardinalUI')
+		return cardinal and cardinal:FindFirstChild('PlayerUI')
+	end
+
+	local function stashFrame(frame)
+		if not frame or stashMap[frame] then
+			return
+		end
+		stashMap[frame] = frame.Parent
+		pcall(function()
+			frame.Parent = stash
+		end)
+	end
+
+	local function restoreFrame(frame)
+		local parent = stashMap[frame]
+		if not frame or not parent then
+			return
+		end
+		pcall(function()
+			if parent.Parent then
+				frame.Parent = parent
+			end
+		end)
+		stashMap[frame] = nil
+	end
+
+	local function restoreAllHeavyTabs()
+		-- Restore any TabFrames panels that were stashed by older plugin versions.
+		local playerUI = getPlayerUI()
+		local main = playerUI and playerUI:FindFirstChild('MainFrame')
+		local tabFrames = main and main:FindFirstChild('TabFrames')
+		for _, child in ipairs(stash:GetChildren()) do
+			local parent = stashMap[child]
+			local name = child.Name
+			if name == 'InventoryFrame' or name == 'Stats' or name == 'CashShop' or name == 'Settings'
+				or name == 'Locations' or name == 'PlayerList' or name == 'Quests' or name == 'Skills'
+			then
+				if not parent or parent.Name ~= 'TabFrames' then
+					parent = tabFrames
+					stashMap[child] = tabFrames
+				end
+				restoreFrame(child)
+			end
+		end
+		for frame, parent in pairs(stashMap) do
+			if typeof(frame) == 'Instance' and parent and parent.Name == 'TabFrames' then
+				restoreFrame(frame)
+			end
+		end
+	end
+
+	local function applyUiStash()
+		if not perfEnabled then
+			return
+		end
+		local playerUI = getPlayerUI()
+		if not playerUI then
+			return
+		end
+
+		-- Always put TabFrames panels back (legacy stash cleanup).
+		restoreAllHeavyTabs()
+
+		-- Only stash non-tab overlays (shops/forge/trade/etc).
+		for _, child in ipairs(playerUI:GetChildren()) do
+			if HEAVY_UI_NAMES[child.Name] then
+				if child.Visible == true then
+					restoreFrame(child)
+				else
+					stashFrame(child)
+				end
+			end
+		end
+	end
+
+	local function applyVolumeAndSensitivity()
+		-- Roblox ESC volume is 0–10 bars → MasterVolume 0.0–1.0. 1 bar = 0.1.
+		local volume = 0.1
+		pcall(function()
+			local gs = UserSettings():GetService('UserGameSettings')
+			gs.MasterVolume = volume
+			pcall(function()
+				gs.MasterVolumeStudio = volume
+			end)
+		end)
+		pcall(function()
+			local ss = game:GetService('SoundService')
+			ss.Volume = volume
+		end)
+		if getgenv().SB2MouseSensLock ~= false then
+			setMouseSensitivity(getgenv().SB2MouseSensTarget or DEFAULT_MOUSE_SENSITIVITY)
+		end
+	end
+
+	local function applyGraphics()
+		-- Do not force QualityLevel — leave user's graphics setting alone.
+		applyVolumeAndSensitivity()
+		pcall(function()
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 1e6
+			Lighting.Brightness = math.min(Lighting.Brightness, 2)
+		end)
+		for _, fx in ipairs(Lighting:GetChildren()) do
+			pcall(function()
+				if fx:IsA('BloomEffect') or fx:IsA('SunRaysEffect') or fx:IsA('DepthOfFieldEffect')
+					or fx:IsA('BlurEffect') or fx:IsA('ColorCorrectionEffect') or fx:IsA('Atmosphere')
+				then
+					if fx:IsA('Atmosphere') then
+						fx.Density = 0
+					elseif fx:IsA('BlurEffect') then
+						fx.Size = 0
+						fx.Enabled = false
+					elseif fx:IsA('DepthOfFieldEffect') then
+						fx.Enabled = false
+						fx.FarIntensity = 0
+						fx.NearIntensity = 0
+					else
+						fx.Enabled = false
+					end
+				end
+			end)
+		end
+		clearMenuBlur()
+	end
+
+	-- Soft light mute only. NEVER Destroy lights / NEVER walk every BasePart —
+	-- that hitch + stream churn was emptying Workspace (map "unload").
+	local function stripWorldLight(inst)
+		if not inst or isPlayerProtected(inst) or isMapProtected(inst) then
+			return
+		end
+		if not (inst:IsA('PointLight') or inst:IsA('SpotLight') or inst:IsA('SurfaceLight')) then
+			return
+		end
+		-- Only mute lights under allowed VFX roots, not the open world.
+		if not isUnderParticleWipeFolder(inst) then
+			return
+		end
+		pcall(function()
+			inst.Enabled = false
+			inst.Brightness = 0
+		end)
+	end
+
+	local function stripExistingLights()
+		local n = 0
+		for _, name in ipairs(PARTICLE_WIPE_FOLDERS) do
+			local folder = workspace:FindFirstChild(name)
+			if folder then
+				for _, d in ipairs(folder:GetDescendants()) do
+					if d:IsA('PointLight') or d:IsA('SpotLight') or d:IsA('SurfaceLight') then
+						pcall(function()
+							d.Enabled = false
+							d.Brightness = 0
+						end)
+						n += 1
+					end
+				end
+			end
+		end
+		return n
+	end
+
+	applyGraphics()
+	-- Always restore any leftover stash from older plugin versions; do not stash UI anymore.
+	do
+		local playerUI = getPlayerUI()
+		local main = playerUI and playerUI:FindFirstChild('MainFrame')
+		local tabFrames = main and main:FindFirstChild('TabFrames')
+		for _, child in ipairs(stash:GetChildren()) do
+			local n = child.Name
+			if n == 'InventoryFrame' or n == 'Stats' or n == 'CashShop' or n == 'Settings'
+				or n == 'Locations' or n == 'PlayerList' or n == 'Quests' or n == 'Skills'
+			then
+				pcall(function()
+					child.Parent = tabFrames or main or playerUI
+				end)
+			elseif playerUI then
+				pcall(function()
+					child.Parent = playerUI
+				end)
+			end
+			stashMap[child] = nil
+		end
+	end
+
+	-- Legacy Roblox Chat ScreenGui sits above CardinalUI (DisplayOrder 6) and can steal hits.
+	pcall(function()
+		local pg = LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui')
+		local legacyChat = pg and pg:FindFirstChild('Chat')
+		if legacyChat and legacyChat:IsA('ScreenGui') then
+			legacyChat.Enabled = false
+		end
+		local cardinal = pg and pg:FindFirstChild('CardinalUI')
+		if cardinal and cardinal:IsA('ScreenGui') then
+			cardinal.DisplayOrder = math.max(cardinal.DisplayOrder, 10)
+		end
+	end)
+
+	-- Cardinal menu: HUD.Menu.Activated calls ToggleMenu() which can error
+	-- ("string expected, got boolean"). Prefer ToggleMenu('Inventory') via UI state.
+	local function getUiState()
+		local playerUI = getPlayerUI()
+		local main = playerUI and playerUI:FindFirstChild('MainFrame')
+		local tabFrames = main and main:FindFirstChild('TabFrames')
+		local invFrame = tabFrames and tabFrames:FindFirstChild('InventoryFrame')
+		local inventory = invFrame and invFrame:FindFirstChild('Inventory')
+		local list = inventory and inventory:FindFirstChild('List')
+		if not list then
+			return nil, nil
+		end
+		for _, obj in next, getgc(true) do
+			if type(obj) == 'table' and rawget(obj, 'iFrame') == list and type(rawget(obj, 'ToggleMenu')) == 'function' then
+				return obj, main
+			end
+		end
+		return nil, main
+	end
+
+	local function fireMenuActivated(src)
+		local state, main = getUiState()
+		local playerUI = getPlayerUI()
+		if not main then
+			local hud = playerUI and playerUI:FindFirstChild('HUD')
+			local menu = hud and hud:FindFirstChild('Menu')
+			if not menu then
+				return false
+			end
+			pcall(function()
+				if firesignal then
+					firesignal(menu.Activated)
+				else
+					for _, c in ipairs(getconnections(menu.Activated)) do
+						pcall(function()
+							if c.Fire then
+								c:Fire()
+							elseif c.Function then
+								c.Function()
+							end
+						end)
+					end
+				end
+			end)
+			return true
+		end
+
+		if main.Visible then
+			local ok = pcall(function()
+				if state then
+					state.ToggleMenu()
+				end
+			end)
+			if main.Visible then
+				main.Visible = false
+			end
+			return true
+		end
+
+		local ok = pcall(function()
+			if state then
+				state.ToggleMenu('Inventory')
+			end
+		end)
+		if not main.Visible then
+			main.Visible = true
+			local inv = main:FindFirstChild('TabFrames') and main.TabFrames:FindFirstChild('InventoryFrame')
+			if inv then
+				inv.Visible = true
+			end
+		end
+		return true
+	end
+	getgenv().SB2FireMenuActivated = fireMenuActivated
+	getgenv().SB2ToggleMenuSafe = fireMenuActivated
+
+	local function pointInGui(gui, x, y)
+		if not gui then
+			return false
+		end
+		local p = gui.AbsolutePosition
+		local s = gui.AbsoluteSize
+		return s.X > 0 and s.Y > 0 and x >= p.X and x <= p.X + s.X and y >= p.Y and y <= p.Y + s.Y
+	end
+
+	local function bindMenuClickRelay()
+		if getgenv().SB2InvClickRelay then
+			return
+		end
+		getgenv().SB2InvClickRelay = true
+
+		rootConns[#rootConns + 1] = UserInputService.InputBegan:Connect(function(input, _gameProcessed)
+			if not perfEnabled or not enabled then
+				return
+			end
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1
+				and input.UserInputType ~= Enum.UserInputType.Touch
+			then
+				return
+			end
+			local playerUI = getPlayerUI()
+			if not playerUI then
+				return
+			end
+			local pos = input.Position
+			local hud = playerUI:FindFirstChild('HUD')
+			local menu = hud and hud:FindFirstChild('Menu')
+			local mb = playerUI:FindFirstChild('MenuButton')
+			local mbb = mb and (mb:FindFirstChild('Button') or mb:FindFirstChildWhichIsA('GuiButton', true))
+			local hitMenu = pointInGui(menu, pos.X, pos.Y)
+			local hitBtn = pointInGui(mbb, pos.X, pos.Y)
+			local hitMb = pointInGui(mb, pos.X, pos.Y)
+			if hitMenu or hitBtn or hitMb then
+				fireMenuActivated('InputBegan')
+			end
+		end)
+
+		task.spawn(function()
+			local playerUI = getPlayerUI()
+			if not playerUI then
+				local pg = LocalPlayer and (LocalPlayer:FindFirstChild('PlayerGui') or LocalPlayer:WaitForChild('PlayerGui', 120))
+				local cardinal = pg and (pg:FindFirstChild('CardinalUI') or pg:WaitForChild('CardinalUI', 120))
+				playerUI = cardinal and (cardinal:FindFirstChild('PlayerUI') or cardinal:WaitForChild('PlayerUI', 120))
+			end
+			if not playerUI then
+				return
+			end
+			local mb = playerUI:FindFirstChild('MenuButton') or playerUI:WaitForChild('MenuButton', 30)
+			local btn = mb and (mb:FindFirstChild('Button') or mb:WaitForChild('Button', 10))
+			if btn and btn:IsA('GuiButton') then
+				rootConns[#rootConns + 1] = btn.Activated:Connect(function()
+					fireMenuActivated('Activated')
+				end)
+				rootConns[#rootConns + 1] = btn.MouseButton1Click:Connect(function()
+					fireMenuActivated('MouseButton1Click')
+				end)
+			end
+		end)
+	end
+	bindMenuClickRelay()
+
+	local lightsKilled = stripExistingLights()
+
+	if not getgenv().SB2PerfBound then
+		getgenv().SB2PerfBound = true
+		-- Do NOT hook workspace.DescendantAdded for lights/parts — as the map
+		-- streams in that fires tens of thousands of times and dumps StreamingEnabled content.
+		-- No collectgarbage loop — this executor forbids it and it hitchs hard if allowed.
+	end
+
+	say(('perf mode on — graphics low, volume 1 bar, sensitivity %s, muted ~%s VFX lights'):format(
+		tostring(getgenv().SB2MouseSensTarget or DEFAULT_MOUSE_SENSITIVITY),
+		tostring(lightsKilled)
+	))
+	return true
+end
+
+local function restorePerfUi()
+	local stashMap = getgenv().SB2UIStashMap
+	if type(stashMap) ~= 'table' then
+		return
+	end
+	for frame, parent in pairs(stashMap) do
+		pcall(function()
+			if frame and parent and parent.Parent then
+				frame.Parent = parent
+			end
+		end)
+		stashMap[frame] = nil
+	end
+end
+
+-- Heavy runtime starts after CCI_LOAD_DELAY so join/stream can settle (FPS).
+local function startCciRuntime()
+	enabled = true
+
+	bindAllNow()
+	bindPerfMode()
+
+	rootConns[#rootConns + 1] = workspace.ChildAdded:Connect(function(child)
+		if child.Name == 'CharacterItems' then
+			bindCharacterItems(child)
+			return
+		end
+		if child.Name == 'Characters' then
+			bindCharacterHats(child)
+			return
+		end
+		if child.Name == 'OptimizedGame' then
+			bindOptimizedGameWind(child)
+			return
+		end
+		if child.Name == 'Mobs' then
+			bindMobAnims(child)
+			return
+		end
+		local target = wipeFolderNames[child.Name]
+		if target and SAFE_WIPE_ROOT_NAMES[child.Name] and child.Parent == workspace then
+			bindWipeFolder(child, target)
+		end
+	end)
+
+	for _, target in ipairs(wipeTargets) do
+		task.spawn(function()
+			if workspace:FindFirstChild(target.name) then
+				return
+			end
+			local folder = workspace:WaitForChild(target.name, 120)
+			if folder and target.enabled and enabled then
+				bindWipeFolder(folder, target)
+			end
+		end)
+	end
+	task.spawn(function()
+		if not workspace:FindFirstChild('CharacterItems') then
+			local root = workspace:WaitForChild('CharacterItems', 120)
+			if root and enabled then
+				bindCharacterItems(root)
+			end
+		end
+	end)
+	task.spawn(function()
+		if not workspace:FindFirstChild('Characters') then
+			local chars = workspace:WaitForChild('Characters', 120)
+			if chars and enabled then
+				bindCharacterHats(chars)
+			end
+		end
+	end)
+	task.spawn(function()
+		if not workspace:FindFirstChild('OptimizedGame') then
+			local optimized = workspace:WaitForChild('OptimizedGame', 120)
+			if optimized and enabled then
+				bindOptimizedGameWind(optimized)
+			end
+		end
+	end)
+	task.spawn(function()
+		if not workspace:FindFirstChild('Mobs') then
+			local mobs = workspace:WaitForChild('Mobs', 120)
+			if mobs and mobAnimEnabled and enabled then
+				bindMobAnims(mobs)
+			end
+		end
+	end)
+
+	task.spawn(function()
+		local playerGui = LocalPlayer and (LocalPlayer:FindFirstChild('PlayerGui') or LocalPlayer:WaitForChild('PlayerGui', 120))
+		local cardinal = playerGui and (playerGui:FindFirstChild('CardinalUI') or playerGui:WaitForChild('CardinalUI', 120))
+		local playerUI = cardinal and (cardinal:FindFirstChild('PlayerUI') or cardinal:WaitForChild('PlayerUI', 120))
+		local chat = playerUI and (playerUI:FindFirstChild('Chat') or playerUI:WaitForChild('Chat', 120))
+		local scroll = chat and (chat:FindFirstChild('ScrollContent') or chat:WaitForChild('ScrollContent', 120))
+		if scroll and velEnabled then
+			bindVelChat(scroll)
+		end
+		ensureVelUIHook()
+		wipeAllVelFrames()
+
+		if playerGui then
+			rootConns[#rootConns + 1] = playerGui.DescendantAdded:Connect(function(desc)
+				if not velEnabled or not enabled then
+					return
+				end
+				if desc.Name == 'ScrollContent' and desc.Parent and desc.Parent.Name == 'Chat' then
+					task.defer(function()
+						bindVelChat(desc)
+					end)
+				elseif desc.Name == 'ChatVelTemplate' then
+					destroyVelFrame(desc)
+				end
+			end)
+		end
+	end)
+
+	setExposure(DEFAULT_EXPOSURE)
+	setMaxZoom(DEFAULT_MAX_ZOOM)
+	applyInvisicam()
+	setMouseSensitivity(DEFAULT_MOUSE_SENSITIVITY)
+	clearMenuBlur()
+	restoreMouse()
+	runFullbright()
+	runAntilag()
+	-- Antilag turns Use2022Materials off for flatter map look; keep that (command still available).
+	runAutoHideIY()
+
+	local keep = keepIds()
+	local list = {}
+	for id in pairs(keep) do
+		list[#list + 1] = id
+	end
+	table.sort(list)
+	say(('active — keep %s | exposure %s | maxzoom %s | invisicam | sensitivity %s | loopfb | antilag | no2022mats | autohideiy | BladeTrail strip | Character hats | one-shot pins | VFX + Vel + mob anims + death FX (ResetEffect protected)'):format(
+		table.concat(list, ', '),
+		tostring(DEFAULT_EXPOSURE),
+		tostring(DEFAULT_MAX_ZOOM),
+		tostring(DEFAULT_MOUSE_SENSITIVITY)
+	))
+end
+
+cciLoadToken += 1
+local myLoadToken = cciLoadToken
+getgenv().SB2CciLoadToken = myLoadToken
+say(('CCI waiting %ss for game to settle…'):format(tostring(CCI_LOAD_DELAY)))
+task.delay(CCI_LOAD_DELAY, function()
+	if getgenv().SB2CciLoadToken ~= myLoadToken then
+		return
+	end
+	if getgenv().SB2ClearCharItemsStop ~= stopPlugin then
+		return
+	end
+	startCciRuntime()
+end)
+
+local Plugin = {
+	['PluginName'] = 'CCI',
+	['PluginDescription'] = 'CharacterItems + Character hats + FX wipe; one-shot exposure/zoom/Invisicam/sens; loopfb, CCI antilag (keeps icons), 2022 materials, auto hideiy',
+	['Commands'] = {
+		['cci'] = {
+			['ListName'] = 'cci / clearcharitems',
+			['Description'] = 'Re-scan CharacterItems + Character hats + effect folders + Vel + mob anims + death FX (keeps your items; never ResetEffect)',
+			['Aliases'] = { 'clearcharitems' },
+			['Function'] = function()
+				enabled = true
+				getgenv().SB2ClearDeathFxBound = nil
+
+				local root = workspace:FindFirstChild('CharacterItems')
+				if root then
+					getgenv().SB2ClearCharItemsBound = nil
+					charItemsHooked = nil
+					bindCharacterItems(root)
+					scanCharacterItems(root)
+				else
+					say('CharacterItems missing')
+				end
+				local chars = workspace:FindFirstChild('Characters')
+				if chars then
+					getgenv().SB2ClearCharHatsBound = nil
+					characterHatsHooked = nil
+					bindCharacterHats(chars)
+				end
+				local optimized = workspace:FindFirstChild('OptimizedGame')
+				if optimized then
+					optimizedGameWindHooked = nil
+					getgenv().SB2ClearOptimizedWindBound = nil
+					bindOptimizedGameWind(optimized)
+				end
+				for _, target in ipairs(wipeTargets) do
+					rebindWipeFolder(target)
+				end
+				getgenv().SB2ClearVelChatBound = nil
+				for _, c in ipairs(velConns) do
+					pcall(function()
+						c:Disconnect()
+					end)
+				end
+				velConns = {}
+				if bindVelObtained() then
+					say('Vel Obtained clearing on')
+				else
+					say('Vel chat not ready — sweep/UI retry armed')
+				end
+				if rebindMobAnims() then
+					say('mob AnimationControllers clearing on')
+				end
+				bindAllNow()
+				bindPerfMode()
+				setExposure()
+				setMaxZoom()
+				applyInvisicam()
+				setMouseSensitivity(getgenv().SB2MouseSensTarget or DEFAULT_MOUSE_SENSITIVITY)
+				restoreMouse()
+				say('rescan done (death FX on — ResetEffect still protected)')
+			end,
+		},
+		['clearbats'] = {
+			['ListName'] = 'clearbats / nobats',
+			['Description'] = 'Wipe workspace.ActiveBats and keep clearing new bats',
+			['Aliases'] = { 'nobats' },
+			['Function'] = function()
+				if rebindWipeFolder(batsTarget) then
+					say('ActiveBats clearing on')
+				end
+			end,
+		},
+		['clearhits'] = {
+			['ListName'] = 'clearhits / nohits',
+			['Description'] = 'Wipe workspace.HitEffects and keep clearing new hit particles',
+			['Aliases'] = { 'nohits' },
+			['Function'] = function()
+				if rebindWipeFolder(hitsTarget) then
+					say('HitEffects clearing on')
+				end
+			end,
+		},
+		['clearmobfx'] = {
+			['ListName'] = 'clearmobfx / nomobfx',
+			['Description'] = 'Wipe workspace.MobSpawnEffects and keep clearing mob spawn VFX',
+			['Aliases'] = { 'nomobfx' },
+			['Function'] = function()
+				if rebindWipeFolder(mobFxTarget) then
+					say('MobSpawnEffects clearing on')
+				end
+			end,
+		},
+		['clearclones'] = {
+			['ListName'] = 'clearclones / noclones',
+			['Description'] = 'Wipe workspace.ShadowClones and keep clearing new clones',
+			['Aliases'] = { 'noclones', 'clearshadowclones' },
+			['Function'] = function()
+				if rebindWipeFolder(clonesTarget) then
+					say('ShadowClones clearing on')
+				end
+			end,
+		},
+		['clearvel'] = {
+			['ListName'] = 'clearvel / novel',
+			['Description'] = 'Hide "Vel Obtained" chat lines and keep blocking new ones',
+			['Aliases'] = { 'novel', 'novels' },
+			['Function'] = function()
+				getgenv().SB2ClearVelChatBound = nil
+				if bindVelObtained() then
+					say('Vel Obtained clearing on')
+				else
+					say('Vel chat not found yet — UI hook armed if available')
+					installVelUIHook()
+				end
+			end,
+		},
+		['clearanims'] = {
+			['ListName'] = 'clearanims / noanims',
+			['Description'] = 'Remove AnimationController from every mob in workspace.Mobs and keep stripping new ones',
+			['Aliases'] = { 'noanims', 'clearmobanims' },
+			['Function'] = function()
+				if rebindMobAnims() then
+					say('mob AnimationControllers clearing on')
+				end
+			end,
+		},
+		['cleardeath'] = {
+			['ListName'] = 'cleardeath / nodeathfx',
+			['Description'] = 'Clear mob death VFX (KillFade + HighlightModel). Never touches ResetEffect.',
+			['Aliases'] = { 'nodeathfx', 'nodeath' },
+			['Function'] = function()
+				getgenv().SB2ClearDeathFxBound = nil
+				if bindDeathFx() then
+					say('death FX clearing on (KillFade + HighlightModel; ResetEffect protected)')
+				else
+					say('death FX armed — KillFade hook may retry when Graphics loads')
+				end
+			end,
+		},
+		['uncleardeath'] = {
+			['ListName'] = 'uncleardeath / yesdeathfx',
+			['Description'] = 'Stop clearing death FX / KillFade',
+			['Aliases'] = { 'yesdeathfx', 'allowdeathfx' },
+			['Function'] = function()
+				deathFxEnabled = false
+				getgenv().SB2ClearDeathFxEnabled = false
+				getgenv().SB2ClearDeathFxBound = nil
+				restoreKillFadeHook()
+				say('death FX clearing off')
+			end,
+		},
+		['clearlava'] = {
+			['ListName'] = 'clearlava / nolava',
+			['Description'] = 'Wipe workspace.Lava Meteor Strike pools (does not enable KillFade clearing)',
+			['Aliases'] = { 'nolava', 'clearmeteor' },
+			['Function'] = function()
+				local function nukeLava(inst)
+					if not inst or inst.Name ~= 'Lava' then
+						return
+					end
+					pcall(function()
+						inst:Destroy()
+					end)
+				end
+				for _, child in ipairs(workspace:GetChildren()) do
+					nukeLava(child)
+				end
+				rootConns[#rootConns + 1] = workspace.ChildAdded:Connect(nukeLava)
+				say('Lava / Meteor Strike pools clearing on')
+			end,
+		},
+		['clearparticles'] = {
+			['ListName'] = 'clearparticles / noparticles',
+			['Description'] = 'Wipe ParticleEmitters under workspace (skips ResetEffect / Characters / your items)',
+			['Aliases'] = { 'noparticles', 'clearpe', 'nopes' },
+			['Function'] = function()
+				getgenv().SB2ClearParticlesBound = nil
+				if particleSweepThread then
+					pcall(task.cancel, particleSweepThread)
+					particleSweepThread = nil
+				end
+				if particleConn then
+					pcall(function()
+						particleConn:Disconnect()
+					end)
+					particleConn = nil
+				end
+				local ok, wiped = bindParticles()
+				if ok then
+					say(('ParticleEmitters clearing on (wiped %s; ResetEffect / your char protected)'):format(tostring(wiped)))
+				end
+			end,
+		},
+		['perfmode'] = {
+			['ListName'] = 'perfmode / lagfix',
+			['Description'] = 'Lower graphics, strip lights/shadows (no UI stash). Keeps inventory menu clickable',
+			['Aliases'] = { 'lagfix', 'fixlag', 'perf' },
+			['Function'] = function()
+				getgenv().SB2PerfBound = nil
+				bindPerfMode()
+			end,
+		},
+		['openinv'] = {
+			['ListName'] = 'openinv / menu',
+			['Description'] = 'Force-open / toggle the Cardinal inventory menu',
+			['Aliases'] = { 'menu', 'inventory', 'toggleinv' },
+			['Function'] = function()
+				local fire = getgenv().SB2FireMenuActivated
+				if type(fire) ~= 'function' then
+					bindPerfMode()
+					fire = getgenv().SB2FireMenuActivated
+				end
+				if type(fire) == 'function' and fire('command') then
+					say('toggled inventory menu')
+				else
+					say('menu toggle failed (HUD.Menu missing?)')
+				end
+			end,
+		},
+		['ccioff'] = {
+			['ListName'] = 'ccioff',
+			['Description'] = 'Stop CCI wiping / effect clear / exposure pinning',
+			['Aliases'] = { 'clearcharitemsoff' },
+			['Function'] = function()
+				stopPlugin()
+			end,
+		},
+		['clearblur'] = {
+			['ListName'] = 'clearblur',
+			['Description'] = 'Destroy Lighting.MenuBlur once (same as CCI load)',
+			['Aliases'] = { 'menublur', 'noblur', 'clearblurs' },
+			['Function'] = function()
+				if clearMenuBlur() then
+					say('Lighting.MenuBlur destroyed')
+				else
+					say('Lighting.MenuBlur not present')
+				end
+			end,
+		},
+		['setexposure'] = {
+			['ListName'] = 'setexposure [num]',
+			['Description'] = 'Pin Lighting.ExposureCompensation (default -1.5). Example: setexposure -1.5',
+			['Aliases'] = { 'exposure', 'exp' },
+			['Function'] = function(args)
+				local raw = args and (args[1] or args[0])
+				local value = tonumber(raw)
+				if value == nil then
+					value = DEFAULT_EXPOSURE
+				end
+				local ok, err, target, now = setExposure(value)
+				if ok then
+					say(('exposure → %s (Lighting=%s)'):format(tostring(target), tostring(now)))
+				else
+					say('exposure failed: ' .. tostring(err))
+				end
+			end,
+		},
+		['maxzoom'] = {
+			['ListName'] = 'maxzoom [num|off]',
+			['Description'] = 'Pin CameraMaxZoomDistance (default 4000). Example: maxzoom 4000 | maxzoom off',
+			['Aliases'] = { 'setmaxzoom', 'camzoom' },
+			['Function'] = function(args)
+				local raw = args and (args[1] or args[0])
+				if type(raw) == 'string' and raw:lower() == 'off' then
+					local ok, _, _, now = setMaxZoom('off')
+					if ok then
+						say(('max zoom lock off (now %s)'):format(tostring(now)))
+					end
+					return
+				end
+				local value = tonumber(raw)
+				if value == nil then
+					value = DEFAULT_MAX_ZOOM
+				end
+				local ok, err, target, now = setMaxZoom(value)
+				if ok then
+					say(('max zoom → %s (Player=%s)'):format(tostring(target), tostring(now)))
+				else
+					say('max zoom failed: ' .. tostring(err))
+				end
+			end,
+		},
+		['sensitivity'] = {
+			['ListName'] = 'sensitivity [num|off]',
+			['Description'] = 'Pin mouse sensitivity (default 0.2). Example: sensitivity 0.2 | sensitivity off',
+			['Aliases'] = { 'sens', 'setsens', 'mousesens' },
+			['Function'] = function(args)
+				local raw = args and (args[1] or args[0])
+				if type(raw) == 'string' and raw:lower() == 'off' then
+					local ok, _, _, now = setMouseSensitivity('off')
+					if ok then
+						say(('sensitivity lock off (now %s)'):format(tostring(now)))
+					end
+					return
+				end
+				local value = tonumber(raw)
+				if value == nil then
+					value = DEFAULT_MOUSE_SENSITIVITY
+				end
+				local ok, err, target, now = setMouseSensitivity(value)
+				if ok then
+					say(('sensitivity → %s (now %s)'):format(tostring(target), tostring(now)))
+				else
+					say('sensitivity failed: ' .. tostring(err))
+				end
+			end,
+		},
+		['fixmouse'] = {
+			['ListName'] = 'fixmouse',
+			['Description'] = 'Re-enable mouse icon if it disappeared',
+			['Aliases'] = { 'fixcursor' },
+			['Function'] = function()
+				restoreMouse()
+				say('mouse icon restored')
+			end,
+		},
+		['2022materials'] = {
+			['ListName'] = '2022materials / use2022materials',
+			['Description'] = 'Enable 2022 material textures (MaterialService.Use2022Materials). On by default with CCI.',
+			['Aliases'] = { 'use2022materials', 'materials2022' },
+			['Function'] = function()
+				local ok, err = set2022Materials(true)
+				if ok then
+					say('2022 materials ON')
+				else
+					say('2022 materials failed: ' .. tostring(err))
+				end
+			end,
+		},
+		['un2022materials'] = {
+			['ListName'] = 'un2022materials / unuse2022materials',
+			['Description'] = 'Disable 2022 material textures',
+			['Aliases'] = { 'unuse2022materials' },
+			['Function'] = function()
+				local ok, err = set2022Materials(false)
+				if ok then
+					say('2022 materials OFF')
+				else
+					say('2022 materials failed: ' .. tostring(err))
+				end
+			end,
+		},
+		['autohideiyon'] = {
+			['ListName'] = 'autohideiyon',
+			['Description'] = 'Enable auto hideiy on CCI/IY load (default). Prefix key still opens the bar.',
+			['Aliases'] = { 'ahiyon', 'autohideiy' },
+			['Function'] = function()
+				writeAutoHideIY(true)
+				getgenv().SB2AutoHideIY = true
+				hideIYNow(true)
+				say('auto hideiy ON')
+			end,
+		},
+		['autohideiyoff'] = {
+			['ListName'] = 'autohideiyoff',
+			['Description'] = 'Disable auto hideiy (IY stays visible on load)',
+			['Aliases'] = { 'ahiyoff' },
+			['Function'] = function()
+				writeAutoHideIY(false)
+				getgenv().SB2AutoHideIY = false
+				say('auto hideiy OFF')
+			end,
+		},
+		['autohideiystatus'] = {
+			['ListName'] = 'autohideiystatus / ahiystat',
+			['Description'] = 'Show auto-hideiy status',
+			['Aliases'] = { 'ahiystat' },
+			['Function'] = function()
+				say(readAutoHideIY() and 'auto hideiy: ON' or 'auto hideiy: OFF')
+			end,
+		},
+		['antilag'] = {
+			['ListName'] = 'antilag / boostfps / lowgraphics',
+			['Description'] = 'One-shot workspace antilag (skips Database/GUI; no stream catch-up)',
+			['Aliases'] = { 'boostfps', 'lowgraphics', 'cciantilag' },
+			['Function'] = function()
+				runAntilag()
+				say('antilag applied (one map strip; icons kept; no stream catch-up)')
+			end,
+		},
+	},
+}
+
+return Plugin

@@ -1,0 +1,2262 @@
+--[[
+    AutoBlock.iy — Infinite Yield plugin (Swordburst 2)
+
+    Owns auto-block EARLY (IY loads before PlayerTools). Watches joins,
+    PromptBlockPlayer + click Block, then hops F11. PlayerTools UI only
+    toggles PlayerTools/autoblock + calls getgenv().SB2SetAutoBlock.
+
+    Install: IY Plugins → Add → AutoBlock.iy (this file)
+    Commands: abon | aboff | abstatus | abarm
+
+    Shared state:
+      PlayerTools/autoblock
+      PlayerTools/autoblock_hop_<account>.json
+      getgenv().SB2AutoBlockIyOwner / SB2AutoBlockJoinConn / SB2AutoBlockBusy
+]]
+
+local Players = game:GetService('Players')
+local HttpService = game:GetService('HttpService')
+local TeleportService = game:GetService('TeleportService')
+local GuiService = game:GetService('GuiService')
+local StarterGui = game:GetService('StarterGui')
+local VirtualInputManager = game:GetService('VirtualInputManager')
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
+	or Players.LocalPlayer
+
+local GENV_STOP = 'SB2AutoBlockIyStop'
+local FOLDER = 'PlayerTools'
+
+-- #region agent log
+local DEBUG_LOG_PATH = FOLDER .. '/debug-7e9135.log'
+local function agentLog(hypothesisId, location, message, data)
+	pcall(function()
+		local payload = HttpService:JSONEncode({
+			sessionId = '7e9135',
+			hypothesisId = hypothesisId,
+			location = location,
+			message = message,
+			data = data or {},
+			timestamp = os.time() * 1000,
+		})
+		if type(writefile) == 'function' then
+			pcall(appendfile, DEBUG_LOG_PATH, payload .. '\n')
+		end
+		pcall(function()
+			HttpService:PostAsync(
+				'http://127.0.0.1:7861/ingest/33b8acf6-21a2-4cac-86cb-3dd7bad0dfa2',
+				payload,
+				Enum.HttpContentType.ApplicationJson,
+				false,
+				{ ['X-Debug-Session-Id'] = '7e9135' }
+			)
+		end)
+	end)
+end
+-- #endregion
+local AUTOBLOCK_PATH = FOLDER .. '/autoblock'
+local F1_PLACE = 542351431
+local F11_PLACE = 5287433115
+local AUTO_BLOCK_WAIT = 15
+getgenv().SB2AutoBlockWait = AUTO_BLOCK_WAIT
+local ACTION_DELAY = 0.5
+local BLOCK_SETTLE_SEC = 1.4
+local PRESENCE_WATCH_SEC = 2
+local BLOCKED_USERS_PATH = FOLDER .. '/blocked_user_ids.json'
+local FRESH_FLOOR_PATH = FOLDER .. '/fresh_finder_floor.json'
+
+local HARD_STORY_FLOORS = {
+	{ placeId = 542351431, name = 'Virhst Woodlands', floor = 1 },
+	{ placeId = 548231754, name = 'Redveil Grove', floor = 2 },
+	{ placeId = 555980327, name = 'Avalanche Expanse', floor = 3 },
+	{ placeId = 572487908, name = 'Hidden Wilds', floor = 4 },
+	{ placeId = 580239979, name = 'Desolate Dunes', floor = 5 },
+	{ placeId = 566212942, name = 'Helmfirth', floor = 6 },
+	{ placeId = 582198062, name = 'Entoloma Gloomlands', floor = 7 },
+	{ placeId = 548878321, name = 'Blooming Plateau', floor = 8 },
+	{ placeId = 573267292, name = "Va' Rok", floor = 9 },
+	{ placeId = 2659143505, name = 'Transylvania', floor = 10 },
+	{ placeId = 5287433115, name = 'Hypersiddia', floor = 11 },
+	{ placeId = 6144637080, name = 'Sector - 235', floor = 12 },
+}
+
+local blockedUserIds = {}
+local freshFinderWatchdogOn = false
+
+
+local OWN_ALT_NAMES = {
+	nickb928 = true,
+	nickb925 = true,
+	nickb926 = true,
+	nickb910 = true,
+	nickb929 = true,
+	dyildolover = true,
+	['62qx'] = true,
+}
+
+if getgenv()[GENV_STOP] then
+	pcall(getgenv()[GENV_STOP])
+end
+
+getgenv().SB2AutoBlockIyOwner = true
+getgenv().SB2AutoBlockIyReady = false
+
+local function say(text)
+	pcall(function()
+		StarterGui:SetCore('SendNotification', {
+			Title = 'AutoBlock',
+			Text = tostring(text),
+			Duration = 4,
+		})
+	end)
+	warn('[AutoBlock.iy] ' .. tostring(text))
+end
+
+local function normalizeAltKey(raw)
+	local s = string.lower(tostring(raw or ''))
+	s = s:gsub('%s+', ''):gsub('[^%w_%-]', '')
+	return s
+end
+
+local function accountFileKey()
+	local name = normalizeAltKey(LocalPlayer and LocalPlayer.Name or 'unknown')
+	if name == '' then
+		name = 'unknown'
+	end
+	return name
+end
+
+local function hopPath()
+	return FOLDER .. '/autoblock_hop_' .. accountFileKey() .. '.json'
+end
+
+local function ensureFolder()
+	if type(makefolder) == 'function' and type(isfolder) == 'function' then
+		pcall(function()
+			if not isfolder(FOLDER) then
+				makefolder(FOLDER)
+			end
+		end)
+	end
+end
+
+local function isOwnAlt(plr)
+	if type(getgenv().SB2IsOwnAlt) == 'function' and plr then
+		local ok, result = pcall(getgenv().SB2IsOwnAlt, plr)
+		if ok then
+			return result == true
+		end
+	end
+	if not plr then
+		return false
+	end
+	local extras = rawget(getgenv(), 'SB2OwnAltNames')
+	local name = normalizeAltKey(plr.Name)
+	local display = normalizeAltKey(plr.DisplayName)
+	return OWN_ALT_NAMES[name] == true
+		or OWN_ALT_NAMES[display] == true
+		or (type(extras) == 'table' and (extras[name] == true or extras[display] == true))
+end
+
+local function countStrangerPlayers()
+	local n = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and not isOwnAlt(plr) then
+			n += 1
+		end
+	end
+	return n
+end
+
+local function isSkipBlocked(plr)
+	if not plr or not plr.UserId then
+		return false
+	end
+	local skip = getgenv().SB2AutoBlockSkipUntil
+	if type(skip) ~= 'table' then
+		return false
+	end
+	local untilT = skip[plr.UserId]
+	return type(untilT) == 'number' and os.clock() < untilT
+end
+
+local function persistBlockedUserId(userId)
+	userId = tonumber(userId)
+	if not userId then
+		return
+	end
+	if blockedUserIds[userId] then
+		return
+	end
+	blockedUserIds[userId] = true
+	if type(writefile) ~= 'function' then
+		return
+	end
+	ensureFolder()
+	local arr = {}
+	for id in pairs(blockedUserIds) do
+		arr[#arr + 1] = id
+	end
+	table.sort(arr)
+	local okJson, body = pcall(function()
+		return HttpService:JSONEncode(arr)
+	end)
+	if okJson and type(body) == 'string' then
+		pcall(writefile, BLOCKED_USERS_PATH, body)
+	end
+end
+
+local function loadBlockedUserIds()
+	blockedUserIds = {}
+	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+		return
+	end
+	local ok, exists = pcall(isfile, BLOCKED_USERS_PATH)
+	if not ok or not exists then
+		return
+	end
+	local okRead, body = pcall(readfile, BLOCKED_USERS_PATH)
+	if not okRead or type(body) ~= 'string' or body == '' then
+		return
+	end
+	local okJson, data = pcall(function()
+		return HttpService:JSONDecode(body)
+	end)
+	if not okJson or type(data) ~= 'table' then
+		return
+	end
+	if data[1] ~= nil then
+		for _, id in ipairs(data) do
+			local n = tonumber(id)
+			if n then
+				blockedUserIds[n] = true
+			end
+		end
+		return
+	end
+	for k, v in pairs(data) do
+		local n = tonumber(k)
+		if n and v ~= false then
+			blockedUserIds[n] = true
+		end
+	end
+end
+
+-- Temporary cooldown only — do NOT persist. Persisting on failed modal/hop
+-- permanently skips real players and causes hop loops without PromptBlockPlayer.
+local function markSkipBlocked(plr, seconds)
+	if not plr or not plr.UserId then
+		return
+	end
+	getgenv().SB2AutoBlockSkipUntil = getgenv().SB2AutoBlockSkipUntil or {}
+	getgenv().SB2AutoBlockSkipUntil[plr.UserId] = os.clock() + (tonumber(seconds) or 300)
+end
+
+-- Only after a real Roblox block (Unblock UI / confirmed modal close).
+local function markConfirmedBlocked(plr, seconds)
+	markSkipBlocked(plr, seconds or 300)
+	if plr and plr.UserId then
+		persistBlockedUserId(plr.UserId)
+	end
+end
+
+local function unpersistBlockedUserId(userId)
+	userId = tonumber(userId)
+	if not userId or not blockedUserIds[userId] then
+		return false
+	end
+	blockedUserIds[userId] = nil
+	if type(writefile) ~= 'function' then
+		return true
+	end
+	ensureFolder()
+	local arr = {}
+	for id in pairs(blockedUserIds) do
+		arr[#arr + 1] = id
+	end
+	table.sort(arr)
+	local okJson, body = pcall(function()
+		return HttpService:JSONEncode(arr)
+	end)
+	if okJson and type(body) == 'string' then
+		pcall(writefile, BLOCKED_USERS_PATH, body)
+	end
+	return true
+end
+
+local function isKnownBlocked(plr)
+	if isSkipBlocked(plr) then
+		return true
+	end
+	return plr and plr.UserId and blockedUserIds[plr.UserId] == true
+end
+
+-- Strangers who still need a block attempt (not already-known blocked).
+local function countActionableStrangers()
+	local n = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and not isOwnAlt(plr) and not isKnownBlocked(plr) then
+			n += 1
+		end
+	end
+	return n
+end
+
+local function markJustLanded(seconds)
+	local untilT = os.clock() + (tonumber(seconds) or 12)
+	getgenv().SB2FreshJustLandedUntil = untilT
+	return untilT
+end
+
+local function stillLanding()
+	return os.clock() < (tonumber(getgenv().SB2FreshJustLandedUntil) or 0)
+end
+
+local function stopFreshFinderIfEmpty(reason)
+	local strangers = countStrangerPlayers()
+	if strangers > 0 then
+		getgenv().SB2FreshEmptySince = nil
+		return false
+	end
+	-- After a hop, other players often aren't replicated yet — don't kill finder.
+	if stillLanding() then
+		return false
+	end
+	-- Require a short stable empty window (not a single empty poll).
+	local emptySince = tonumber(getgenv().SB2FreshEmptySince) or 0
+	if emptySince <= 0 then
+		getgenv().SB2FreshEmptySince = os.clock()
+		return false
+	end
+	if (os.clock() - emptySince) < 4 then
+		return false
+	end
+	getgenv().SB2FreshEmptySince = nil
+	if type(getgenv().SB2StopFreshServerFinder) == 'function' then
+		pcall(getgenv().SB2StopFreshServerFinder, reason or 'Empty server found on this floor')
+	else
+		writeFreshFinder({ active = false, placeId = game.PlaceId, tried = {}, hops = 0 })
+		writeHop({ active = false, phase = 'off' })
+		getgenv().SB2AutoBlockHopping = nil
+		say(reason or 'Empty server found on this floor')
+	end
+	return true
+end
+
+local function fileOn()
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, AUTOBLOCK_PATH)
+		if ok and exists then
+			local okRead, body = pcall(readfile, AUTOBLOCK_PATH)
+			if okRead then
+				return tostring(body) == 'true'
+			end
+		end
+	end
+	return getgenv().SB2AutoBlockWanted == true
+end
+
+local function writeFile(on)
+	ensureFolder()
+	if type(writefile) == 'function' then
+		pcall(writefile, AUTOBLOCK_PATH, on and 'true' or 'false')
+	end
+end
+
+local function readHop()
+	local path = hopPath()
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, path)
+		if ok and exists then
+			local okRead, body = pcall(readfile, path)
+			if okRead and type(body) == 'string' and body ~= '' then
+				local okJson, data = pcall(function()
+					return HttpService:JSONDecode(body)
+				end)
+				if okJson and type(data) == 'table' then
+					return data
+				end
+			end
+		end
+	end
+	local shared = getgenv().SB2AutoBlockHop
+	if type(shared) == 'table' then
+		return shared
+	end
+	return nil
+end
+
+local function writeHop(data)
+	ensureFolder()
+	data = type(data) == 'table' and data or {}
+	data.owner = accountFileKey()
+	data.t = data.t or os.time()
+	getgenv().SB2AutoBlockHop = data
+	if type(writefile) == 'function' then
+		local okJson, body = pcall(function()
+			return HttpService:JSONEncode(data)
+		end)
+		if okJson and type(body) == 'string' then
+			pcall(writefile, hopPath(), body)
+		end
+	end
+end
+
+local function hopInProgress()
+	local hop = readHop()
+	return type(hop) == 'table'
+		and hop.active == true
+		and (hop.phase == 'f1' or hop.phase == 'f11' or hop.phase == 'fresh')
+end
+
+local function httpGet(url)
+	local request = (syn and syn.request)
+		or (http and http.request)
+		or http_request
+		or request
+	if type(request) == 'function' then
+		local ok, res = pcall(function()
+			return request({ Url = url, Method = 'GET' })
+		end)
+		if ok and type(res) == 'table' and type(res.Body) == 'string' then
+			return res.Body
+		end
+	end
+	return game:HttpGet(url)
+end
+
+local function readFreshFinder()
+	local fsf = getgenv().SB2FreshServerFinder
+	if type(fsf) == 'table' then
+		return fsf
+	end
+	local path = FOLDER .. '/fresh_server_finder.json'
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, path)
+		if ok and exists then
+			local okRead, body = pcall(readfile, path)
+			if okRead and type(body) == 'string' and body ~= '' then
+				local okJson, data = pcall(function()
+					return HttpService:JSONDecode(body)
+				end)
+				if okJson and type(data) == 'table' then
+					getgenv().SB2FreshServerFinder = data
+					return data
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function writeFreshFinder(data)
+	if type(data) ~= 'table' then
+		data = { active = false }
+	end
+	getgenv().SB2FreshServerFinder = data
+	if type(getgenv().SB2WriteFreshServerFinder) == 'function' then
+		pcall(getgenv().SB2WriteFreshServerFinder, data)
+		return
+	end
+	if type(writefile) ~= 'function' then
+		return
+	end
+	ensureFolder()
+	local okJson, body = pcall(function()
+		return HttpService:JSONEncode(data)
+	end)
+	if okJson and type(body) == 'string' then
+		pcall(writefile, FOLDER .. '/fresh_server_finder.json', body)
+	end
+end
+
+local function freshFinderActive()
+	local fsf = readFreshFinder()
+	return type(fsf) == 'table' and fsf.active == true
+end
+
+local function ensureServerHopCatalog()
+	if type(getgenv().SB2EnsureServerHopCatalog) == 'function' then
+		local ok, cat = pcall(getgenv().SB2EnsureServerHopCatalog)
+		if ok and type(cat) == 'table' then
+			return cat
+		end
+	end
+	local cat = getgenv().SB2ServerHopCatalog
+	return type(cat) == 'table' and cat or nil
+end
+
+local function buildFreshFinderFloorList()
+	local out = {}
+	local cat = ensureServerHopCatalog()
+	local storyPlaces = {}
+
+	if type(cat) == 'table' then
+		if type(cat.floors) == 'table' then
+			for i, rec in ipairs(cat.floors) do
+				if type(rec) == 'table' and tonumber(rec.placeId) then
+					storyPlaces[rec.placeId] = true
+					local f = tonumber(rec.floor) or i
+					out[#out + 1] = {
+						placeId = rec.placeId,
+						name = rec.name,
+						floor = f,
+						category = rec.category or 'Main',
+						label = ('F%d %s'):format(f, tostring(rec.name)),
+						sortKey = string.format('%04d_%s', f, tostring(rec.name)),
+					}
+				end
+			end
+		end
+		if type(cat.all) == 'table' then
+			for _, rec in ipairs(cat.all) do
+				if type(rec) == 'table' and tonumber(rec.placeId) and not storyPlaces[rec.placeId] then
+					local catStr = tostring(rec.category or '')
+					local label = tostring(rec.name or ('Place ' .. tostring(rec.placeId)))
+					if catStr ~= '' then
+						label = label .. ' [' .. catStr .. ']'
+					end
+					out[#out + 1] = {
+						placeId = rec.placeId,
+						name = rec.name,
+						category = catStr,
+						label = label,
+						sortKey = 'z_' .. catStr .. '_' .. label,
+					}
+				end
+			end
+		end
+	end
+
+	if #out == 0 then
+		for _, rec in ipairs(HARD_STORY_FLOORS) do
+			out[#out + 1] = {
+				placeId = rec.placeId,
+				name = rec.name,
+				floor = rec.floor,
+				category = 'Main',
+				label = ('F%d %s'):format(rec.floor, rec.name),
+				sortKey = string.format('%04d_%s', rec.floor, rec.name),
+			}
+		end
+	end
+
+	table.sort(out, function(a, b)
+		return tostring(a.sortKey) < tostring(b.sortKey)
+	end)
+	return out
+end
+
+local function getFloorCatalog()
+	local cat = ensureServerHopCatalog()
+	if type(cat) == 'table' and type(cat.all) == 'table' and #cat.all > 0 then
+		return cat.all
+	end
+	return HARD_STORY_FLOORS
+end
+
+local function resolveFloorTarget(raw)
+	if raw == nil or tostring(raw) == '' then
+		return nil
+	end
+	if type(getgenv().SB2ServerHopResolveTarget) == 'function' then
+		local ok, rec = pcall(getgenv().SB2ServerHopResolveTarget, raw)
+		if ok and type(rec) == 'table' and rec.placeId then
+			return rec
+		end
+	end
+	local rawStr = tostring(raw)
+	for _, rec in ipairs(buildFreshFinderFloorList()) do
+		if rec.label and rec.label == rawStr then
+			return rec
+		end
+	end
+	local key = string.lower(rawStr:gsub('^%s+', ''):gsub('%s+$', ''))
+	local flead = key:match('^(f%d+)')
+	if flead then
+		key = flead
+	end
+	local cat = ensureServerHopCatalog()
+	if type(cat) == 'table' and type(cat.byAlias) == 'table' then
+		local rec = cat.byAlias[key] or cat.byAlias[key:gsub('%W', '')]
+		if rec then
+			return rec
+		end
+	end
+	local fnum = key:match('^f%-?(%d+)$') or key:match('^floor%-?(%d+)$') or key:match('^floor%s+(%d+)$')
+	if fnum and type(cat) == 'table' and type(cat.floors) == 'table' then
+		local rec = cat.floors[tonumber(fnum)]
+		if rec then
+			return rec
+		end
+	end
+	for _, rec in ipairs(getFloorCatalog()) do
+		local name = string.lower(tostring(rec.name or ''))
+		if key == name or key == name:gsub('%W', '') then
+			return rec
+		end
+		if tonumber(key) == tonumber(rec.placeId) then
+			return rec
+		end
+	end
+	return nil
+end
+
+local function readFreshFinderFloorPref()
+	local fsf = readFreshFinder()
+	if type(fsf) == 'table' and tonumber(fsf.placeId) then
+		return tonumber(fsf.placeId), fsf.placeName
+	end
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, FRESH_FLOOR_PATH)
+		if ok and exists then
+			local okRead, body = pcall(readfile, FRESH_FLOOR_PATH)
+			if okRead and type(body) == 'string' and body ~= '' then
+				local okJson, data = pcall(function()
+					return HttpService:JSONDecode(body)
+				end)
+				if okJson and type(data) == 'table' and tonumber(data.placeId) then
+					return tonumber(data.placeId), data.placeName
+				end
+			end
+		end
+	end
+	return tonumber(game.PlaceId) or game.PlaceId, nil
+end
+
+local function writeFreshFinderFloorPref(placeId, placeName)
+	placeId = tonumber(placeId)
+	if not placeId then
+		return
+	end
+	ensureFolder()
+	local payload = { placeId = placeId, placeName = placeName, t = os.time() }
+	if type(writefile) == 'function' then
+		local okJson, body = pcall(function()
+			return HttpService:JSONEncode(payload)
+		end)
+		if okJson and type(body) == 'string' then
+			pcall(writefile, FRESH_FLOOR_PATH, body)
+		end
+	end
+	local fsf = readFreshFinder()
+	if type(fsf) == 'table' then
+		fsf.placeId = placeId
+		fsf.placeName = placeName
+		writeFreshFinder(fsf)
+	end
+end
+
+local function setFreshFinderFloor(raw)
+	local rec = resolveFloorTarget(raw)
+	if not rec or not rec.placeId then
+		return false, 'unknown floor'
+	end
+	writeFreshFinderFloorPref(rec.placeId, rec.name)
+	local label = rec.floor and ('F' .. rec.floor .. ' ' .. rec.name) or rec.name
+	return true, label
+end
+
+local freshHopBusy = false
+local runAutoBlockSequence
+local blockRetryToken = 0
+
+local function bumpFreshFinderCancel()
+	getgenv().SB2FreshFinderCancelGen = (getgenv().SB2FreshFinderCancelGen or 0) + 1
+	blockRetryToken += 1
+	freshHopBusy = false
+end
+
+local function freshFinderCancelled(sinceGen)
+	if (getgenv().SB2FreshFinderCancelGen or 0) ~= (sinceGen or 0) then
+		return true
+	end
+	return not freshFinderActive()
+end
+
+local function pickFreshServerJob(placeId, triedSet)
+	-- Only empty public instances count as "fresh". Never hop into an already
+	-- populated server just because it has fewer players — that cycles the list.
+	triedSet = triedSet or {}
+	local current = tostring(game.JobId or '')
+	if current ~= '' then
+		triedSet[current] = true
+	end
+	local cursor = ''
+	for _ = 1, 8 do
+		local url = ('https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100'):format(placeId)
+		if cursor ~= '' then
+			local enc = cursor
+			pcall(function()
+				enc = HttpService:UrlEncode(cursor)
+			end)
+			url = url .. '&cursor=' .. enc
+		end
+		local ok, body = pcall(httpGet, url)
+		if not ok or type(body) ~= 'string' or body == '' then
+			break
+		end
+		local okJson, data = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if not okJson or type(data) ~= 'table' or type(data.data) ~= 'table' then
+			break
+		end
+		for _, srv in ipairs(data.data) do
+			local id = tostring(srv.id or '')
+			local playing = tonumber(srv.playing) or 0
+			if id ~= '' and not triedSet[id] and playing <= 0 then
+				return id, triedSet
+			end
+		end
+		cursor = data.nextPageCursor
+		if type(cursor) ~= 'string' or cursor == '' then
+			break
+		end
+	end
+	return nil, triedSet
+end
+
+local function autoblockShouldRun()
+	return enabled or freshFinderActive()
+end
+
+local function armTeleport()
+	getgenv().SB2AutoBlockHopping = true
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
+		pcall(getgenv().SB2PlayerToolsArmTeleport)
+	elseif type(queueteleport) == 'function' then
+		-- Keep PlayerTools across the hop even if PT hasn't loaded yet.
+		pcall(queueteleport, [[
+if isfile and isfile('PlayerTools/manual_unload') then local ok,b=pcall(readfile,'PlayerTools/manual_unload'); if ok and tostring(b)=='true' then return end end
+if getgenv().SB2PlayerToolsManualUnload then return end
+getgenv().SB2MenuHopGraceUntil=os.clock()+25;getgenv().SB2UiKeeperQuietUntil=os.clock()+25;getgenv().SB2MenuWantOpen=true
+local function soft() local gui=getgenv().SB2PlayerToolsGui; if typeof(gui)~='Instance' then return false end
+if not gui.Parent then pcall(function() local h=nil; if gethui then local ok,x=pcall(gethui); if ok then h=x end end; local cg=game:FindService('CoreGui') or game:GetService('CoreGui'); gui.Parent=h or (cg and cg:FindFirstChild('RobloxGui')) or cg; if not gui.Parent then local lp=game:GetService('Players').LocalPlayer; local pg=lp and lp:FindFirstChildOfClass('PlayerGui'); if pg then gui.Parent=pg end end; if gui.Parent then gui.Enabled=true end end) end
+if not gui.Parent then return false end; getgenv().SB2PlayerTools=true; getgenv().SB2UiOrphanFails=0; if type(getgenv().SB2RefreshPlayerTools)=='function' then pcall(getgenv().SB2RefreshPlayerTools) end; return true end
+if soft() then return end
+if getgenv().SB2PlayerToolsLoading==true then for _=1,50 do task.wait(0.4); if getgenv().SB2PlayerToolsManualUnload then return end; if soft() then return end; if getgenv().SB2PlayerToolsLoading~=true then break end end; if soft() then return end end
+for _=1,10 do task.wait(0.4); if soft() then return end end
+if getgenv().SB2PlayerToolsLoading==true then return end
+if type(getgenv().SB2ScrubAllLeakedHooks)=='function' then pcall(getgenv().SB2ScrubAllLeakedHooks) elseif type(getgenv().SB2TeardownStarlightLeaks)=='function' then pcall(getgenv().SB2TeardownStarlightLeaks) end
+getgenv().SB2SoftPlayerToolsReload=true; getgenv().SB2PlayerToolsLoading=true; getgenv().SB2PlayerToolsLoadingSince=os.clock(); getgenv().SB2PlayerTools=false; getgenv().SB2PlayerToolsLibrary=nil
+local p=(isfile and isfile('PlayerTools/launch.lua') and 'PlayerTools/launch.lua') or (isfile and isfile('PlayerTools/PlayerTools.lua') and 'PlayerTools/PlayerTools.lua') or (isfile and isfile('PlayerTools.lua') and 'PlayerTools.lua')
+if not p then getgenv().SB2PlayerToolsLoading=false; getgenv().SB2SoftPlayerToolsReload=nil; return end
+local fn,err=(loadstring or load)(readfile(p),p)
+if fn then pcall(fn) else getgenv().SB2PlayerToolsLoading=false; getgenv().SB2SoftPlayerToolsReload=nil end
+]])
+	end
+end
+
+local function startFreshServerHop(reason)
+	local fresh = freshFinderActive()
+	if not fresh then
+		return false
+	end
+	if stopFreshFinderIfEmpty('Empty server found on this floor') then
+		return false
+	end
+	if freshHopBusy then
+		return false
+	end
+	local cancelGen = getgenv().SB2FreshFinderCancelGen or 0
+	-- Fresh finder needs transient block runs without flipping the user's autoblock toggle.
+	local placeId = tonumber(game.PlaceId) or game.PlaceId
+	local fsf = readFreshFinder() or { active = true, placeId = placeId, tried = {}, hops = 0 }
+	if fsf.active ~= true then
+		return false
+	end
+	fsf.placeId = tonumber(fsf.placeId) or placeId
+	fsf.tried = type(fsf.tried) == 'table' and fsf.tried or {}
+	fsf.hops = (tonumber(fsf.hops) or 0) + 1
+	if fsf.hops > 60 then
+		fsf.active = false
+		writeFreshFinder(fsf)
+		writeHop({ active = false, phase = 'off' })
+		getgenv().SB2AutoBlockHopping = nil
+		say('fresh server finder stopped — 60 hops')
+		return false
+	end
+	writeFreshFinder(fsf)
+	writeHop({ active = true, phase = 'fresh', placeId = fsf.placeId, auto = true })
+	armTeleport()
+	getgenv().SB2AutoBlockHopping = true
+	markJustLanded(14) -- for the destination session after teleport
+	local label = reason or ('fresh hop #' .. tostring(fsf.hops))
+	local hopNum = fsf.hops
+	freshHopBusy = true
+	task.spawn(function()
+		if freshFinderCancelled(cancelGen) then
+			freshHopBusy = false
+			return
+		end
+		task.wait(0.35)
+		if freshFinderCancelled(cancelGen) then
+			freshHopBusy = false
+			return
+		end
+		task.wait(BLOCK_SETTLE_SEC)
+		if freshFinderCancelled(cancelGen) then
+			freshHopBusy = false
+			return
+		end
+		if stopFreshFinderIfEmpty('Empty server found on this floor') then
+			freshHopBusy = false
+			return
+		end
+		local hopPlace = tonumber(game.PlaceId) or fsf.placeId
+		fsf.placeId = hopPlace
+		writeFreshFinder(fsf)
+		local teleported = false
+		-- Private reserve = empty server, same floor, no HTTP scrape.
+		local okReserve, reserveCode = pcall(function()
+			return TeleportService:ReserveServer(hopPlace)
+		end)
+		if okReserve and type(reserveCode) == 'string' and reserveCode ~= '' then
+			say(label .. ' → reserved server…')
+			teleported = pcall(function()
+				TeleportService:TeleportToPrivateServer(hopPlace, reserveCode, { LocalPlayer })
+			end)
+		end
+		if not teleported then
+			local jobId
+			jobId, fsf.tried = pickFreshServerJob(hopPlace, fsf.tried)
+			if freshFinderCancelled(cancelGen) then
+				freshHopBusy = false
+				return
+			end
+			writeFreshFinder(fsf)
+			local currentJob = tostring(game.JobId or '')
+			if jobId and jobId == currentJob then
+				jobId = nil
+			end
+			if jobId then
+				fsf.tried[jobId] = true
+				writeFreshFinder(fsf)
+				say(label .. ' → empty public server ' .. string.sub(jobId, 1, 8) .. '…')
+				teleported = pcall(function()
+					TeleportService:TeleportToPlaceInstance(hopPlace, jobId, LocalPlayer)
+				end)
+			end
+		end
+		if not teleported then
+			-- No reserved/empty listed instance — matchmake (may spin a new server).
+			-- Do NOT scrape low-pop occupied servers; that just cycles the list.
+			say(label .. ' → matchmaking for a new server…')
+			pcall(function()
+				TeleportService:Teleport(hopPlace, LocalPlayer)
+			end)
+		end
+		task.delay(2, function()
+			freshHopBusy = false
+		end)
+	end)
+	return true
+end
+
+getgenv().SB2StartFreshServerHop = startFreshServerHop
+
+-- Fresh finder: strangers present but all already blocked → hop same floor.
+local function hopFreshIfNoUnblocked(reason)
+	local fresh = freshFinderActive()
+	local actionable = countActionableStrangers()
+	local strangers = countStrangerPlayers()
+	if not fresh then
+		return false
+	end
+	if actionable > 0 then
+		return false
+	end
+	-- Empty server is the goal — never hop away from zero strangers.
+	if strangers == 0 then
+		return stopFreshFinderIfEmpty(reason or 'Empty server found on this floor')
+	end
+	if stopFreshFinderIfEmpty('Empty server found on this floor') then
+		return true
+	end
+	say(reason or 'all present already blocked — hopping…')
+	local ok = startFreshServerHop(reason or 'all present already blocked — hopping…')
+	return ok
+end
+getgenv().SB2HopFreshIfNoUnblocked = hopFreshIfNoUnblocked
+
+local function startSameFloorHop(reason)
+	if enabled then
+		writeFile(true)
+	end
+	getgenv().SB2AutoBlockWanted = autoblockShouldRun()
+	local placeId = tonumber(game.PlaceId) or game.PlaceId
+	writeHop({ active = true, phase = 'fresh', placeId = placeId, auto = true })
+	armTeleport()
+	getgenv().SB2AutoBlockHopping = true
+	markJustLanded(14)
+	say(reason or 'hopping this floor…')
+	task.spawn(function()
+		local teleported = false
+		local okReserve, code = pcall(function()
+			return TeleportService:ReserveServer(placeId)
+		end)
+		if okReserve and type(code) == 'string' and code ~= '' then
+			say((reason or 'hop') .. ' → reserved server…')
+			teleported = pcall(function()
+				TeleportService:TeleportToPrivateServer(placeId, code, { LocalPlayer })
+			end)
+		end
+		if not teleported then
+			say((reason or 'hop') .. ' → random server on this floor')
+			pcall(function()
+				TeleportService:Teleport(placeId, LocalPlayer)
+			end)
+		end
+	end)
+	return true
+end
+
+-- Legacy name — always hops current floor (never F11-only).
+local function startF11Hop(reason)
+	return startSameFloorHop(reason)
+end
+
+-- ---- CoreGui Block prompt helpers (ported from PlayerTools) ----
+local function coreGui()
+	local cg = game:GetService('CoreGui')
+	if cloneref then
+		pcall(function()
+			cg = cloneref(cg)
+		end)
+	end
+	return cg
+end
+
+local function coreGuiRoots()
+	local roots = {}
+	local seen = {}
+	local function add(r)
+		if r and not seen[r] then
+			seen[r] = true
+			roots[#roots + 1] = r
+		end
+	end
+	-- Raw CoreGui first — cloneref sometimes hides Foundation overlay kids.
+	pcall(function()
+		add(game:GetService('CoreGui'))
+	end)
+	pcall(function()
+		add(coreGui())
+	end)
+	pcall(function()
+		if type(gethui) == 'function' then
+			add(gethui())
+		end
+	end)
+	return roots
+end
+
+local function buttonPlainText(obj)
+	local text = ''
+	pcall(function()
+		text = tostring(obj.Text or '')
+	end)
+	if text == '' then
+		pcall(function()
+			text = tostring(obj.ContentText or '')
+		end)
+	end
+	text = text:gsub('%b<>', '')
+	return (string.lower(text):gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+local function findBlockingModal()
+	-- FindFirstChild on FoundationOverlay often returns nil even when the modal is open.
+	for _, root in ipairs(coreGuiRoots()) do
+		local ok, descendants = pcall(function()
+			return root:GetDescendants()
+		end)
+		if ok and type(descendants) == 'table' then
+			for _, d in ipairs(descendants) do
+				if d.Name == 'BlockingModalScreen' and not d:IsA('LuaSourceContainer') then
+					local path = ''
+					pcall(function()
+						path = string.lower(d:GetFullName())
+					end)
+					if path:find('foundationoverlay', 1, true) or path:find('safeareaframe', 1, true) then
+						return d
+					end
+					if not path:find('modules.settings', 1, true) and (d:IsA('GuiObject') or d:IsA('Folder')) then
+						return d
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- Live Block row = FoundationOverlay ... Footer.Buttons.N (ImageButton).
+local function findModalBlockButton()
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+	local best
+	local bestScore = -math.huge
+
+	local function scoreCandidate(pick, path)
+		if not pick or not pick:IsA('GuiObject') then
+			return
+		end
+		local ps = pick.AbsoluteSize
+		if ps.X < 40 or ps.Y < 16 then
+			return
+		end
+		if ps.Y > 96 or ps.X > vp.X * 0.85 then
+			return
+		end
+		if ps.X > vp.X * 0.7 and ps.Y > vp.Y * 0.2 then
+			return
+		end
+		local cy = pick.AbsolutePosition.Y + ps.Y * 0.5
+		if cy < vp.Y * 0.35 then
+			return
+		end
+		local score = 0
+		if path:find('footer', 1, true) then
+			score += 80
+		end
+		if path:find('buttons', 1, true) then
+			score += 40
+		end
+		if pick.Name:match('^%d+$') then
+			score += 25
+		end
+		if pick:IsA('GuiButton') then
+			score += 20
+		end
+		if ps.Y >= 28 and ps.Y <= 64 then
+			score += 30
+		elseif ps.Y <= 80 then
+			score += 10
+		end
+		score += math.min(40, (cy / vp.Y) * 40)
+		if path:find('footer', 1, true) then
+			score -= (cy / vp.Y) * 8
+		end
+		score -= ps.Y * 0.15
+		if score > bestScore then
+			bestScore = score
+			best = pick
+		end
+	end
+
+	local function buttonHasExactBlock(btn)
+		local hasBlock = false
+		local hasReport = false
+		local function check(obj)
+			local t = buttonPlainText(obj)
+			if t == 'block' then
+				hasBlock = true
+			elseif t:find('report', 1, true) then
+				hasReport = true
+			end
+		end
+		check(btn)
+		for _, c in ipairs(btn:GetDescendants()) do
+			if c:IsA('TextLabel') or c:IsA('TextButton') then
+				check(c)
+			end
+		end
+		return hasBlock and not hasReport
+	end
+
+	for _, root in ipairs(coreGuiRoots()) do
+		pcall(function()
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA('ImageButton') or d:IsA('TextButton') then
+					local path = string.lower(d:GetFullName())
+					if path:find('joinlogs', 1, true) or path:find('playertools', 1, true) then
+						continue
+					end
+					if not (path:find('foundationoverlay', 1, true) or path:find('blockingmodal', 1, true)) then
+						continue
+					end
+					if path:find('report', 1, true) then
+						continue
+					end
+					if buttonHasExactBlock(d) then
+						scoreCandidate(d, path)
+					end
+				end
+			end
+		end)
+	end
+
+	if best then
+		return best
+	end
+
+	for _, root in ipairs(coreGuiRoots()) do
+		pcall(function()
+			for _, label in ipairs(root:GetDescendants()) do
+				if label:IsA('TextLabel') or label:IsA('TextButton') then
+					if buttonPlainText(label) ~= 'block' then
+						continue
+					end
+					local path = string.lower(label:GetFullName())
+					if path:find('joinlogs', 1, true) or path:find('playertools', 1, true) then
+						continue
+					end
+					if path:find('report', 1, true) then
+						continue
+					end
+					if not (path:find('foundationoverlay', 1, true) or path:find('blockingmodal', 1, true)) then
+						continue
+					end
+					local pick = label
+					local p = label.Parent
+					for _ = 1, 6 do
+						if not p then
+							break
+						end
+						if p:IsA('GuiButton') then
+							pick = p
+							break
+						end
+						p = p.Parent
+					end
+					scoreCandidate(pick, path)
+				end
+			end
+		end)
+	end
+	return best
+end
+
+local function blockAimPoints(btn)
+	if not btn or not btn:IsA('GuiObject') then
+		return {}
+	end
+	local pos = btn.AbsolutePosition
+	local size = btn.AbsoluteSize
+	if size.X < 2 or size.Y < 2 then
+		return {}
+	end
+	local inset = Vector2.zero
+	pcall(function()
+		inset = GuiService:GetGuiInset()
+	end)
+	local cx = pos.X + size.X * 0.5
+	local cy = pos.Y + size.Y * 0.55
+	local points = {
+		{ x = cx + inset.X, y = cy + inset.Y, tag = 'abs+inset' },
+		{ x = cx + inset.X, y = pos.Y + size.Y * 0.72 + inset.Y, tag = 'low+inset' },
+		{ x = cx + inset.X, y = pos.Y + size.Y - 4 + inset.Y, tag = 'bot+inset' },
+	}
+	points[#points + 1] = { x = cx, y = cy, tag = 'abs' }
+	points[#points + 1] = { x = cx, y = cy + 53, tag = 'abs+53' }
+	return points
+end
+
+local function focusThisClient()
+	pcall(function()
+		local cam = workspace.CurrentCamera
+		local vs = cam and cam.ViewportSize
+		local fx = vs and (vs.X * 0.5) or 400
+		local fy = vs and math.min(40, vs.Y * 0.05) or 20
+		if type(mousemoveabs) == 'function' then
+			mousemoveabs(fx, fy)
+		else
+			VirtualInputManager:SendMouseMoveEvent(fx, fy, game)
+		end
+		if type(mouse1click) == 'function' then
+			mouse1click()
+		else
+			VirtualInputManager:SendMouseButtonEvent(fx, fy, 0, true, game, 1)
+			VirtualInputManager:SendMouseButtonEvent(fx, fy, 0, false, game, 1)
+		end
+	end)
+	task.wait(0.05)
+end
+
+local function blockClickCoords(btn)
+	local cam = workspace.CurrentCamera
+	local vs = cam and cam.ViewportSize or Vector2.new(1600, 877)
+	local points = blockAimPoints(btn)
+	if points[1] then
+		return points[1].x, points[1].y, points[1].tag
+	end
+	return vs.X * 0.5056, vs.Y * 0.5450, 'norm'
+end
+
+local function fireGuiClick(btn)
+	if not btn then
+		return
+	end
+	local target = btn
+	if not target:IsA('GuiButton') and target.Parent and target.Parent:IsA('GuiButton') then
+		target = target.Parent
+	end
+	pcall(function()
+		local p = target
+		for _ = 1, 6 do
+			if not p then
+				break
+			end
+			if p:IsA('ImageButton') or p:IsA('TextButton') then
+				target = p
+				break
+			end
+			p = p.Parent
+		end
+	end)
+	if not target:IsA('GuiButton') then
+		return
+	end
+	pcall(function()
+		if typeof(target.Activate) == 'function' then
+			target:Activate()
+		end
+	end)
+	pcall(function()
+		if type(firesignal) == 'function' then
+			pcall(firesignal, target.Activated)
+			pcall(firesignal, target.MouseButton1Click)
+			pcall(firesignal, target.MouseButton1Down)
+			pcall(firesignal, target.MouseButton1Up)
+		end
+	end)
+	pcall(function()
+		if type(getconnections) ~= 'function' then
+			return
+		end
+		for _, sig in ipairs({ 'Activated', 'MouseButton1Click', 'MouseButton1Down', 'MouseButton1Up' }) do
+			local ok, cons = pcall(getconnections, target[sig])
+			if ok and type(cons) == 'table' then
+				for _, c in ipairs(cons) do
+					pcall(function()
+						if c.Fire then
+							c:Fire()
+						elseif c.fire then
+							c:fire()
+						end
+					end)
+				end
+			end
+		end
+	end)
+end
+
+local function moveAndClickAt(gx, gy)
+	pcall(function()
+		if type(mousemoveabs) == 'function' then
+			mousemoveabs(gx, gy)
+		end
+	end)
+	pcall(function()
+		VirtualInputManager:SendMouseMoveEvent(gx, gy, game)
+	end)
+	task.wait(0.12)
+	pcall(function()
+		if type(mouse1press) == 'function' and type(mouse1release) == 'function' then
+			mouse1press()
+			task.wait(0.07)
+			mouse1release()
+		elseif type(mouse1click) == 'function' then
+			mouse1click()
+		end
+	end)
+	pcall(function()
+		VirtualInputManager:SendMouseMoveEvent(gx, gy, game)
+		VirtualInputManager:SendMouseButtonEvent(gx, gy, 0, true, game, 1)
+		task.wait(0.07)
+		VirtualInputManager:SendMouseButtonEvent(gx, gy, 0, false, game, 1)
+	end)
+end
+
+local function modalStillUp()
+	return findBlockingModal() ~= nil
+end
+
+local function alreadyBlockedUi()
+	for _, root in ipairs(coreGuiRoots()) do
+		local ok, hit = pcall(function()
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA('TextLabel') or d:IsA('TextButton') or d:IsA('TextBox') then
+					local t = buttonPlainText(d)
+					if t == 'unblock' then
+						local path = string.lower(d:GetFullName())
+						if path:find('joinlogs', 1, true)
+							or path:find('playertools', 1, true)
+							or path:find('modules.settings', 1, true)
+						then
+							continue
+						end
+						return true
+					end
+				end
+			end
+			return false
+		end)
+		if ok and hit then
+			return true
+		end
+	end
+	return false
+end
+
+local function waitForBlockModal(timeoutSec)
+	local untilT = os.clock() + (tonumber(timeoutSec) or 2.5)
+	while os.clock() < untilT do
+		if findBlockingModal() or findModalBlockButton() then
+			return true
+		end
+		task.wait(0.2)
+	end
+	return modalStillUp()
+end
+
+local function waitForBlockedUi(timeoutSec)
+	local untilT = os.clock() + (tonumber(timeoutSec) or 2.5)
+	while os.clock() < untilT do
+		if alreadyBlockedUi() then
+			return true
+		end
+		task.wait(0.15)
+	end
+	return alreadyBlockedUi()
+end
+
+local function sendNavKey(keyCode)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+		task.wait(0.04)
+		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+	end)
+end
+
+local function gentleBlockClick(btn)
+	btn = findModalBlockButton() or btn
+	if not btn then
+		return false
+	end
+	local target = btn
+	if not target:IsA('GuiButton') and target.Parent and target.Parent:IsA('GuiButton') then
+		target = target.Parent
+	end
+
+	-- Navigation UI: move selection to Block, then Enter (Cancel is default focus).
+	pcall(function()
+		GuiService.SelectedObject = target
+	end)
+	task.wait(0.08)
+	local selText = ''
+	pcall(function()
+		local sel = GuiService.SelectedObject
+		if sel then
+			selText = buttonPlainText(sel)
+		end
+	end)
+	if selText:find('cancel', 1, true) or selText:find('report', 1, true) or selText == '' then
+		sendNavKey(Enum.KeyCode.Up)
+		task.wait(0.06)
+		sendNavKey(Enum.KeyCode.Up)
+		task.wait(0.06)
+		pcall(function()
+			GuiService.SelectedObject = target
+		end)
+		task.wait(0.08)
+	end
+	sendNavKey(Enum.KeyCode.Return)
+	task.wait(0.35)
+	if not modalStillUp() then
+		return true
+	end
+
+	-- Fallback: single Activate (avoid multi-fire "Something went wrong").
+	pcall(function()
+		if typeof(target.Activate) == 'function' then
+			target:Activate()
+		end
+	end)
+	task.wait(0.55)
+	return not modalStillUp()
+end
+
+local function clickBlockWithMouse(btn, useOsMouse)
+	btn = findModalBlockButton() or btn
+	if gentleBlockClick(btn) then
+		return true
+	end
+	btn = findModalBlockButton() or btn
+	if not btn then
+		return not modalStillUp()
+	end
+	if useOsMouse == false then
+		return not modalStillUp()
+	end
+	focusThisClient()
+	local points = blockAimPoints(btn)
+	if #points == 0 then
+		local x, y = blockClickCoords(btn)
+		points = { { x = x, y = y, tag = 'norm' } }
+	end
+	if points[1] then
+		moveAndClickAt(points[1].x, points[1].y)
+		task.wait(0.45)
+	end
+	local closed = not modalStillUp()
+	return closed
+end
+
+-- ---- Watch / timers ----
+local enabled = false
+local autoTimers = {}
+local autoBusy = false
+local autoEpoch = 0
+local justLandedUntil = 0
+local statusText = 'off'
+local conns = {}
+
+local function setStatus(text)
+	statusText = tostring(text or 'off')
+	getgenv().SB2AutoBlockStatus = statusText
+	if type(getgenv().SB2AutoBlockPaint) == 'function' then
+		pcall(getgenv().SB2AutoBlockPaint)
+	end
+end
+
+local function cancelAutoTimer(userId)
+	userId = tonumber(userId)
+	if not userId then
+		return
+	end
+	local rec = autoTimers[userId]
+	if rec then
+		rec.cancelled = true
+		autoTimers[userId] = nil
+	end
+end
+
+local function cancelAllAutoTimers()
+	for userId, rec in pairs(autoTimers) do
+		if rec then
+			rec.cancelled = true
+		end
+		autoTimers[userId] = nil
+	end
+end
+
+local function finishHop(plr, reason, opts)
+	opts = type(opts) == 'table' and opts or {}
+	local freshNow = freshFinderActive()
+	if opts.fromFreshFinder == true and not freshNow then
+		return false
+	end
+	if plr and plr.UserId and opts.allowFreshHop == true then
+		markSkipBlocked(plr, 300)
+		getgenv().SB2FreshBlockRetries = getgenv().SB2FreshBlockRetries or {}
+		getgenv().SB2FreshBlockRetries[plr.UserId] = nil
+	end
+	if freshFinderActive() and opts.allowFreshHop ~= true then
+		local retries = getgenv().SB2FreshBlockRetries or {}
+		local n = (tonumber(retries[plr and plr.UserId]) or 0) + 1
+		retries[plr and plr.UserId] = n
+		getgenv().SB2FreshBlockRetries = retries
+		if n >= 2 then
+			say(('fresh finder — hop anyway after %d tries (%s)'):format(
+				n,
+				tostring(plr and (plr.DisplayName or plr.Name) or '?')
+			))
+			opts.allowFreshHop = true
+		else
+			local myToken = blockRetryToken
+			say(reason or 'fresh finder — retry block…')
+			task.delay(1.5, function()
+				if blockRetryToken ~= myToken or freshFinderCancelled(getgenv().SB2FreshFinderCancelGen or 0) then
+					return
+				end
+				if not enabled and not freshFinderActive() then
+					return
+				end
+				if plr and Players:GetPlayerByUserId(plr.UserId) then
+					runAutoBlockSequence(plr)
+				else
+					armPresent(0)
+				end
+			end)
+			return false
+		end
+	end
+	cancelAllAutoTimers()
+	local wantFreshHop = freshNow
+		or opts.fromFreshFinder == true
+		or (opts.allowFreshHop == true and freshFinderActive())
+	if wantFreshHop then
+		local ok = startFreshServerHop(reason)
+		if not ok and wantFreshHop and opts.allowFreshHop == true then
+			-- Prefer PlayerTools fallback, then same-floor hop.
+			task.delay(0.5, function()
+				if type(getgenv().SB2HopCurrentFloorNow) == 'function' then
+					pcall(getgenv().SB2HopCurrentFloorNow, reason .. ' (pt fallback)')
+					return
+				end
+				if not freshFinderActive() then
+					return
+				end
+				if freshHopBusy or hopInProgress() then
+					return
+				end
+				startFreshServerHop(reason .. ' (retry)')
+			end)
+			-- Last resort: hop this PlaceId even if fresh-finder state raced off.
+			return startSameFloorHop(reason)
+		end
+		return ok
+	end
+	return startSameFloorHop(reason)
+end
+
+runAutoBlockSequence = function(plr)
+	if autoBusy or not plr or plr == LocalPlayer or isOwnAlt(plr) then
+		return
+	end
+	if not Players:GetPlayerByUserId(plr.UserId) then
+		return
+	end
+	local forFreshFinder = freshFinderActive()
+	if not forFreshFinder and not enabled then
+		return
+	end
+	local cancelGen = getgenv().SB2FreshFinderCancelGen or 0
+	local function cancelled()
+		return freshFinderCancelled(cancelGen)
+	end
+	if isKnownBlocked(plr) then
+		if forFreshFinder then
+			if hopFreshIfNoUnblocked(('already blocked %s — hopping…'):format(tostring(plr.DisplayName or plr.Name))) then
+				return
+			end
+			finishHop(plr, ('already blocked %s — hopping…'):format(tostring(plr.DisplayName or plr.Name)), {
+				allowFreshHop = true,
+				fromFreshFinder = forFreshFinder,
+			})
+		end
+		return
+	end
+	autoBusy = true
+	getgenv().SB2AutoBlockBusy = true
+	setStatus('blocking ' .. tostring(plr.DisplayName or plr.Name))
+	say(('blocking %s'):format(tostring(plr.DisplayName or plr.Name)))
+	task.spawn(function()
+		local okRun, errRun = xpcall(function()
+			if cancelled() then
+				return
+			end
+			task.wait(ACTION_DELAY)
+			if cancelled() or not Players:GetPlayerByUserId(plr.UserId) then
+				return
+			end
+			if alreadyBlockedUi() then
+				markConfirmedBlocked(plr, 300)
+				finishHop(plr, ('%s already blocked — hopping…'):format(tostring(plr.DisplayName or plr.Name)), {
+					allowFreshHop = true,
+					fromFreshFinder = forFreshFinder,
+				})
+				return
+			end
+			if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+				pcall(getgenv().SB2CloseAllPillPanels)
+			end
+			task.wait(0.15)
+			local promptOk = pcall(function()
+				StarterGui:SetCore('PromptBlockPlayer', plr)
+			end)
+			if not promptOk then
+				task.wait(0.5)
+				promptOk = pcall(function()
+					StarterGui:SetCore('PromptBlockPlayer', plr)
+				end)
+			end
+			if not promptOk then
+				markSkipBlocked(plr, 45)
+				finishHop(
+					plr,
+					('block prompt failed for %s'):format(tostring(plr.DisplayName or plr.Name)),
+					{ allowFreshHop = true, fromFreshFinder = forFreshFinder }
+				)
+				return
+			end
+			say('waiting for Block menu…')
+			local sawModal = waitForBlockModal(2.5)
+			if waitForBlockedUi(1.5) then
+				markConfirmedBlocked(plr, 86400)
+				finishHop(plr, ('%s already blocked — hopping…'):format(tostring(plr.DisplayName or plr.Name)), {
+					allowFreshHop = true,
+					fromFreshFinder = forFreshFinder,
+				})
+				return
+			end
+			if cancelled() then
+				return
+			end
+			if alreadyBlockedUi() then
+				markConfirmedBlocked(plr, 300)
+				finishHop(plr, ('%s already blocked — hopping…'):format(tostring(plr.DisplayName or plr.Name)), {
+					allowFreshHop = true,
+					fromFreshFinder = forFreshFinder,
+				})
+				return
+			end
+			local btn = findModalBlockButton()
+			if btn then
+				gentleBlockClick(btn)
+				task.wait(0.45)
+				if modalStillUp() then
+					clickBlockWithMouse(btn, true)
+					task.wait(0.45)
+				end
+			elseif sawModal then
+				task.wait(0.65)
+			end
+			local blocked = alreadyBlockedUi() or (sawModal and not modalStillUp())
+			if cancelled() then
+				return
+			end
+			if not enabled and not freshFinderActive() then
+				return
+			end
+			if blocked then
+				task.wait(BLOCK_SETTLE_SEC)
+				markConfirmedBlocked(plr, 300)
+				finishHop(plr, ('blocked %s — hopping same floor…'):format(tostring(plr.DisplayName or plr.Name)), {
+					allowFreshHop = true,
+					fromFreshFinder = forFreshFinder,
+				})
+				return
+			end
+			-- Fresh finder: confirm failed — short temp skip only (never persist).
+			if forFreshFinder then
+				markSkipBlocked(plr, 20)
+				finishHop(
+					plr,
+					('no unblocked action for %s — hopping…'):format(tostring(plr.DisplayName or plr.Name)),
+					{ allowFreshHop = true, fromFreshFinder = true }
+				)
+				return
+			end
+			finishHop(
+				plr,
+				('Block menu missing for %s'):format(tostring(plr.DisplayName or plr.Name)),
+				{ allowFreshHop = false, fromFreshFinder = forFreshFinder }
+			)
+		end, debug.traceback)
+		autoBusy = false
+		getgenv().SB2AutoBlockBusy = false
+		if not okRun then
+			setStatus('error')
+			say('error: ' .. tostring(errRun))
+			if not cancelled() then
+				finishHop(plr, ('error on %s — hopping anyway'):format(tostring(plr.DisplayName or plr.Name)), {
+					allowFreshHop = true,
+					fromFreshFinder = forFreshFinder,
+				})
+			end
+		elseif enabled and not hopInProgress() then
+			setStatus('watching')
+		end
+	end)
+end
+
+local function startAutoTimer(plr, waitSec, opts)
+	opts = type(opts) == 'table' and opts or {}
+	if not autoblockShouldRun() or not plr or plr == LocalPlayer or isOwnAlt(plr) then
+		return
+	end
+	if isKnownBlocked(plr) then
+		if freshFinderActive() then
+			hopFreshIfNoUnblocked(('already blocked %s — hopping…'):format(tostring(plr.DisplayName or plr.Name)))
+		end
+		return
+	end
+	if hopInProgress() and game.PlaceId == F1_PLACE then
+		return
+	end
+	local userId = plr.UserId
+	waitSec = tonumber(waitSec)
+	if waitSec == nil then
+		waitSec = AUTO_BLOCK_WAIT
+	end
+	local immediate = waitSec <= 0.05
+	if autoTimers[userId] then
+		if not immediate then
+			return
+		end
+		cancelAutoTimer(userId)
+	end
+	local epoch = autoEpoch
+	local rec = {
+		userId = userId,
+		name = tostring(plr.DisplayName or plr.Name),
+		deadline = os.clock() + math.max(0, waitSec),
+		cancelled = false,
+	}
+	autoTimers[userId] = rec
+	local function finishTimer()
+		if rec.cancelled or autoTimers[userId] ~= rec or epoch ~= autoEpoch then
+			return
+		end
+		autoTimers[userId] = nil
+		local still = Players:GetPlayerByUserId(userId)
+		if not still then
+			setStatus(enabled and 'watching' or 'off')
+			return
+		end
+		runAutoBlockSequence(still)
+	end
+	if immediate then
+		if not opts.silent then
+			say(('block now — %s (already here)'):format(rec.name))
+		end
+		setStatus('blocking now · ' .. rec.name)
+		task.spawn(function()
+			local spin = os.clock() + 20
+			while autoBusy and os.clock() < spin do
+				if rec.cancelled or autoTimers[userId] ~= rec then
+					return
+				end
+				task.wait(0.15)
+			end
+			finishTimer()
+		end)
+		return
+	end
+	if not opts.silent then
+		-- #region agent log
+		agentLog('C', 'startAutoTimer', 'arming block timer', {
+			waitSec = waitSec,
+			enabled = enabled,
+			freshActive = freshFinderActive(),
+			name = rec.name,
+		})
+		-- #endregion
+		say(('auto block in %ds — %s'):format(math.floor(waitSec + 0.5), rec.name))
+	end
+	setStatus(('%ds · %s'):format(math.ceil(waitSec), rec.name))
+	task.spawn(function()
+		while autoTimers[userId] == rec and not rec.cancelled and epoch == autoEpoch do
+			local left = rec.deadline - os.clock()
+			if left <= 0 then
+				break
+			end
+			setStatus(('%ds · %s'):format(math.ceil(left), rec.name))
+			task.wait(0.5)
+		end
+		finishTimer()
+	end)
+end
+
+local function ensureFreshFinderWatchdog()
+	if freshFinderWatchdogOn then
+		return
+	end
+	freshFinderWatchdogOn = true
+	task.spawn(function()
+		while freshFinderActive() do
+			task.wait(2.5)
+			if not freshFinderActive() then
+				break
+			end
+			local strangers = countStrangerPlayers()
+			local actionable = countActionableStrangers()
+			if strangers > 0 and actionable <= 0 and not autoBusy and getgenv().SB2AutoBlockBusy ~= true then
+				-- #region agent log
+				agentLog('D', 'watchdog', 'hop trigger', {
+					strangers = strangers,
+					actionable = actionable,
+					autoBusy = autoBusy,
+					sb2Busy = getgenv().SB2AutoBlockBusy,
+				})
+				-- #endregion
+				hopFreshIfNoUnblocked('watchdog — all known blocked, hopping…')
+			end
+		end
+		freshFinderWatchdogOn = false
+	end)
+end
+
+-- Forward-declare: resumeFreshServerFinder runs at boot and must see the local,
+-- not a nil global (Lua scope begins at the declaration line).
+local setAutoBlockEnabled
+
+local function resumeFreshServerFinder()
+	if not freshFinderActive() then
+		return
+	end
+	-- #region agent log
+	agentLog('B', 'resumeFreshServerFinder', 'resume without toggling user autoblock', {
+		enabled = enabled,
+		userWanted = getgenv().SB2AutoBlockUserWanted,
+		fileOn = fileOn(),
+	})
+	-- #endregion
+	markJustLanded(14)
+	ensureFreshFinderWatchdog()
+	getgenv().SB2AutoBlockHopping = nil
+	writeHop({ active = false, phase = 'off' })
+	wireWatchers()
+	ensurePresenceWatchdog()
+	armPresent(0)
+	say('fresh finder — re-armed after hop')
+	task.spawn(function()
+		-- Wait briefly for character / players, but keep arming the whole time.
+		for i = 1, 40 do
+			if not freshFinderActive() then
+				return
+			end
+			local char = LocalPlayer.Character
+			local hrp = char and (char:FindFirstChild('HumanoidRootPart') or char:FindFirstChild('Humanoid'))
+			local strangers = countStrangerPlayers()
+			if strangers > 0 then
+				getgenv().SB2FreshEmptySince = nil
+			end
+			if i == 1 or i % 4 == 0 then
+				pcall(armPresent, 0)
+			end
+			if type(getgenv().SB2FreshServerFinderTick) == 'function' then
+				pcall(getgenv().SB2FreshServerFinderTick)
+			end
+			-- Only declare empty after landing grace + stable empty.
+			if hrp and not stillLanding() then
+				if stopFreshFinderIfEmpty('Empty server found on this floor') then
+					return
+				end
+			end
+			if strangers > 0 and hrp then
+				-- Engaged — keep watchdog going; no need to spin forever here.
+				if i >= 6 then
+					return
+				end
+			end
+			task.wait(0.35)
+		end
+		if freshFinderActive() then
+			pcall(armPresent, 0)
+		end
+	end)
+end
+
+local function armPresent(waitSec)
+	if not autoblockShouldRun() then
+		return
+	end
+	if hopInProgress() and game.PlaceId == F1_PLACE then
+		return
+	end
+	waitSec = tonumber(waitSec)
+	if waitSec == nil then
+		waitSec = (os.clock() < justLandedUntil) and 0 or AUTO_BLOCK_WAIT
+	end
+	if freshFinderActive() then
+		waitSec = 0
+	end
+	local armed = 0
+	local skipped = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and not isOwnAlt(plr) then
+			if isKnownBlocked(plr) then
+				skipped += 1
+			else
+				startAutoTimer(plr, waitSec, { silent = waitSec <= 0.05 })
+				armed += 1
+			end
+		end
+	end
+	-- Fresh finder: everyone here is already blocked → hop same floor (not when empty).
+	if armed == 0 and freshFinderActive() then
+		if countStrangerPlayers() == 0 then
+			stopFreshFinderIfEmpty('Empty server found on this floor')
+		else
+			hopFreshIfNoUnblocked('no unblocked players here — hopping…')
+		end
+	end
+end
+
+getgenv().SB2RunAutoBlockForPlayer = runAutoBlockSequence
+
+local function disconnectAll()
+	for _, c in ipairs(conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	conns = {}
+end
+
+local function wireWatchers()
+	disconnectAll()
+	conns[#conns + 1] = Players.PlayerAdded:Connect(function(plr)
+		if plr == LocalPlayer or isOwnAlt(plr) then
+			return
+		end
+		task.defer(function()
+			local waitSec = AUTO_BLOCK_WAIT
+			if os.clock() < justLandedUntil then
+				waitSec = 0
+			end
+			startAutoTimer(plr, waitSec, { silent = waitSec <= 0.05 })
+		end)
+	end)
+	conns[#conns + 1] = Players.PlayerRemoving:Connect(function(plr)
+		if not plr or plr == LocalPlayer then
+			return
+		end
+		cancelAutoTimer(plr.UserId)
+		if enabled and not autoBusy then
+			setStatus('watching')
+		end
+	end)
+	getgenv().SB2AutoBlockJoinConn = conns[1]
+	getgenv().SB2AutoBlockLeaveConn = conns[2]
+	getgenv().SB2AutoBlockIyReady = true
+end
+
+local function ensurePresenceWatchdog()
+	if getgenv().SB2AutoBlockPresenceWatch == true then
+		return
+	end
+	getgenv().SB2AutoBlockPresenceWatch = true
+	task.spawn(function()
+		while getgenv().SB2AutoBlockPresenceWatch == true do
+			task.wait(PRESENCE_WATCH_SEC)
+			if getgenv().SB2AutoBlockIyOwner ~= true then
+				break
+			end
+			if not autoblockShouldRun() then
+				continue
+			end
+			-- Recover if IY watchers were disconnected mid-session.
+			if not getgenv().SB2AutoBlockJoinConn then
+				pcall(wireWatchers)
+			end
+			if autoBusy or hopInProgress() then
+				continue
+			end
+			local armed = 0
+			local missing = 0
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr ~= LocalPlayer and not isOwnAlt(plr) and not isKnownBlocked(plr) then
+					if not autoTimers[plr.UserId] then
+						missing += 1
+						-- Strict: anyone already here with no timer gets blocked now.
+						startAutoTimer(plr, 0, { silent = true })
+						armed += 1
+					end
+				end
+			end
+		end
+		getgenv().SB2AutoBlockPresenceWatch = false
+	end)
+end
+
+setAutoBlockEnabled = function(on, silent, opts)
+	opts = type(opts) == 'table' and opts or {}
+	on = on == true
+	autoEpoch += 1
+	enabled = on
+	getgenv().SB2AutoBlockWanted = on or freshFinderActive()
+	if opts.userChoice == true then
+		getgenv().SB2AutoBlockUserWanted = on
+	end
+	if opts.persist ~= false then
+		writeFile(on)
+	end
+	if on then
+		justLandedUntil = os.clock() + 8
+		setStatus('watching')
+		wireWatchers()
+		ensurePresenceWatchdog()
+		if opts.armPresent ~= false then
+			armPresent(0)
+			if not silent then
+				say('armed (IY) — instant if someone is already here')
+			end
+		elseif not silent then
+			say('armed (IY) — watching new joins only')
+		end
+	else
+		cancelAllAutoTimers()
+		getgenv().SB2AutoBlockHopping = nil
+		writeHop({ active = false, phase = 'off' })
+		setStatus('off')
+		if not silent then
+			say('off')
+		end
+	end
+	-- Sync PlayerTools toggle if it exists (do not recurse into ourselves).
+	pcall(function()
+		local t = Toggles and Toggles.AutoBlockJoin
+		if type(t) == 'table' and type(t.SetValue) == 'function' and t.Value ~= on then
+			getgenv().SB2ConfigLoading = true
+			t:SetValue(on)
+			getgenv().SB2ConfigLoading = false
+		end
+	end)
+	return on
+end
+
+getgenv().SB2SetAutoBlock = setAutoBlockEnabled
+getgenv().SB2GetAutoBlock = function()
+	return enabled == true
+end
+getgenv().SB2ArmAutoBlockTimers = armPresent
+getgenv().SB2AutoBlockStatusFn = function()
+	return statusText
+end
+getgenv().SB2ListFreshFinderFloors = function()
+	return buildFreshFinderFloorList()
+end
+getgenv().SB2RefreshFreshFinderFloors = function()
+	if type(getgenv().SB2EnsureServerHopCatalog) == 'function' then
+		pcall(getgenv().SB2EnsureServerHopCatalog)
+	end
+	return buildFreshFinderFloorList()
+end
+getgenv().SB2SetFreshFinderFloor = function(raw)
+	local ok, label = setFreshFinderFloor(raw)
+	return ok, label
+end
+getgenv().SB2GetFreshFinderFloor = function()
+	local placeId, placeName = readFreshFinderFloorPref()
+	return placeId, placeName
+end
+
+getgenv().SB2StopFreshServerFinder = function(msg)
+	local prev = readFreshFinder()
+	local wasActive = type(prev) == 'table' and prev.active == true
+	bumpFreshFinderCancel()
+	writeFreshFinder({ active = false, placeId = game.PlaceId, tried = {}, hops = 0 })
+	writeHop({ active = false, phase = 'off' })
+	getgenv().SB2AutoBlockHopping = nil
+	getgenv().SB2FreshBlockRetries = {}
+	autoBusy = false
+	getgenv().SB2AutoBlockBusy = false
+	autoEpoch += 1
+	cancelAllAutoTimers()
+	-- Fresh finder wrote autoblock=true — do not leave block armed when finder stops.
+	if getgenv().SB2AutoBlockUserWanted ~= true then
+		enabled = false
+		getgenv().SB2AutoBlockWanted = false
+		writeFile(false)
+		setStatus('off')
+	else
+		setStatus('watching')
+	end
+	-- Only announce when the finder was actually running (PT reloads used to spam this).
+	if wasActive then
+		say(msg or 'fresh server finder stopped')
+	end
+end
+
+local function stopPlugin()
+	disconnectAll()
+	cancelAllAutoTimers()
+	enabled = false
+	getgenv().SB2AutoBlockPresenceWatch = false
+	getgenv().SB2AutoBlockIyOwner = nil
+	getgenv().SB2AutoBlockIyReady = false
+	getgenv().SB2AutoBlockJoinConn = nil
+	getgenv().SB2AutoBlockLeaveConn = nil
+	getgenv().SB2AutoBlockBusy = false
+	if getgenv().SB2SetAutoBlock == setAutoBlockEnabled then
+		getgenv().SB2SetAutoBlock = nil
+	end
+	if getgenv().SB2ArmAutoBlockTimers == armPresent then
+		getgenv().SB2ArmAutoBlockTimers = nil
+	end
+	getgenv()[GENV_STOP] = nil
+	say('stopped')
+end
+getgenv()[GENV_STOP] = stopPlugin
+
+-- Boot ASAP — do not wait for PlayerTools.
+loadBlockedUserIds()
+wireWatchers()
+local freshFinderHopResume = false
+do
+	local hop = readHop()
+	local pid = game.PlaceId
+	if type(hop) == 'table' and hop.active == true then
+		if hop.phase == 'fresh' then
+			freshFinderHopResume = true
+			justLandedUntil = markJustLanded(14)
+			writeHop({ active = false, phase = 'off' })
+			getgenv().SB2AutoBlockHopping = nil
+			task.defer(resumeFreshServerFinder)
+		elseif pid ~= F1_PLACE and pid ~= F11_PLACE then
+			writeHop({ active = false, phase = 'off' })
+			getgenv().SB2AutoBlockHopping = nil
+		elseif pid == F1_PLACE or (pid == F11_PLACE and hop.phase == 'f11') then
+			-- Finish / continue hop before anything else.
+			justLandedUntil = os.clock() + 8
+			getgenv().SB2AutoBlockHopping = true
+			if pid == F1_PLACE then
+				writeHop({ active = true, phase = 'f11', auto = true })
+				armTeleport()
+				say('IY hop — scripts ready, joining F11…')
+				pcall(function()
+					TeleportService:Teleport(F11_PLACE, LocalPlayer)
+				end)
+				-- Still arm watchers; teleport is in flight.
+			elseif pid == F11_PLACE then
+				writeHop({ active = false, phase = 'off' })
+				getgenv().SB2AutoBlockHopping = nil
+				justLandedUntil = os.clock() + 8
+			end
+		end
+	end
+end
+
+if fileOn() then
+	-- #region agent log
+	agentLog('C', 'boot', 'autoblock file is true — arming from sidecar', {
+		freshActive = freshFinderActive(),
+		hopResume = freshFinderHopResume,
+	})
+	-- #endregion
+	getgenv().SB2AutoBlockUserWanted = true
+	setAutoBlockEnabled(true, true, { armPresent = true, userChoice = true })
+	say('IY AutoBlock armed — blocking anyone already here')
+else
+	setStatus('off')
+	say('IY AutoBlock loaded — abon or enable in PlayerTools')
+end
+
+if freshFinderActive() then
+	if freshFinderHopResume then
+		-- #region agent log
+		agentLog('A', 'boot', 'fresh finder resuming after hop landing', {})
+		-- #endregion
+	else
+		-- #region agent log
+		agentLog('A', 'boot', 'stale fresh finder cleared on load', {
+			enabled = enabled,
+			fileOn = fileOn(),
+		})
+		-- #endregion
+		if type(getgenv().SB2StopFreshServerFinder) == 'function' then
+			pcall(getgenv().SB2StopFreshServerFinder, 'cleared stale fresh finder — start again from PlayerTools')
+		else
+			writeFreshFinder({ active = false, placeId = game.PlaceId, tried = {}, hops = 0 })
+			say('cleared stale fresh server finder')
+		end
+	end
+end
+ensurePresenceWatchdog()
+
+local Plugin = {
+	['PluginName'] = 'AutoBlock',
+	['PluginDescription'] = 'Early auto-block + F11 hop (loads with Infinite Yield, before PlayerTools)',
+	['Commands'] = {
+		['abon'] = {
+			['ListName'] = 'abon / autoblockon',
+			['Description'] = 'Enable auto-block (writes PlayerTools/autoblock)',
+			['Aliases'] = { 'autoblockon', 'abenable' },
+			['Function'] = function()
+				setAutoBlockEnabled(true, false, { userChoice = true, persist = true })
+			end,
+		},
+		['aboff'] = {
+			['ListName'] = 'aboff / autoblockoff',
+			['Description'] = 'Disable auto-block',
+			['Aliases'] = { 'autoblockoff', 'abdisable' },
+			['Function'] = function()
+				setAutoBlockEnabled(false, false, { userChoice = true, persist = true })
+			end,
+		},
+		['abstatus'] = {
+			['ListName'] = 'abstatus',
+			['Description'] = 'Show AutoBlock status',
+			['Aliases'] = { 'abstat' },
+			['Function'] = function()
+				say(('enabled=%s status=%s place=%s'):format(tostring(enabled), statusText, tostring(game.PlaceId)))
+			end,
+		},
+		['abarm'] = {
+			['ListName'] = 'abarm',
+			['Description'] = 'Arm timers for everyone already here (instant)',
+			['Aliases'] = { 'abnow' },
+			['Function'] = function()
+				setAutoBlockEnabled(true, true)
+				armPresent(0)
+				say('armed present players')
+			end,
+		},
+		['freshserver'] = {
+			['ListName'] = 'freshserver / fsf',
+			['Description'] = 'Fresh server finder — block & hop until empty',
+			['Aliases'] = { 'fsf', 'freshfinder' },
+			['Function'] = function(args)
+				if args and args[1] then
+					local ok, label = setFreshFinderFloor(table.concat(args, ' '))
+					if ok then
+						say('fresh finder floor → ' .. tostring(label))
+					else
+						say('unknown floor — try fsffloor F11')
+					end
+				end
+				local targetPlace, targetName = readFreshFinderFloorPref()
+				writeFreshFinder({
+					active = true,
+					placeId = targetPlace or game.PlaceId,
+					placeName = targetName,
+					tried = { [tostring(game.JobId or '')] = true },
+					hops = 0,
+					started = os.time(),
+				})
+				local floorLabel = targetName or tostring(targetPlace or game.PlaceId)
+				say('fresh server finder started — ' .. tostring(floorLabel))
+				ensureFreshFinderWatchdog()
+				resumeFreshServerFinder()
+			end,
+		},
+		['fsffloor'] = {
+			['ListName'] = 'fsffloor [F11|name]',
+			['Description'] = 'Set which floor fresh server finder hops on',
+			['Aliases'] = { 'freshfloor', 'abfloor' },
+			['Function'] = function(args)
+				local raw = args and table.concat(args, ' ') or ''
+				if raw == '' then
+					local placeId, placeName = readFreshFinderFloorPref()
+					say(('fresh finder floor: %s (%s)'):format(tostring(placeName or '?'), tostring(placeId)))
+					return
+				end
+				local ok, label = setFreshFinderFloor(raw)
+				if ok then
+					say('fresh finder floor → ' .. tostring(label))
+				else
+					say('unknown floor — try F1, F11, Hypersiddia, etc.')
+				end
+			end,
+		},
+		['fsffloors'] = {
+			['ListName'] = 'fsffloors',
+			['Description'] = 'List all locations for fresh server finder',
+			['Aliases'] = { 'fsflist', 'abfloors' },
+			['Function'] = function()
+				for _, rec in ipairs(buildFreshFinderFloorList()) do
+					say(('%s (%s)'):format(tostring(rec.label or rec.name), tostring(rec.placeId)))
+				end
+			end,
+		},
+		['fsfstop'] = {
+			['ListName'] = 'fsfstop',
+			['Description'] = 'Stop fresh server finder',
+			['Aliases'] = { 'freshstop' },
+			['Function'] = function()
+				getgenv().SB2StopFreshServerFinder('fresh server finder stopped')
+			end,
+		},
+	},
+}
+
+return Plugin

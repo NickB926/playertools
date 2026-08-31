@@ -1,0 +1,2030 @@
+--[[
+    JoinLogs.iy — Infinite Yield plugin
+    Better player join/leave logger than stock IY jlogs.
+
+    - Joins AND leaves (stock IY only logs joins)
+    - DisplayName + @Username + UserId + account age
+    - Friend / new-account highlighting
+    - Floating JL chip + scrollable panel (drag either)
+    - Click a row to copy Username / UserId
+    - Optional toast notifications
+    - Appends to PlayerTools/joinlogs.txt
+    - Optional Discord webhook
+    - 1m auto-block: timer on join, cancel on leave, focus client + instant mouse click Block, hop F1→F11
+
+    Install: workspace/JoinLogs.iy → IY Plugins → Add → JoinLogs
+    Commands: jlgui | jlon | jloff | jlclear | jlsave | jlnotify | jlauto | jlwebhook [url]
+]]
+
+local Players = game:GetService('Players')
+local HttpService = game:GetService('HttpService')
+local UserInputService = game:GetService('UserInputService')
+local TeleportService = game:GetService('TeleportService')
+local GuiService = game:GetService('GuiService')
+local StarterGui = game:GetService('StarterGui')
+local VirtualInputManager = game:GetService('VirtualInputManager')
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
+	or Players.LocalPlayer
+
+local GENV = 'SB2JoinLogs'
+local GENV_GUI = 'SB2JoinLogsGui'
+local GENV_CONNS = 'SB2JoinLogsConns'
+local GENV_STOP = 'SB2JoinLogsStop'
+
+local SAVE_PATH = 'PlayerTools/joinlogs.txt'
+local HOP_PATH = 'PlayerTools/autoblock_hop.json'
+local MAX_ENTRIES = 300
+local NEW_ACCOUNT_DAYS = 14
+local AUTO_BLOCK_WAIT = 60
+local ACTION_DELAY = 0.5
+local F1_PLACE = 542351431
+local F11_PLACE = 5287433115
+local OWN_ALT_NAMES = {
+	nickb928 = true,
+	nickb925 = true,
+	nickb926 = true,
+	nickb910 = true,
+	nickb929 = true,
+	dyildolover = true,
+	['62qx'] = true,
+}
+local function isOwnAlt(plr)
+	if type(getgenv().SB2IsOwnAlt) == 'function' and plr then
+		local ok, result = pcall(getgenv().SB2IsOwnAlt, plr)
+		if ok then
+			return result == true
+		end
+	end
+	if not plr then
+		return false
+	end
+	local name = string.lower(tostring(plr.Name or ''))
+	local display = string.lower(tostring(plr.DisplayName or ''))
+	return OWN_ALT_NAMES[name] == true or OWN_ALT_NAMES[display] == true
+end
+
+-- Stop previous instance cleanly.
+if getgenv()[GENV_STOP] then
+	pcall(getgenv()[GENV_STOP])
+end
+
+local state = getgenv()[GENV]
+if type(state) ~= 'table' then
+	state = {}
+	getgenv()[GENV] = state
+end
+state.enabled = state.enabled ~= false
+state.notify = state.notify ~= false
+state.webhook = type(state.webhook) == 'string' and state.webhook or ''
+state.filter = state.filter or 'all' -- all | join | leave
+state.entries = type(state.entries) == 'table' and state.entries or {}
+state.widgetPos = state.widgetPos
+state.guiPos = state.guiPos
+state.guiSize = state.guiSize
+state.panelOpen = true
+-- autoBlock must not sticky-persist across reloads when PlayerTools/IY say off.
+-- Cleared here; boot syncs from AutoBlock.iy / PlayerTools/autoblock / toggle.
+state.autoBlock = false
+state.autoEpoch = (tonumber(state.autoEpoch) or 0) + 1
+local AUTO_EPOCH = state.autoEpoch
+
+-- #region agent log
+pcall(function()
+	local payload = game:GetService('HttpService'):JSONEncode({
+		sessionId = '7e9135',
+		hypothesisId = 'JL1',
+		location = 'JoinLogs.iy:state-init',
+		message = 'reset sticky autoBlock on load',
+		data = {
+			iyOwner = getgenv().SB2AutoBlockIyOwner == true,
+			fileOn = (type(isfile) == 'function' and isfile('PlayerTools/autoblock') and tostring(readfile('PlayerTools/autoblock')) == 'true') or false,
+		},
+		timestamp = os.time() * 1000,
+	})
+	if type(appendfile) == 'function' then
+		pcall(appendfile, 'PlayerTools/debug-7e9135.log', payload .. '\n')
+	end
+end)
+-- #endregion
+
+local MIN_PANEL_W = 260
+local MIN_PANEL_H = 220
+local GUI_LAYOUT_PATHS = {
+	'PlayerTools/joinlogs_gui.json',
+	'joinlogs_gui.json',
+}
+
+local function say(text)
+	pcall(function()
+		StarterGui:SetCore('SendNotification', {
+			Title = 'JoinLogs',
+			Text = tostring(text),
+			Duration = 3.5,
+		})
+	end)
+	warn('[JoinLogs] ' .. tostring(text))
+end
+
+local function notifyToast(title, text)
+	if not state.notify then
+		return
+	end
+	pcall(function()
+		StarterGui:SetCore('SendNotification', {
+			Title = tostring(title),
+			Text = tostring(text),
+			Duration = 4,
+		})
+	end)
+end
+
+local function parentGui()
+	local ok, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and hui then
+		return hui
+	end
+	return game:GetService('CoreGui') or (LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui'))
+end
+
+local function loadPillDock()
+	if type(getgenv().SB2RegisterPill) == 'function' then
+		return true
+	end
+	for _, path in ipairs({ 'PlayerTools/PillDock.lua', 'PillDock.lua' }) do
+		local ok, src = pcall(function()
+			return readfile(path)
+		end)
+		if ok and type(src) == 'string' and #src > 50 then
+			local okLoad = pcall(function()
+				assert(loadstring(src))()
+			end)
+			if okLoad and type(getgenv().SB2RegisterPill) == 'function' then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function registerJlPill()
+	if not loadPillDock() then
+		return nil
+	end
+	return getgenv().SB2RegisterPill({
+		id = 'JL',
+		text = state.enabled and 'JL' or 'JL·',
+		textColor = state.enabled and Color3.fromRGB(170, 210, 255) or Color3.fromRGB(140, 140, 150),
+		strokeColor = Color3.fromRGB(70, 100, 140),
+		onClick = function()
+			local fn = getgenv().SB2JoinLogsToggleGui
+			if type(fn) == 'function' then
+				fn()
+			end
+		end,
+	})
+end
+
+local function disconnectOld()
+	local conns = getgenv()[GENV_CONNS]
+	if type(conns) == 'table' then
+		for _, c in ipairs(conns) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+	end
+	getgenv()[GENV_CONNS] = {}
+end
+
+local function track(conn)
+	local conns = getgenv()[GENV_CONNS]
+	if type(conns) ~= 'table' then
+		conns = {}
+		getgenv()[GENV_CONNS] = conns
+	end
+	conns[#conns + 1] = conn
+	return conn
+end
+
+local function destroyGui()
+	disconnectOld()
+	local gui = getgenv()[GENV_GUI]
+	if gui and gui.Parent then
+		pcall(function()
+			gui:Destroy()
+		end)
+	end
+	getgenv()[GENV_GUI] = nil
+end
+
+local function pad2(n)
+	n = math.floor(tonumber(n) or 0)
+	return (n < 10 and '0' or '') .. tostring(n)
+end
+
+local function stamp(t)
+	t = t or os.time()
+	local d = os.date('*t', t)
+	return ('%s:%s:%s'):format(pad2(d.hour), pad2(d.min), pad2(d.sec))
+end
+
+local function stampFull(t)
+	t = t or os.time()
+	local d = os.date('*t', t)
+	return ('%04d-%02d-%02d %s:%s:%s'):format(d.year, d.month, d.day, pad2(d.hour), pad2(d.min), pad2(d.sec))
+end
+
+local function udimFromSaved(saved, fallback)
+	if type(saved) == 'table' and saved.xs ~= nil then
+		return UDim2.new(saved.xs, saved.xo, saved.ys, saved.yo)
+	end
+	return fallback
+end
+
+local function persistPos(key, guiObject)
+	if not guiObject then
+		return
+	end
+	state[key] = {
+		xs = guiObject.Position.X.Scale,
+		xo = guiObject.Position.X.Offset,
+		ys = guiObject.Position.Y.Scale,
+		yo = guiObject.Position.Y.Offset,
+	}
+end
+
+local function persistSize(guiObject)
+	if not guiObject then
+		return
+	end
+	local sz = guiObject.AbsoluteSize
+	state.guiSize = {
+		w = math.max(MIN_PANEL_W, math.floor((sz.X > 0 and sz.X or guiObject.Size.X.Offset) + 0.5)),
+		h = math.max(MIN_PANEL_H, math.floor((sz.Y > 0 and sz.Y or guiObject.Size.Y.Offset) + 0.5)),
+	}
+end
+
+local function sizeFromSaved(size, fallbackW, fallbackH)
+	local w = fallbackW
+	local h = fallbackH
+	if type(size) == 'table' then
+		w = tonumber(size.w) or w
+		h = tonumber(size.h) or h
+	end
+	return math.max(MIN_PANEL_W, math.floor(w + 0.5)), math.max(MIN_PANEL_H, math.floor(h + 0.5))
+end
+
+local function loadGuiLayoutFile()
+	if type(readfile) ~= 'function' then
+		return
+	end
+	for _, path in ipairs(GUI_LAYOUT_PATHS) do
+		local okExists, exists = pcall(function()
+			return isfile and isfile(path)
+		end)
+		if okExists and exists then
+			local okRead, body = pcall(readfile, path)
+			if okRead and type(body) == 'string' and body ~= '' then
+				local okJson, data = pcall(function()
+					return HttpService:JSONDecode(body)
+				end)
+				if okJson and type(data) == 'table' then
+					if type(data.pos) == 'table' then
+						state.guiPos = data.pos
+					end
+					if type(data.size) == 'table' then
+						state.guiSize = data.size
+					end
+					-- autoBlock is owned by PlayerTools profile / PlayerTools/autoblock — do not restore from JL layout.
+					return
+				end
+			end
+		end
+	end
+end
+
+local function saveGuiLayoutFile()
+	if type(writefile) ~= 'function' then
+		return
+	end
+	if type(makefolder) == 'function' and type(isfolder) == 'function' then
+		pcall(function()
+			if not isfolder('PlayerTools') then
+				makefolder('PlayerTools')
+			end
+		end)
+	end
+	local okJson, body = pcall(function()
+		return HttpService:JSONEncode({
+			pos = state.guiPos,
+			size = state.guiSize,
+		})
+	end)
+	if not okJson or type(body) ~= 'string' then
+		return
+	end
+	for _, path in ipairs(GUI_LAYOUT_PATHS) do
+		pcall(writefile, path, body)
+	end
+end
+
+loadGuiLayoutFile()
+
+local function makeDraggable(guiObject, persistKey, onClickIfNotDrag)
+	local dragging = false
+	local dragDist = 0
+	local dragStart, startPos
+	track(guiObject.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragDist = 0
+			dragStart = input.Position
+			startPos = guiObject.Position
+		end
+	end))
+	local function endDrag()
+		if not dragging then
+			return
+		end
+		dragging = false
+		if dragDist >= 4 then
+			persistPos(persistKey, guiObject)
+			if persistKey == 'guiPos' then
+				saveGuiLayoutFile()
+			end
+		elseif onClickIfNotDrag then
+			onClickIfNotDrag()
+		end
+	end
+	track(guiObject.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endDrag()
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endDrag()
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			dragDist = math.max(dragDist, math.abs(delta.X) + math.abs(delta.Y))
+			guiObject.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end))
+end
+
+local function makeResizable(frame, onEnd)
+	local grip = Instance.new('TextButton')
+	grip.Name = 'Resize'
+	grip.Size = UDim2.fromOffset(18, 18)
+	grip.Position = UDim2.new(1, -20, 1, -20)
+	grip.BackgroundColor3 = Color3.fromRGB(50, 56, 66)
+	grip.BorderSizePixel = 0
+	grip.AutoButtonColor = true
+	grip.Text = ''
+	grip.ZIndex = 5
+	grip.Parent = frame
+	Instance.new('UICorner', grip).CornerRadius = UDim.new(0, 4)
+	local mark = Instance.new('TextLabel')
+	mark.BackgroundTransparency = 1
+	mark.Size = UDim2.fromScale(1, 1)
+	mark.Font = Enum.Font.GothamBold
+	mark.TextSize = 11
+	mark.TextColor3 = Color3.fromRGB(160, 170, 185)
+	mark.Text = '⌟'
+	mark.ZIndex = 6
+	mark.Parent = grip
+
+	local resizing = false
+	local dragStart, startSize
+	local function endResize()
+		if not resizing then
+			return
+		end
+		resizing = false
+		if onEnd then
+			onEnd()
+		end
+	end
+	track(grip.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			resizing = true
+			dragStart = input.Position
+			startSize = frame.AbsoluteSize
+		end
+	end))
+	track(grip.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endResize()
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			endResize()
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if not resizing or not dragStart or not startSize then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			local cam = workspace.CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+			local w = math.clamp(startSize.X + delta.X, MIN_PANEL_W, math.max(MIN_PANEL_W, vp.X - 16))
+			local h = math.clamp(startSize.Y + delta.Y, MIN_PANEL_H, math.max(MIN_PANEL_H, vp.Y - 16))
+			frame.Size = UDim2.fromOffset(math.floor(w + 0.5), math.floor(h + 0.5))
+		end
+	end))
+	return grip
+end
+
+local function setClipboard(text)
+	text = tostring(text or '')
+	if type(setclipboard) == 'function' then
+		pcall(setclipboard, text)
+		return true
+	end
+	if type(toclipboard) == 'function' then
+		pcall(toclipboard, text)
+		return true
+	end
+	return false
+end
+
+local function coreGui()
+	local cg = game:GetService('CoreGui')
+	if cloneref then
+		pcall(function()
+			cg = cloneref(cg)
+		end)
+	end
+	return cg
+end
+
+local function buttonPlainText(obj)
+	local text = ''
+	pcall(function()
+		text = tostring(obj.Text or '')
+	end)
+	if text == '' then
+		pcall(function()
+			text = tostring(obj.ContentText or '')
+		end)
+	end
+	return (string.lower(text):gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+local function findBlockingModal()
+	local cg = coreGui()
+	for _, child in ipairs(cg:GetChildren()) do
+		if child.Name == 'FoundationOverlay' then
+			local screen = child:FindFirstChild('BlockingModalScreen', true)
+			if screen then
+				return screen
+			end
+		end
+	end
+	return nil
+end
+
+local function findModalBlockButton()
+	local screen = findBlockingModal()
+	if not screen then
+		return nil
+	end
+	local root = screen:FindFirstChild('Buttons', true) or screen
+	local function labelOf(inst)
+		local text = buttonPlainText(inst)
+		if text ~= '' then
+			return text
+		end
+		local ok, descendants = pcall(function()
+			return inst:GetDescendants()
+		end)
+		if ok and type(descendants) == 'table' then
+			for _, d in ipairs(descendants) do
+				local t = buttonPlainText(d)
+				if t ~= '' then
+					return t
+				end
+			end
+		end
+		return ''
+	end
+	for _, child in ipairs(root:GetChildren()) do
+		if labelOf(child) == 'block' then
+			if child:IsA('GuiButton') then
+				return child
+			end
+			local btn = child:FindFirstAncestorWhichIsA('GuiButton')
+			if btn then
+				return btn
+			end
+			for _, d in ipairs(child:GetDescendants()) do
+				if d:IsA('GuiButton') then
+					return d
+				end
+			end
+			return child
+		end
+	end
+	return nil
+end
+
+local function buttonCenter(btn)
+	if not btn then
+		return nil
+	end
+	local insetY = 0
+	pcall(function()
+		insetY = GuiService:GetGuiInset().Y
+	end)
+	local pos = btn.AbsolutePosition
+	local size = btn.AbsoluteSize
+	return pos.X + size.X / 2, pos.Y + size.Y / 2 + insetY
+end
+
+local function focusThisClient()
+	pcall(function()
+		local cam = workspace.CurrentCamera
+		local vs = cam and cam.ViewportSize
+		local fx = vs and (vs.X * 0.5) or 400
+		local fy = vs and math.min(40, vs.Y * 0.05) or 20
+		if type(mousemoveabs) == 'function' then
+			mousemoveabs(fx, fy)
+		else
+			VirtualInputManager:SendMouseMoveEvent(fx, fy, game)
+		end
+		if type(mouse1click) == 'function' then
+			mouse1click()
+		else
+			VirtualInputManager:SendMouseButtonEvent(fx, fy, 0, true, game, 1)
+			VirtualInputManager:SendMouseButtonEvent(fx, fy, 0, false, game, 1)
+		end
+	end)
+	task.wait(0.05)
+end
+
+local function clickBlockWithMouse(btn)
+	if not btn then
+		return
+	end
+	local x, y = buttonCenter(btn)
+	if not x then
+		return
+	end
+	focusThisClient()
+	pcall(function()
+		if type(mousemoveabs) == 'function' then
+			mousemoveabs(x, y)
+		else
+			VirtualInputManager:SendMouseMoveEvent(x, y, game)
+		end
+	end)
+	task.wait(0.02)
+	pcall(function()
+		if type(mouse1click) == 'function' then
+			mouse1click()
+		else
+			VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+			VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+		end
+	end)
+end
+
+local function confirmBlockButton(btn)
+	task.wait(ACTION_DELAY)
+	if not btn then
+		btn = findModalBlockButton()
+	end
+	if btn then
+		clickBlockWithMouse(btn)
+	end
+	task.wait(ACTION_DELAY)
+end
+
+local function autoConfirmBlockPrompt()
+	task.spawn(function()
+		local done = false
+		local function tryClick()
+			if done then
+				return false
+			end
+			local btn = findModalBlockButton()
+			if not btn and not findBlockingModal() then
+				return false
+			end
+			done = true
+			confirmBlockButton(btn)
+			return true
+		end
+		local conn
+		pcall(function()
+			conn = coreGui().DescendantAdded:Connect(function(inst)
+				if inst.Name == 'BlockingModalScreen' or inst.Name == 'BlockingModal' then
+					task.delay(ACTION_DELAY, tryClick)
+				end
+			end)
+		end)
+		for _ = 1, 40 do
+			if tryClick() then
+				break
+			end
+			task.wait(0.15)
+		end
+		if conn then
+			pcall(function()
+				conn:Disconnect()
+			end)
+		end
+	end)
+end
+
+local function readHopState()
+	if type(readfile) ~= 'function' or type(isfile) ~= 'function' then
+		return nil
+	end
+	local okExists, exists = pcall(isfile, HOP_PATH)
+	if not (okExists and exists) then
+		return nil
+	end
+	local okRead, body = pcall(readfile, HOP_PATH)
+	if not (okRead and type(body) == 'string' and body ~= '') then
+		return nil
+	end
+	local okJson, data = pcall(function()
+		return HttpService:JSONDecode(body)
+	end)
+	if okJson and type(data) == 'table' then
+		return data
+	end
+	return nil
+end
+
+local function writeHopState(data)
+	if type(writefile) ~= 'function' then
+		return
+	end
+	if type(makefolder) == 'function' and type(isfolder) == 'function' then
+		pcall(function()
+			if not isfolder('PlayerTools') then
+				makefolder('PlayerTools')
+			end
+		end)
+	end
+	local okJson, body = pcall(function()
+		return HttpService:JSONEncode(data)
+	end)
+	if okJson and type(body) == 'string' then
+		pcall(writefile, HOP_PATH, body)
+	end
+	getgenv().SB2AutoBlockHop = data
+end
+
+local function hopInProgress()
+	local hop = readHopState() or getgenv().SB2AutoBlockHop
+	return type(hop) == 'table' and hop.active == true
+end
+
+local function armThenTeleport(placeId, label)
+	if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
+		pcall(getgenv().SB2PlayerToolsArmTeleport)
+	end
+	-- Do not clear SoloCombatResume here — that fought the PlayerTools profile.
+	-- PlayerTools hop uses SB2AutoBlockHopping to pause resume until F11 lands.
+	getgenv().SB2AutoBlockHopping = true
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	say(label or ('joining ' .. tostring(placeId)))
+	local ok, err = pcall(function()
+		TeleportService:Teleport(placeId, LocalPlayer)
+	end)
+	if not ok then
+		say('teleport failed: ' .. tostring(err))
+		return false
+	end
+	return true
+end
+
+local function startF1ThenF11Hop()
+	-- Direct F11 only. Never bounce through F1 (that yanked people off other floors).
+	-- Only hop when already on F11 (contested farm server) or F1 mid-legacy hop.
+	local pid = game.PlaceId
+	if pid ~= F11_PLACE and pid ~= F1_PLACE then
+		writeHopState({
+			active = false,
+			phase = 'off',
+			auto = true,
+			t = os.time(),
+		})
+		getgenv().SB2AutoBlockHopping = nil
+		say('auto-block hop skipped — not on F11')
+		return false
+	end
+	writeHopState({
+		active = true,
+		phase = 'f11',
+		auto = true,
+		t = os.time(),
+	})
+	return armThenTeleport(F11_PLACE, 'joining F11 Hypersiddia…')
+end
+
+local autoTimers = {}
+local autoBusy = false
+local autoStatusText = 'idle'
+local paintAuto -- filled after GUI builds
+
+local function setAutoStatus(text)
+	autoStatusText = tostring(text or 'idle')
+	if type(paintAuto) == 'function' then
+		pcall(paintAuto)
+	end
+end
+
+local function cancelAutoTimer(userId)
+	userId = tonumber(userId)
+	if not userId then
+		return
+	end
+	local rec = autoTimers[userId]
+	if rec then
+		rec.cancelled = true
+		autoTimers[userId] = nil
+	end
+end
+
+local function cancelAllAutoTimers()
+	for userId, rec in pairs(autoTimers) do
+		if rec then
+			rec.cancelled = true
+		end
+		autoTimers[userId] = nil
+	end
+	if not autoBusy then
+		setAutoStatus(state.autoBlock and 'watching' or 'off')
+	end
+end
+
+local function soonestTimer()
+	local best, bestAt = nil, nil
+	for _, rec in pairs(autoTimers) do
+		if rec and not rec.cancelled then
+			if not bestAt or rec.deadline < bestAt then
+				best = rec
+				bestAt = rec.deadline
+			end
+		end
+	end
+	return best
+end
+
+local function promptBlockPlayer(entry)
+	local userId = tonumber(entry and entry.userId)
+	if not userId or userId <= 0 then
+		say('no userId to block')
+		return false
+	end
+	if LocalPlayer and userId == LocalPlayer.UserId then
+		say("can't block yourself")
+		return false
+	end
+	local plr = Players:GetPlayerByUserId(userId)
+	if not plr then
+		say('player left — open their profile to block')
+		local url = ('https://www.roblox.com/users/%s/profile'):format(tostring(userId))
+		local opened = pcall(function()
+			GuiService:OpenBrowserWindow(url)
+		end)
+		if not opened then
+			if setClipboard(url) then
+				say('copied profile URL')
+			else
+				say(url)
+			end
+		end
+		return false
+	end
+	autoConfirmBlockPrompt()
+	task.wait(ACTION_DELAY)
+	local ok = pcall(function()
+		StarterGui:SetCore('PromptBlockPlayer', plr)
+	end)
+	if not ok then
+		ok = pcall(function()
+			StarterGui:SetCore('PromptBlockPlayer', { Player = plr })
+		end)
+	end
+	if not ok then
+		say('block prompt failed')
+		return false
+	end
+	return true
+end
+
+local function runAutoBlockSequence(plr)
+	if getgenv().SB2AutoBlockIyOwner == true then
+		return
+	end
+	if autoBusy or not plr or plr == LocalPlayer then
+		return
+	end
+	if state.autoEpoch ~= AUTO_EPOCH then
+		return
+	end
+	if not Players:GetPlayerByUserId(plr.UserId) then
+		return
+	end
+	autoBusy = true
+	setAutoStatus('blocking ' .. tostring(plr.DisplayName or plr.Name))
+	say(('1m up — blocking %s'):format(tostring(plr.DisplayName or plr.Name)))
+	local okRun, errRun = pcall(function()
+		task.wait(ACTION_DELAY)
+		if not Players:GetPlayerByUserId(plr.UserId) then
+			return
+		end
+		local opened = pcall(function()
+			StarterGui:SetCore('PromptBlockPlayer', plr)
+		end)
+		if not opened then
+			opened = pcall(function()
+				StarterGui:SetCore('PromptBlockPlayer', { Player = plr })
+			end)
+		end
+		if not opened then
+			say('block prompt failed')
+			return
+		end
+		task.wait(ACTION_DELAY)
+		local untilT = os.clock() + 8
+		while os.clock() < untilT do
+			local btn = findModalBlockButton()
+			if btn or findBlockingModal() then
+				confirmBlockButton(btn)
+				break
+			end
+			task.wait(0.15)
+		end
+		task.wait(ACTION_DELAY)
+		if not state.autoBlock then
+			return
+		end
+		if not Players:GetPlayerByUserId(plr.UserId) and not findBlockingModal() then
+			-- they left during the prompt; still hop to a fresh F11
+		end
+		cancelAllAutoTimers()
+		startF1ThenF11Hop()
+	end)
+	autoBusy = false
+	if not okRun then
+		setAutoStatus('error')
+		say('auto block error: ' .. tostring(errRun))
+	end
+end
+
+local function startAutoTimer(plr, waitSec)
+	-- AutoBlock.iy owns join blocking — never run JoinLogs' parallel 1m timers.
+	if getgenv().SB2AutoBlockIyOwner == true then
+		return
+	end
+	if not state.autoBlock or not plr or plr == LocalPlayer or isOwnAlt(plr) then
+		return
+	end
+	-- #region agent log
+	pcall(function()
+		local payload = game:GetService('HttpService'):JSONEncode({
+			sessionId = '7e9135',
+			hypothesisId = 'JL2',
+			location = 'JoinLogs.iy:startAutoTimer',
+			message = 'JoinLogs arming timer',
+			data = {
+				name = tostring(plr and (plr.DisplayName or plr.Name)),
+				autoBlock = state.autoBlock == true,
+			},
+			timestamp = os.time() * 1000,
+		})
+		if type(appendfile) == 'function' then
+			pcall(appendfile, 'PlayerTools/debug-7e9135.log', payload .. '\n')
+		end
+	end)
+	-- #endregion
+	if hopInProgress() then
+		return
+	end
+	local userId = plr.UserId
+	waitSec = tonumber(waitSec)
+	if waitSec == nil then
+		waitSec = AUTO_BLOCK_WAIT
+	end
+	local immediate = waitSec <= 0.05
+	if autoTimers[userId] then
+		if not immediate then
+			return
+		end
+		cancelAutoTimer(userId)
+	end
+	local rec = {
+		userId = userId,
+		name = tostring(plr.DisplayName or plr.Name),
+		deadline = os.clock() + math.max(0, waitSec),
+		cancelled = false,
+	}
+	autoTimers[userId] = rec
+	local function finishTimer()
+		if rec.cancelled or autoTimers[userId] ~= rec or state.autoEpoch ~= AUTO_EPOCH then
+			return
+		end
+		autoTimers[userId] = nil
+		local still = Players:GetPlayerByUserId(userId)
+		if not still then
+			setAutoStatus(state.autoBlock and 'watching' or 'off')
+			return
+		end
+		runAutoBlockSequence(still)
+	end
+	if immediate then
+		setAutoStatus('blocking now · ' .. rec.name)
+		say(('auto block now — %s (already here)'):format(rec.name))
+		task.spawn(function()
+			local spin = os.clock() + 20
+			while autoBusy and os.clock() < spin do
+				if rec.cancelled or autoTimers[userId] ~= rec then
+					return
+				end
+				task.wait(0.15)
+			end
+			finishTimer()
+		end)
+		return
+	end
+	setAutoStatus(('1m · %s'):format(rec.name))
+	say(('auto block in 1m — %s'):format(rec.name))
+	task.spawn(function()
+		while autoTimers[userId] == rec and not rec.cancelled and state.autoEpoch == AUTO_EPOCH do
+			local left = rec.deadline - os.clock()
+			if left <= 0 then
+				break
+			end
+			setAutoStatus(('%ds · %s'):format(math.ceil(left), rec.name))
+			task.wait(0.5)
+		end
+		finishTimer()
+	end)
+end
+
+local function armAutoTimersForPresent(waitSec)
+	if getgenv().SB2AutoBlockIyOwner == true then
+		return
+	end
+	if not state.autoBlock then
+		return
+	end
+	if hopInProgress() then
+		return
+	end
+	if waitSec == nil then
+		waitSec = 0
+	end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		startAutoTimer(plr, waitSec)
+	end
+	if not soonestTimer() then
+		setAutoStatus('watching')
+	end
+end
+-- Never steal AutoBlock.iy's arm export.
+if getgenv().SB2AutoBlockIyOwner ~= true then
+	getgenv().SB2ArmAutoBlockTimers = armAutoTimersForPresent
+end
+
+local function syncPlayerToolsAutoBlock(on)
+	pcall(function()
+		local t = Toggles and Toggles.AutoBlockJoin
+		if type(t) == 'table' and type(t.SetValue) == 'function' and t.Value ~= on then
+			t:SetValue(on)
+		end
+	end)
+end
+
+local function setAutoBlockEnabled(on, silent)
+	on = on == true
+	-- AutoBlock.iy owns the early path — don't fight it / don't run JL timers.
+	if getgenv().SB2AutoBlockIyOwner == true then
+		state.autoBlock = false
+		cancelAllAutoTimers()
+		if type(getgenv().SB2SetAutoBlock) == 'function' then
+			pcall(getgenv().SB2SetAutoBlock, on, silent == true, { userChoice = true, persist = true })
+		end
+		setAutoStatus(on and 'IY owns auto-block' or 'off (IY)')
+		if type(paintAuto) == 'function' then
+			pcall(paintAuto)
+		end
+		return on
+	end
+	local changed = state.autoBlock ~= on
+	state.autoBlock = on
+	if changed then
+		saveGuiLayoutFile()
+	end
+	if on then
+		setAutoStatus('watching')
+		armAutoTimersForPresent()
+		if not silent and changed then
+			say('auto block on — 1m if someone joins while you are solo')
+		end
+	else
+		cancelAllAutoTimers()
+		setAutoStatus('off')
+		getgenv().SB2AutoBlockWanted = false
+		getgenv().SB2AutoBlockHopping = nil
+		writeHopState({
+			active = false,
+			phase = 'off',
+			t = os.time(),
+		})
+		if not silent and changed then
+			say('auto block off')
+		end
+	end
+	if type(paintAuto) == 'function' then
+		pcall(paintAuto)
+	end
+	syncPlayerToolsAutoBlock(on)
+	return on
+end
+if getgenv().SB2AutoBlockIyOwner ~= true then
+	getgenv().SB2SetAutoBlock = function(on)
+		return setAutoBlockEnabled(on == true, true)
+	end
+	getgenv().SB2GetAutoBlock = function()
+		return state.autoBlock == true
+	end
+end
+
+local function ensureLogFolder()
+	if type(isfolder) == 'function' and type(makefolder) == 'function' then
+		local ok, exists = pcall(isfolder, 'PlayerTools')
+		if ok and not exists then
+			pcall(makefolder, 'PlayerTools')
+		end
+	end
+end
+
+local function appendFile(line)
+	if type(appendfile) ~= 'function' and type(writefile) ~= 'function' then
+		return
+	end
+	ensureLogFolder()
+	local path = SAVE_PATH
+	if type(appendfile) == 'function' then
+		pcall(appendfile, path, line .. '\n')
+		return
+	end
+	local prev = ''
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, path)
+		if ok and exists then
+			local rok, body = pcall(readfile, path)
+			if rok and type(body) == 'string' then
+				prev = body
+			end
+		end
+	end
+	pcall(writefile, path, prev .. line .. '\n')
+end
+
+local function httpRequest(opts)
+	local req = (syn and syn.request)
+		or http_request
+		or (http and http.request)
+		or request
+	if type(req) ~= 'function' then
+		return false, 'no request'
+	end
+	local ok, res = pcall(req, opts)
+	return ok, res
+end
+
+local function sendWebhook(entry)
+	local url = state.webhook
+	if type(url) ~= 'string' or url == '' or not url:find('discord.com/api/webhooks') then
+		return
+	end
+	local color = entry.kind == 'leave' and 0xE06C75 or 0x98C379
+	if entry.friend then
+		color = 0x61AFEF
+	elseif entry.newAccount then
+		color = 0xE5C07B
+	end
+	local content = ('**%s** `%s` (%s) — age %sd%s'):format(
+		entry.kind == 'leave' and 'LEFT' or 'JOINED',
+		entry.username,
+		tostring(entry.userId),
+		tostring(entry.accountAge or '?'),
+		entry.friend and ' · friend' or ''
+	)
+	task.spawn(function()
+		httpRequest({
+			Url = url,
+			Method = 'POST',
+			Headers = { ['Content-Type'] = 'application/json' },
+			Body = HttpService:JSONEncode({
+				embeds = {
+					{
+						title = entry.displayName ~= entry.username
+								and (entry.displayName .. ' (@' .. entry.username .. ')')
+							or entry.username,
+						description = content,
+						color = color,
+						footer = { text = 'Place ' .. tostring(game.PlaceId) .. ' · Job ' .. tostring(game.JobId) },
+						timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ', entry.time),
+					},
+				},
+			}),
+		})
+	end)
+end
+
+local function playerMeta(plr)
+	local username = plr and plr.Name or '?'
+	local display = username
+	local userId = plr and plr.UserId or 0
+	local age = 0
+	local friend = false
+	pcall(function()
+		display = plr.DisplayName or username
+	end)
+	pcall(function()
+		age = plr.AccountAge or 0
+	end)
+	pcall(function()
+		if LocalPlayer and plr and plr ~= LocalPlayer then
+			friend = LocalPlayer:IsFriendsWith(plr.UserId)
+		end
+	end)
+	return {
+		username = username,
+		displayName = display,
+		userId = userId,
+		accountAge = age,
+		friend = friend == true,
+		newAccount = (tonumber(age) or 9999) <= NEW_ACCOUNT_DAYS,
+	}
+end
+
+local refreshGui
+
+-- Drop presence rows (HERE / JOIN) for a user — used when they leave so names don't linger.
+local function clearPresence(userId)
+	userId = tonumber(userId)
+	if not userId then
+		return 0
+	end
+	local list = state.entries
+	local kept = {}
+	local removed = 0
+	for _, e in ipairs(list) do
+		if tonumber(e.userId) == userId and (e.kind == 'here' or e.kind == 'join') then
+			removed += 1
+		else
+			kept[#kept + 1] = e
+		end
+	end
+	state.entries = kept
+	return removed
+end
+
+local function pushEntry(kind, plr, opts)
+	opts = opts or {}
+	if not state.enabled and not opts.force then
+		return
+	end
+	local meta = typeof(plr) == 'Instance' and playerMeta(plr) or plr
+	if type(meta) ~= 'table' then
+		return
+	end
+	-- Leaving: wipe their name from the roster first, then log LEFT.
+	if kind == 'leave' then
+		clearPresence(meta.userId)
+	end
+	-- Re-joining: drop an old LEFT so the list shows them as present again.
+	if kind == 'join' or kind == 'here' then
+		local list = state.entries
+		local kept = {}
+		for _, e in ipairs(list) do
+			if not (tonumber(e.userId) == tonumber(meta.userId) and e.kind == 'leave') then
+				kept[#kept + 1] = e
+			end
+		end
+		state.entries = kept
+	end
+	local entry = {
+		kind = kind, -- join | leave | here
+		time = os.time(),
+		username = meta.username,
+		displayName = meta.displayName,
+		userId = meta.userId,
+		accountAge = meta.accountAge,
+		friend = meta.friend,
+		newAccount = meta.newAccount,
+		placeId = game.PlaceId,
+		jobId = game.JobId,
+	}
+	local list = state.entries
+	list[#list + 1] = entry
+	while #list > MAX_ENTRIES do
+		table.remove(list, 1)
+	end
+
+	local line = ('[%s] %s  %s (@%s)  id=%s  age=%sd%s%s'):format(
+		stampFull(entry.time),
+		string.upper(entry.kind),
+		entry.displayName,
+		entry.username,
+		tostring(entry.userId),
+		tostring(entry.accountAge or '?'),
+		entry.friend and '  friend' or '',
+		entry.newAccount and '  NEW' or ''
+	)
+	appendFile(line)
+
+	if kind == 'join' or kind == 'leave' then
+		local tag = kind == 'join' and 'joined' or 'left'
+		local extra = ''
+		if entry.friend then
+			extra = ' (friend)'
+		elseif entry.newAccount then
+			extra = (' (new · %sd)'):format(tostring(entry.accountAge))
+		end
+		notifyToast(
+			kind == 'join' and 'Player joined' or 'Player left',
+			('%s%s'):format(entry.username, extra)
+		)
+		sendWebhook(entry)
+	end
+
+	if refreshGui then
+		task.defer(refreshGui)
+	end
+	return entry
+end
+
+local function filteredEntries()
+	local q = string.lower(tostring(state.search or ''))
+	local filter = state.filter or 'all'
+	local out = {}
+	for i = #state.entries, 1, -1 do
+		local e = state.entries[i]
+		if filter == 'all' or e.kind == filter or (filter == 'join' and e.kind == 'here') then
+			if q == ''
+				or string.find(string.lower(e.username), q, 1, true)
+				or string.find(string.lower(e.displayName), q, 1, true)
+				or string.find(tostring(e.userId), q, 1, true)
+			then
+				out[#out + 1] = e
+			end
+		end
+	end
+	return out
+end
+
+local function setPanelOpen(open)
+	open = open == true
+	state.panelOpen = open
+	local gui = getgenv()[GENV_GUI]
+	local main = gui and gui:FindFirstChild('Main')
+	if main then
+		main.Visible = open
+	end
+end
+
+local function togglePanel()
+	local gui = getgenv()[GENV_GUI]
+	local main = gui and gui:FindFirstChild('Main')
+	if not main then
+		return false
+	end
+	setPanelOpen(not main.Visible)
+	return main.Visible
+end
+
+local function mkBtn(parent, text, size, pos, bg)
+	local b = Instance.new('TextButton')
+	b.Size = size
+	b.Position = pos
+	b.BackgroundColor3 = bg or Color3.fromRGB(40, 44, 52)
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = true
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.TextColor3 = Color3.fromRGB(220, 224, 232)
+	b.Text = text
+	b.Parent = parent
+	Instance.new('UICorner', b).CornerRadius = UDim.new(0, 6)
+	return b
+end
+
+local function buildGui()
+	destroyGui()
+
+	local gui = Instance.new('ScreenGui')
+	gui.Name = 'SB2JoinLogsGui'
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.DisplayOrder = 105
+	pcall(function()
+		gui.Parent = parentGui()
+	end)
+	if not gui.Parent and LocalPlayer then
+		gui.Parent = LocalPlayer:WaitForChild('PlayerGui')
+	end
+	getgenv()[GENV_GUI] = gui
+	pcall(registerJlPill)
+
+	-- Pill lives in shared SB2PillDock — panel only here.
+	local frame = Instance.new('Frame')
+	frame.Name = 'Main'
+	local savedW, savedH = sizeFromSaved(state.guiSize, 360, 460)
+	frame.Size = UDim2.fromOffset(savedW, savedH)
+	frame.Position = udimFromSaved(state.guiPos, UDim2.new(1, -380, 0, 152))
+	frame.BackgroundColor3 = Color3.fromRGB(22, 24, 28)
+	frame.BorderSizePixel = 0
+	frame.Active = true
+	frame.Visible = false
+	frame.Parent = gui
+	Instance.new('UICorner', frame).CornerRadius = UDim.new(0, 10)
+	local stroke = Instance.new('UIStroke')
+	stroke.Color = Color3.fromRGB(55, 60, 70)
+	stroke.Thickness = 1
+	stroke.Parent = frame
+
+	local title = Instance.new('TextLabel')
+	title.Name = 'Title'
+	title.BackgroundTransparency = 1
+	title.Size = UDim2.new(1, -90, 0, 28)
+	title.Position = UDim2.fromOffset(14, 8)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = Color3.fromRGB(235, 238, 245)
+	title.Text = 'Join Logs'
+	title.Parent = frame
+
+	local sub = Instance.new('TextLabel')
+	sub.Name = 'Sub'
+	sub.BackgroundTransparency = 1
+	sub.Size = UDim2.new(1, -20, 0, 16)
+	sub.Position = UDim2.fromOffset(14, 32)
+	sub.Font = Enum.Font.Gotham
+	sub.TextSize = 11
+	sub.TextXAlignment = Enum.TextXAlignment.Left
+	sub.TextColor3 = Color3.fromRGB(140, 148, 160)
+	sub.Text = 'click row = copy user · drag title · ⌟ resize'
+	sub.Parent = frame
+
+	local closeBtn = mkBtn(frame, 'X', UDim2.fromOffset(28, 28), UDim2.new(1, -36, 0, 8), Color3.fromRGB(40, 44, 52))
+	track(closeBtn.MouseButton1Click:Connect(function()
+		setPanelOpen(false)
+	end))
+
+	makeDraggable(frame, 'guiPos', nil)
+	makeResizable(frame, function()
+		persistSize(frame)
+		saveGuiLayoutFile()
+	end)
+	pcall(function()
+		local old = gui:FindFirstChild('Widget')
+		if old then
+			old:Destroy()
+		end
+	end)
+
+	local toolbar = Instance.new('Frame')
+	toolbar.Name = 'Toolbar'
+	toolbar.BackgroundTransparency = 1
+	toolbar.Size = UDim2.new(1, -20, 0, 28)
+	toolbar.Position = UDim2.fromOffset(10, 54)
+	toolbar.Parent = frame
+
+	local filterAll = mkBtn(toolbar, 'All', UDim2.fromOffset(52, 26), UDim2.fromOffset(0, 0))
+	local filterJoin = mkBtn(toolbar, 'Join', UDim2.fromOffset(52, 26), UDim2.fromOffset(56, 0))
+	local filterLeave = mkBtn(toolbar, 'Leave', UDim2.fromOffset(58, 26), UDim2.fromOffset(112, 0))
+	local toggleBtn = mkBtn(toolbar, state.enabled and 'ON' or 'OFF', UDim2.fromOffset(44, 26), UDim2.fromOffset(176, 0), state.enabled and Color3.fromRGB(40, 90, 60) or Color3.fromRGB(90, 45, 45))
+	local notifyBtn = mkBtn(toolbar, state.notify and 'Ntf' or 'Mute', UDim2.fromOffset(44, 26), UDim2.fromOffset(224, 0))
+	local clearBtn = mkBtn(toolbar, 'Clr', UDim2.fromOffset(36, 26), UDim2.fromOffset(272, 0), Color3.fromRGB(70, 50, 50))
+	local saveBtn = mkBtn(toolbar, 'Save', UDim2.fromOffset(40, 26), UDim2.new(1, -40, 0, 0), Color3.fromRGB(45, 70, 95))
+
+	local autoBar = Instance.new('Frame')
+	autoBar.Name = 'AutoBar'
+	autoBar.BackgroundTransparency = 1
+	autoBar.Size = UDim2.new(1, -20, 0, 26)
+	autoBar.Position = UDim2.fromOffset(10, 86)
+	autoBar.Parent = frame
+	local autoBtn = mkBtn(
+		autoBar,
+		state.autoBlock and '1m ON' or '1m',
+		UDim2.fromOffset(64, 26),
+		UDim2.fromOffset(0, 0),
+		state.autoBlock and Color3.fromRGB(110, 55, 55) or Color3.fromRGB(40, 44, 52)
+	)
+	local autoLabel = Instance.new('TextLabel')
+	autoLabel.BackgroundTransparency = 1
+	autoLabel.Size = UDim2.new(1, -72, 1, 0)
+	autoLabel.Position = UDim2.fromOffset(72, 0)
+	autoLabel.Font = Enum.Font.Gotham
+	autoLabel.TextSize = 12
+	autoLabel.TextXAlignment = Enum.TextXAlignment.Left
+	autoLabel.TextColor3 = Color3.fromRGB(180, 150, 150)
+	autoLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	autoLabel.Text = state.autoBlock and 'watching' or 'off'
+	autoLabel.Parent = autoBar
+
+	local search = Instance.new('TextBox')
+	search.Name = 'Search'
+	search.Size = UDim2.new(1, -20, 0, 28)
+	search.Position = UDim2.fromOffset(10, 118)
+	search.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
+	search.BorderSizePixel = 0
+	search.ClearTextOnFocus = false
+	search.Font = Enum.Font.Gotham
+	search.TextSize = 13
+	search.TextColor3 = Color3.fromRGB(230, 232, 240)
+	search.PlaceholderColor3 = Color3.fromRGB(110, 118, 130)
+	search.PlaceholderText = 'search name / id…'
+	search.Text = tostring(state.search or '')
+	search.TextXAlignment = Enum.TextXAlignment.Left
+	search.Parent = frame
+	Instance.new('UICorner', search).CornerRadius = UDim.new(0, 6)
+	local sPad = Instance.new('UIPadding')
+	sPad.PaddingLeft = UDim.new(0, 10)
+	sPad.Parent = search
+
+	local list = Instance.new('ScrollingFrame')
+	list.Name = 'List'
+	list.Size = UDim2.new(1, -20, 1, -178)
+	list.Position = UDim2.fromOffset(10, 154)
+	list.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 5
+	list.CanvasSize = UDim2.new(0, 0, 0, 0)
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Parent = frame
+	Instance.new('UICorner', list).CornerRadius = UDim.new(0, 8)
+	local layout = Instance.new('UIListLayout')
+	layout.Padding = UDim.new(0, 5)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+	local pad = Instance.new('UIPadding')
+	pad.PaddingTop = UDim.new(0, 6)
+	pad.PaddingBottom = UDim.new(0, 6)
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.Parent = list
+
+	local function paintFilter()
+		local f = state.filter
+		filterAll.BackgroundColor3 = f == 'all' and Color3.fromRGB(55, 85, 120) or Color3.fromRGB(40, 44, 52)
+		filterJoin.BackgroundColor3 = f == 'join' and Color3.fromRGB(45, 95, 65) or Color3.fromRGB(40, 44, 52)
+		filterLeave.BackgroundColor3 = f == 'leave' and Color3.fromRGB(110, 55, 55) or Color3.fromRGB(40, 44, 52)
+	end
+
+	local function paintToggles()
+		toggleBtn.Text = state.enabled and 'ON' or 'OFF'
+		toggleBtn.BackgroundColor3 = state.enabled and Color3.fromRGB(40, 90, 60) or Color3.fromRGB(90, 45, 45)
+		notifyBtn.Text = state.notify and 'Ntf' or 'Mute'
+		autoBtn.Text = state.autoBlock and '1m ON' or '1m'
+		autoBtn.BackgroundColor3 = state.autoBlock and Color3.fromRGB(110, 55, 55) or Color3.fromRGB(40, 44, 52)
+		autoLabel.Text = autoStatusText
+		autoLabel.TextColor3 = state.autoBlock and Color3.fromRGB(220, 170, 170) or Color3.fromRGB(140, 148, 160)
+		if type(getgenv().SB2SetPillText) == 'function' then
+			getgenv().SB2SetPillText('JL', state.enabled and 'JL' or 'JL·')
+		end
+		local dock = getgenv().SB2PillDock
+		local pill = dock and dock.pills and dock.pills.JL
+		if pill then
+			pill.TextColor3 = state.enabled and Color3.fromRGB(170, 210, 255) or Color3.fromRGB(140, 140, 150)
+		end
+	end
+	paintAuto = paintToggles
+
+	refreshGui = function()
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA('GuiObject') then
+				child:Destroy()
+			end
+		end
+		paintFilter()
+		paintToggles()
+		title.Text = ('Join Logs  ·  %d'):format(#state.entries)
+		local rows = filteredEntries()
+		if #rows == 0 then
+			local empty = Instance.new('TextLabel')
+			empty.Name = 'Empty'
+			empty.BackgroundTransparency = 1
+			empty.Size = UDim2.new(1, 0, 0, 40)
+			empty.Font = Enum.Font.Gotham
+			empty.TextSize = 13
+			empty.TextColor3 = Color3.fromRGB(120, 128, 140)
+			empty.Text = state.enabled and 'no entries yet' or 'logging paused (jlon to resume)'
+			empty.Parent = list
+			return
+		end
+		for i, e in ipairs(rows) do
+			local kindColor = Color3.fromRGB(152, 195, 121)
+			local kindText = 'JOIN'
+			if e.kind == 'leave' then
+				kindColor = Color3.fromRGB(224, 108, 117)
+				kindText = 'LEFT'
+			elseif e.kind == 'here' then
+				kindColor = Color3.fromRGB(120, 130, 150)
+				kindText = 'HERE'
+			end
+			if e.friend then
+				kindColor = Color3.fromRGB(97, 175, 239)
+			elseif e.newAccount and e.kind ~= 'here' then
+				kindColor = Color3.fromRGB(229, 192, 123)
+			end
+
+			local row = Instance.new('TextButton')
+			row.Name = 'Row'
+			row.LayoutOrder = i
+			row.Size = UDim2.new(1, 0, 0, 52)
+			row.BackgroundColor3 = Color3.fromRGB(34, 38, 46)
+			row.BorderSizePixel = 0
+			row.AutoButtonColor = true
+			row.Text = ''
+			row.Parent = list
+			Instance.new('UICorner', row).CornerRadius = UDim.new(0, 6)
+
+			local accent = Instance.new('Frame')
+			accent.Size = UDim2.new(0, 3, 1, -10)
+			accent.Position = UDim2.fromOffset(4, 5)
+			accent.BackgroundColor3 = kindColor
+			accent.BorderSizePixel = 0
+			accent.Parent = row
+			Instance.new('UICorner', accent).CornerRadius = UDim.new(0, 2)
+
+			local line1 = Instance.new('TextLabel')
+			line1.BackgroundTransparency = 1
+			line1.Size = UDim2.new(1, -128, 0, 22)
+			line1.Position = UDim2.fromOffset(14, 6)
+			line1.Font = Enum.Font.GothamBold
+			line1.TextSize = 13
+			line1.TextXAlignment = Enum.TextXAlignment.Left
+			line1.TextColor3 = Color3.fromRGB(235, 238, 245)
+			line1.TextTruncate = Enum.TextTruncate.AtEnd
+			if e.displayName ~= e.username then
+				line1.Text = ('%s  (@%s)'):format(e.displayName, e.username)
+			else
+				line1.Text = e.username
+			end
+			line1.Parent = row
+
+			local line2 = Instance.new('TextLabel')
+			line2.BackgroundTransparency = 1
+			line2.Size = UDim2.new(1, -128, 0, 18)
+			line2.Position = UDim2.fromOffset(14, 28)
+			line2.Font = Enum.Font.Gotham
+			line2.TextSize = 11
+			line2.TextXAlignment = Enum.TextXAlignment.Left
+			line2.TextColor3 = Color3.fromRGB(140, 148, 160)
+			local flags = {}
+			if e.friend then
+				flags[#flags + 1] = 'friend'
+			end
+			if e.newAccount then
+				flags[#flags + 1] = 'new'
+			end
+			line2.Text = ('%s · id %s · age %sd%s'):format(
+				stamp(e.time),
+				tostring(e.userId),
+				tostring(e.accountAge or '?'),
+				#flags > 0 and (' · ' .. table.concat(flags, ', ')) or ''
+			)
+			line2.Parent = row
+
+			local badge = Instance.new('TextLabel')
+			badge.BackgroundTransparency = 1
+			badge.Size = UDim2.fromOffset(48, 20)
+			badge.Position = UDim2.new(1, -54, 0, 6)
+			badge.Font = Enum.Font.GothamBold
+			badge.TextSize = 11
+			badge.TextColor3 = kindColor
+			badge.Text = kindText
+			badge.Parent = row
+
+			local blockBtn = mkBtn(row, 'Block', UDim2.fromOffset(52, 20), UDim2.new(1, -110, 0, 6), Color3.fromRGB(110, 50, 55))
+			blockBtn.TextSize = 11
+			blockBtn.ZIndex = 3
+			blockBtn.Active = true
+			blockBtn.AutoButtonColor = true
+			track(blockBtn.MouseButton1Click:Connect(function()
+				row:SetAttribute('SkipCopy', true)
+				promptBlockPlayer(e)
+				task.defer(function()
+					if row.Parent then
+						row:SetAttribute('SkipCopy', false)
+					end
+				end)
+			end))
+
+			track(row.MouseButton1Click:Connect(function()
+				if row:GetAttribute('SkipCopy') then
+					return
+				end
+				local payload = ('%s\t%s'):format(e.username, tostring(e.userId))
+				if setClipboard(payload) then
+					say(('copied %s'):format(payload))
+				else
+					say(payload)
+				end
+			end))
+			track(row.MouseButton2Click:Connect(function()
+				if setClipboard(tostring(e.userId)) then
+					say('copied userId ' .. tostring(e.userId))
+				end
+			end))
+		end
+	end
+
+	track(filterAll.MouseButton1Click:Connect(function()
+		state.filter = 'all'
+		refreshGui()
+	end))
+	track(filterJoin.MouseButton1Click:Connect(function()
+		state.filter = 'join'
+		refreshGui()
+	end))
+	track(filterLeave.MouseButton1Click:Connect(function()
+		state.filter = 'leave'
+		refreshGui()
+	end))
+	track(toggleBtn.MouseButton1Click:Connect(function()
+		state.enabled = not state.enabled
+		paintToggles()
+		say(state.enabled and 'logging on' or 'logging off')
+	end))
+	track(notifyBtn.MouseButton1Click:Connect(function()
+		state.notify = not state.notify
+		paintToggles()
+		say(state.notify and 'toasts on' or 'toasts off')
+	end))
+	track(autoBtn.MouseButton1Click:Connect(function()
+		setAutoBlockEnabled(not state.autoBlock, false)
+		paintToggles()
+	end))
+	track(clearBtn.MouseButton1Click:Connect(function()
+		state.entries = {}
+		refreshGui()
+		say('cleared session log')
+	end))
+	track(saveBtn.MouseButton1Click:Connect(function()
+		ensureLogFolder()
+		local lines = { '-- JoinLogs dump ' .. stampFull() }
+		for _, e in ipairs(state.entries) do
+			lines[#lines + 1] = ('[%s] %s %s (@%s) id=%s age=%s'):format(
+				stampFull(e.time),
+				string.upper(e.kind),
+				e.displayName,
+				e.username,
+				tostring(e.userId),
+				tostring(e.accountAge or '?')
+			)
+		end
+		local path = ('PlayerTools/joinlogs_dump_%s.txt'):format(os.time())
+		if type(writefile) == 'function' then
+			pcall(writefile, path, table.concat(lines, '\n'))
+			say('saved ' .. path)
+		else
+			say('writefile unavailable')
+		end
+	end))
+	track(search:GetPropertyChangedSignal('Text'):Connect(function()
+		state.search = search.Text
+		refreshGui()
+	end))
+
+	refreshGui()
+	setPanelOpen(false)
+	return gui
+end
+
+local function ensureGui()
+	local gui = getgenv()[GENV_GUI]
+	if gui and gui.Parent then
+		pcall(registerJlPill)
+		return gui
+	end
+	return buildGui()
+end
+
+getgenv().SB2JoinLogsToggleGui = function()
+	ensureGui()
+	local open = togglePanel()
+	if open and refreshGui then
+		refreshGui()
+	end
+	return open
+end
+
+local function hookPlayers()
+	track(Players.PlayerAdded:Connect(function(plr)
+		if plr == LocalPlayer then
+			return
+		end
+		-- IsFriendsWith can yield; defer so join isn't dropped.
+		task.defer(function()
+			pushEntry('join', plr)
+			startAutoTimer(plr)
+		end)
+	end))
+	track(Players.PlayerRemoving:Connect(function(plr)
+		if plr == LocalPlayer then
+			return
+		end
+		cancelAutoTimer(plr.UserId)
+		-- Capture meta before the player instance is gone.
+		local meta = playerMeta(plr)
+		pushEntry('leave', meta)
+		if state.autoBlock and not autoBusy and not soonestTimer() then
+			setAutoStatus('watching')
+		end
+	end))
+end
+
+local function seedPresent()
+	-- Only seed once per server job so reloads don't spam HERE.
+	local key = 'seeded_' .. tostring(game.JobId)
+	if state[key] then
+		return
+	end
+	state[key] = true
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			pushEntry('here', plr, { force = true })
+		end
+	end
+end
+
+local function stopPlugin()
+	destroyGui()
+	getgenv()[GENV_STOP] = nil
+	say('stopped')
+end
+
+getgenv()[GENV_STOP] = stopPlugin
+
+-- Boot
+ensureGui()
+setPanelOpen(false)
+hookPlayers()
+task.defer(seedPresent)
+task.defer(function()
+	-- AutoBlock.iy owns join-watch when installed — JoinLogs only mirrors status.
+	if getgenv().SB2AutoBlockIyOwner == true then
+		state.autoBlock = false
+		cancelAllAutoTimers()
+		local iyOn = getgenv().SB2GetAutoBlock and getgenv().SB2GetAutoBlock() == true
+		setAutoStatus(iyOn and 'IY owns auto-block' or 'off (IY)')
+		-- #region agent log
+		pcall(function()
+			local payload = game:GetService('HttpService'):JSONEncode({
+				sessionId = '7e9135',
+				hypothesisId = 'JL1',
+				location = 'JoinLogs.iy:boot',
+				message = 'IY owns — JL timers forced off',
+				data = { iyOn = iyOn },
+				timestamp = os.time() * 1000,
+			})
+			if type(appendfile) == 'function' then
+				pcall(appendfile, 'PlayerTools/debug-7e9135.log', payload .. '\n')
+			end
+		end)
+		-- #endregion
+		if refreshGui then
+			refreshGui()
+		end
+		return
+	end
+	-- Prefer PlayerTools profile file over stale JoinLogs layout.
+	local fileOn = false
+	pcall(function()
+		if type(isfile) == 'function' and type(readfile) == 'function' and isfile('PlayerTools/autoblock') then
+			fileOn = tostring(readfile('PlayerTools/autoblock')) == 'true'
+		end
+	end)
+	local toggleOn = false
+	pcall(function()
+		local t = Toggles and Toggles.AutoBlockJoin
+		toggleOn = type(t) == 'table' and t.Value == true
+	end)
+	-- Explicit false when neither source wants it (do not keep sticky genv true).
+	state.autoBlock = fileOn or toggleOn
+	if state.autoBlock then
+		setAutoStatus('watching')
+		armAutoTimersForPresent()
+	else
+		cancelAllAutoTimers()
+		setAutoStatus('off')
+		-- Do not clear SB2AutoBlockWanted / hop — PlayerTools owns those across reloads.
+	end
+	local hop = readHopState() or getgenv().SB2AutoBlockHop
+	if type(hop) == 'table' and hop.active == true then
+		local pid = game.PlaceId
+		if pid ~= F1_PLACE and pid ~= F11_PLACE then
+			writeHopState({
+				active = false,
+				phase = 'off',
+				t = os.time(),
+			})
+			getgenv().SB2AutoBlockHopping = nil
+		end
+	end
+	if refreshGui then
+		refreshGui()
+	end
+end)
+task.spawn(function()
+	for _ = 1, 40 do
+		if getgenv().SB2AutoBlockIyOwner == true then
+			state.autoBlock = false
+			cancelAllAutoTimers()
+			local iyOn = getgenv().SB2GetAutoBlock and getgenv().SB2GetAutoBlock() == true
+			setAutoStatus(iyOn and 'IY owns auto-block' or 'off (IY)')
+			if refreshGui then
+				refreshGui()
+			end
+			return
+		end
+		local t = Toggles and Toggles.AutoBlockJoin
+		if type(t) == 'table' and t.Value ~= nil then
+			-- Follow PlayerTools toggle only — never push a stale false into the profile toggle.
+			state.autoBlock = t.Value == true
+			if state.autoBlock then
+				setAutoStatus('watching')
+			else
+				cancelAllAutoTimers()
+				setAutoStatus('off')
+			end
+			if refreshGui then
+				refreshGui()
+			end
+			return
+		end
+		task.wait(0.25)
+	end
+end)
+say(state.enabled and 'active — JL chip top-right' or 'loaded (paused) — jlon to enable')
+
+local Plugin = {
+	['PluginName'] = 'JoinLogs',
+	['PluginDescription'] = 'Better join/leave logs — display names, age, friends, file + webhook',
+	['Commands'] = {
+		['jlgui'] = {
+			['ListName'] = 'jlgui / betterjlogs',
+			['Description'] = 'Toggle JoinLogs panel (or click the JL chip)',
+			['Aliases'] = { 'betterjlogs', 'bjl', 'jlpanel' },
+			['Function'] = function()
+				ensureGui()
+				if togglePanel() then
+					say('panel open')
+				else
+					say('panel closed')
+				end
+			end,
+		},
+		['jlon'] = {
+			['ListName'] = 'jlon',
+			['Description'] = 'Enable join/leave logging',
+			['Aliases'] = { 'jlenable' },
+			['Function'] = function()
+				state.enabled = true
+				ensureGui()
+				if refreshGui then
+					refreshGui()
+				end
+				say('logging on')
+			end,
+		},
+		['jloff'] = {
+			['ListName'] = 'jloff',
+			['Description'] = 'Pause join/leave logging (keeps history)',
+			['Aliases'] = { 'jldisable' },
+			['Function'] = function()
+				state.enabled = false
+				if refreshGui then
+					refreshGui()
+				end
+				say('logging off')
+			end,
+		},
+		['jlclear'] = {
+			['ListName'] = 'jlclear',
+			['Description'] = 'Clear in-memory join log for this session',
+			['Aliases'] = { 'jlwipe' },
+			['Function'] = function()
+				state.entries = {}
+				if refreshGui then
+					refreshGui()
+				end
+				say('cleared')
+			end,
+		},
+		['jlsave'] = {
+			['ListName'] = 'jlsave',
+			['Description'] = 'Dump current session log to PlayerTools/joinlogs_dump_*.txt',
+			['Aliases'] = { 'jldump' },
+			['Function'] = function()
+				ensureGui()
+				ensureLogFolder()
+				local lines = { '-- JoinLogs dump ' .. stampFull() }
+				for _, e in ipairs(state.entries) do
+					lines[#lines + 1] = ('[%s] %s %s (@%s) id=%s age=%s'):format(
+						stampFull(e.time),
+						string.upper(e.kind),
+						e.displayName,
+						e.username,
+						tostring(e.userId),
+						tostring(e.accountAge or '?')
+					)
+				end
+				local path = ('PlayerTools/joinlogs_dump_%s.txt'):format(os.time())
+				if type(writefile) == 'function' then
+					pcall(writefile, path, table.concat(lines, '\n'))
+					say('saved ' .. path)
+				else
+					say('writefile unavailable — live appends also need writefile/appendfile')
+				end
+			end,
+		},
+		['jlnotify'] = {
+			['ListName'] = 'jlnotify',
+			['Description'] = 'Toggle toast notifications on join/leave',
+			['Aliases'] = { 'jltoasts' },
+			['Function'] = function()
+				state.notify = not state.notify
+				if refreshGui then
+					refreshGui()
+				end
+				say(state.notify and 'toasts on' or 'toasts off')
+			end,
+		},
+		['jlauto'] = {
+			['ListName'] = 'jlauto',
+			['Description'] = 'Toggle 1-minute auto-block + F1→F11 hop',
+			['Aliases'] = { 'jlblock', 'autoblock' },
+			['Function'] = function()
+				setAutoBlockEnabled(not state.autoBlock, false)
+				ensureGui()
+				if refreshGui then
+					refreshGui()
+				end
+			end,
+		},
+		['jlwebhook'] = {
+			['ListName'] = 'jlwebhook [url]',
+			['Description'] = 'Set Discord webhook for joins/leaves (empty to clear)',
+			['Aliases'] = { 'jlhook' },
+			['Function'] = function(args)
+				local url = args and table.concat(args, ' ') or ''
+				url = url:gsub('^%s+', ''):gsub('%s+$', '')
+				state.webhook = url
+				if url == '' then
+					say('webhook cleared')
+				else
+					say('webhook set')
+				end
+			end,
+		},
+		['joinlogs'] = {
+			['ListName'] = 'joinlogs / jlogs',
+			['Description'] = 'Open better JoinLogs (replaces stock IY feel)',
+			['Aliases'] = { 'jlogs' },
+			['Function'] = function()
+				ensureGui()
+				setPanelOpen(true)
+				if refreshGui then
+					refreshGui()
+				end
+				say('JoinLogs panel open')
+			end,
+		},
+	},
+}
+
+return Plugin
