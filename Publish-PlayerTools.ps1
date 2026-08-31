@@ -89,24 +89,44 @@ if (Test-Path $pkgPath) {
 }
 
 Set-Location $repoRoot
+
+# Per-command identity only (never touch global git config).
+$gitIdentity = @(
+  '-c', 'user.email=nickb926@users.noreply.github.com',
+  '-c', 'user.name=NickB926'
+)
+
+function Invoke-Git {
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+  & git @gitIdentity @GitArgs
+  if ($LASTEXITCODE -ne 0) {
+    throw "git $($GitArgs -join ' ') failed (exit $LASTEXITCODE)"
+  }
+}
+
 try {
   if (-not (Test-Path (Join-Path $repoRoot '.git'))) {
     git init
+    if ($LASTEXITCODE -ne 0) { throw "git init failed" }
     git branch -M main
     gh repo create NickB926/playertools --public --source=. --remote=origin --push
+    if ($LASTEXITCODE -ne 0) { throw "gh repo create failed" }
   } else {
     git add -A
+    if ($LASTEXITCODE -ne 0) { throw "git add failed" }
     $status = git status --porcelain
     if (-not $status) {
       Write-Host 'No file changes after sync --- nothing to push.'
       exit 0
     }
-    git commit -m "PlayerTools $($ver.version): $($ver.message)"
+    Invoke-Git commit -m "PlayerTools $($ver.version): $($ver.message)"
     git push -u origin HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git push failed (exit $LASTEXITCODE)" }
   }
 
   if ($Public) {
     gh repo edit NickB926/playertools --visibility public --accept-visibility-change-consequences
+    if ($LASTEXITCODE -ne 0) { throw "gh repo edit failed" }
   }
 } catch {
   Write-Host "==> Publish failed --- restoring version.json to $oldVersion"
@@ -115,7 +135,7 @@ try {
 }
 
 Write-Host ""
-Write-Host "==> Published $($ver.version)  (was $oldVersion)"
+Write-Host "==> Published $($ver.version)  (was $oldVersion) --- pushed to GitHub"
 Write-Host "Friend / reinstall:"
 Write-Host 'loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/playertools/main/bootstrap.lua"))()'
-Write-Host "Or in-game: Settings --- GitHub updates --- Check / Apply"
+Write-Host "Or in-game: Settings -> GitHub updates -> Check / Apply"
