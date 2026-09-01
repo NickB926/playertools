@@ -94,6 +94,15 @@ local OWN_ALT_NAMES = {
 	['62qx'] = true,
 }
 
+-- Hardcoded so placeholder names like roblox_user_<id> still count as you.
+local OWN_ALT_USERIDS = {
+	[105008790] = true, -- NickB926
+	[5629930206] = true, -- NickB910
+	[58534583] = true, -- NickB925
+	[2948744565] = true, -- NickB929
+	[1781632332] = true, -- dyildolover (Roblox renamed → roblox_user_*)
+}
+
 if getgenv()[GENV_STOP] then
 	pcall(getgenv()[GENV_STOP])
 end
@@ -150,12 +159,25 @@ local function isOwnAlt(plr)
 	if not plr then
 		return false
 	end
+	local uid = tonumber(plr.UserId)
+	if uid and OWN_ALT_USERIDS[uid] then
+		return true
+	end
 	local extras = rawget(getgenv(), 'SB2OwnAltNames')
 	local name = normalizeAltKey(plr.Name)
 	local display = normalizeAltKey(plr.DisplayName)
-	return OWN_ALT_NAMES[name] == true
+	-- Placeholder accounts: roblox_user_<userid>
+	local stubId = name:match('^roblox_user_(%d+)$')
+	if stubId and OWN_ALT_USERIDS[tonumber(stubId)] then
+		return true
+	end
+	local hit = OWN_ALT_NAMES[name] == true
 		or OWN_ALT_NAMES[display] == true
 		or (type(extras) == 'table' and (extras[name] == true or extras[display] == true))
+	if hit and uid then
+		OWN_ALT_USERIDS[uid] = true
+	end
+	return hit
 end
 
 local function countStrangerPlayers()
@@ -698,7 +720,9 @@ local function pickFreshServerJob(placeId, triedSet)
 end
 
 local function autoblockShouldRun()
-	return enabled or freshFinderActive()
+	-- Only the local enabled flag (or active fresh finder) — never re-arm from stale
+	-- genv/file after the user turns AutoBlock off.
+	return enabled == true or freshFinderActive()
 end
 
 local function armTeleport()
@@ -1497,7 +1521,7 @@ local function finishHop(plr, reason, opts)
 end
 
 runAutoBlockSequence = function(plr)
-	if autoBusy or not plr or plr == LocalPlayer or isOwnAlt(plr) then
+	if not plr or plr == LocalPlayer or isOwnAlt(plr) then
 		return
 	end
 	if not Players:GetPlayerByUserId(plr.UserId) then
@@ -1507,9 +1531,26 @@ runAutoBlockSequence = function(plr)
 	if not forFreshFinder and not enabled then
 		return
 	end
+	if not autoblockShouldRun() then
+		return
+	end
+	-- Only one block UI at a time — re-queue instead of dropping the player.
+	if autoBusy then
+		task.delay(0.6, function()
+			if not autoblockShouldRun() then
+				return
+			end
+			local still = Players:GetPlayerByUserId(plr.UserId)
+			if still and not isOwnAlt(still) and not isKnownBlocked(still) then
+				startAutoTimer(still, 0, { silent = true })
+			end
+		end)
+		return
+	end
 	local cancelGen = getgenv().SB2FreshFinderCancelGen or 0
+	local myEpoch = autoEpoch
 	local function cancelled()
-		return freshFinderCancelled(cancelGen)
+		return freshFinderCancelled(cancelGen) or myEpoch ~= autoEpoch or not autoblockShouldRun()
 	end
 	if isKnownBlocked(plr) then
 		if forFreshFinder then
@@ -1644,6 +1685,20 @@ runAutoBlockSequence = function(plr)
 		elseif enabled and not hopInProgress() then
 			setStatus('watching')
 		end
+		-- After one block finishes, arm the next stranger (avoids multi-target race drop).
+		task.defer(function()
+			if not autoblockShouldRun() or autoBusy or hopInProgress() then
+				return
+			end
+			for _, other in ipairs(Players:GetPlayers()) do
+				if other ~= LocalPlayer and not isOwnAlt(other) and not isKnownBlocked(other) then
+					if not autoTimers[other.UserId] then
+						startAutoTimer(other, 0, { silent = true })
+						break
+					end
+				end
+			end
+		end)
 	end)
 end
 
@@ -1699,9 +1754,21 @@ local function startAutoTimer(plr, waitSec, opts)
 		end
 		setStatus('blocking now · ' .. rec.name)
 		task.spawn(function()
-			local spin = os.clock() + 20
+			local spin = os.clock() + 45
+			-- Always wait for an in-flight block to finish (prevents multi-target race drop).
+			while os.clock() < spin do
+				if rec.cancelled or autoTimers[userId] ~= rec or epoch ~= autoEpoch then
+					return
+				end
+				if not autoBusy then
+					break
+				end
+				task.wait(0.15)
+			end
+			-- Tiny stagger by userId so two ready timers don't claim at the same frame.
+			task.wait(0.05 + (math.abs(userId) % 7) * 0.03)
 			while autoBusy and os.clock() < spin do
-				if rec.cancelled or autoTimers[userId] ~= rec then
+				if rec.cancelled or autoTimers[userId] ~= rec or epoch ~= autoEpoch then
 					return
 				end
 				task.wait(0.15)
@@ -1827,6 +1894,7 @@ end
 
 local function armPresent(waitSec)
 	if not autoblockShouldRun() then
+		say('arm skipped — autoblock not enabled')
 		return
 	end
 	if hopInProgress() and game.PlaceId == F1_PLACE then
@@ -1841,6 +1909,7 @@ local function armPresent(waitSec)
 	end
 	local armed = 0
 	local skipped = 0
+	local names = {}
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if plr ~= LocalPlayer and not isOwnAlt(plr) then
 			if isKnownBlocked(plr) then
@@ -1848,8 +1917,16 @@ local function armPresent(waitSec)
 			else
 				startAutoTimer(plr, waitSec, { silent = waitSec <= 0.05 })
 				armed += 1
+				names[#names + 1] = tostring(plr.DisplayName or plr.Name)
 			end
 		end
+	end
+	if armed > 0 then
+		say(('armed %d — %s'):format(armed, table.concat(names, ', ')))
+	elseif skipped > 0 then
+		say(('arm: %d already known blocked'):format(skipped))
+	else
+		say('arm: no strangers in this server')
 	end
 	-- Fresh finder: everyone here is already blocked → hop same floor (not when empty).
 	if armed == 0 and freshFinderActive() then
@@ -1943,9 +2020,15 @@ setAutoBlockEnabled = function(on, silent, opts)
 	on = on == true
 	autoEpoch += 1
 	enabled = on
-	getgenv().SB2AutoBlockWanted = on or freshFinderActive()
-	if opts.userChoice == true then
-		getgenv().SB2AutoBlockUserWanted = on
+	if on then
+		getgenv().SB2AutoBlockWanted = true
+		if opts.userChoice == true then
+			getgenv().SB2AutoBlockUserWanted = true
+		end
+	else
+		-- Hard off — clear every sticky flag so nothing re-arms block.
+		getgenv().SB2AutoBlockWanted = freshFinderActive() == true
+		getgenv().SB2AutoBlockUserWanted = false
 	end
 	if opts.persist ~= false then
 		writeFile(on)
@@ -1965,6 +2048,12 @@ setAutoBlockEnabled = function(on, silent, opts)
 		end
 	else
 		cancelAllAutoTimers()
+		disconnectAll()
+		getgenv().SB2AutoBlockPresenceWatch = false
+		getgenv().SB2AutoBlockJoinConn = nil
+		getgenv().SB2AutoBlockLeaveConn = nil
+		getgenv().SB2AutoBlockBusy = false
+		autoBusy = false
 		getgenv().SB2AutoBlockHopping = nil
 		writeHop({ active = false, phase = 'off' })
 		setStatus('off')

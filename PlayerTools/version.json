@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.5",
+    "version":  "1.0.6",
     "message":  "bootstrap skip same-version; fresh finder current floor only",
     "files":  [
                   "PlayerTools/launch.lua",

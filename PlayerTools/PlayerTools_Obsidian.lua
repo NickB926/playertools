@@ -330,7 +330,13 @@ local OWN_ALT_NAMES = {
 	sb2butonlytrading = true,
 	['62qx'] = true,
 }
-local OWN_ALT_USERIDS = {} -- filled as matching names are seen (survives display-name changes)
+local OWN_ALT_USERIDS = {
+	[105008790] = true, -- NickB926
+	[5629930206] = true, -- NickB910
+	[58534583] = true, -- NickB925
+	[2948744565] = true, -- NickB929
+	[1781632332] = true, -- dyildolover (Roblox renamed → roblox_user_*)
+}
 local function normalizeAltKey(raw)
 	local s = string.lower(tostring(raw or ''))
 	s = s:gsub('%s+', ''):gsub('[^%w_%-]', '')
@@ -355,6 +361,10 @@ local function isOwnAlt(plr)
 	local extras = rawget(getgenv(), 'SB2OwnAltNames')
 	local name = normalizeAltKey(plr.Name)
 	local display = normalizeAltKey(plr.DisplayName)
+	local stubId = name:match('^roblox_user_(%d+)$')
+	if stubId and OWN_ALT_USERIDS[tonumber(stubId)] then
+		return true
+	end
 	local hit = OWN_ALT_NAMES[name] == true
 		or OWN_ALT_NAMES[display] == true
 		or (type(extras) == 'table' and (extras[name] == true or extras[display] == true))
@@ -6381,6 +6391,7 @@ local ok, err = pcall(function()
 			'Vyroth, The Frostflame',
 			'Wa, the Curious',
 			'Warlord',
+			'Hunter',
 			'Wintula the Punisher',
 			'Za, the Eldest',
 		}
@@ -12503,14 +12514,15 @@ local ok, err = pcall(function()
 				on = on == true
 				silent = silent == true
 				getgenv().SB2AutoBlockWanted = on
-				if opts.userChoice == true then
-					getgenv().SB2AutoBlockUserWanted = on
+				-- Always update user intent when syncing from the Solo toggle.
+				if opts.userChoice == true or opts.clearUser == true or on == false then
+					getgenv().SB2AutoBlockUserWanted = on == true
 				end
 				writeAutoblockFile(on)
 				if type(getgenv().SB2SetAutoBlock) == 'function' then
 					pcall(getgenv().SB2SetAutoBlock, on, true, {
 						persist = true,
-						userChoice = opts.userChoice == true,
+						userChoice = true,
 						armPresent = on == true,
 					})
 				elseif on and not silent then
@@ -13209,6 +13221,420 @@ local ok, err = pcall(function()
 			end
 			Library:Notify(('Waypoints: %d'):format(math.max(0, #names - 1)))
 		end)
+
+		-- Multi-boss waypoint route (F12: warlord → hunter → limor → radioactive).
+		-- Kill each, then wait at the first-killed boss for respawn (~90s) to sync the loop.
+		-- Own IIFE: bare do/end still burns the Combat/Solo 200-local budget.
+		;(function()
+			local BOSS_ROUTE_RESPAWN_SEC = 90
+			local bossRouteToken = 0
+			local bossRouteLabel = SoloBox:AddLabel('Boss WP route: off')
+
+			local function paintBossRoute(text)
+				pcall(function()
+					if bossRouteLabel.SetText then
+						bossRouteLabel:SetText(tostring(text))
+					elseif bossRouteLabel.Text ~= nil then
+						bossRouteLabel.Text = tostring(text)
+					end
+				end)
+			end
+
+			-- Preferred kill order; waypoint names are matched by substring (your WPs: warlord/hunter/limor/radioactive shit).
+			local BOSS_ROUTE_DEFS = {
+				{ order = 1, keys = { 'warlord' }, hints = { 'Warlord' } },
+				{ order = 2, keys = { 'hunter' }, hints = { 'Hunter' } },
+				{ order = 3, keys = { 'limor' }, hints = { 'Limor the Devourer', 'Limor' } },
+				{
+					order = 4,
+					keys = { 'radioactive', 'radio', 'experiment' },
+					hints = { 'Radioactive Experiment' },
+				},
+			}
+
+			local function wpKeyHit(wpName, keys)
+				local n = string.lower(tostring(wpName or ''))
+				for _, k in ipairs(keys) do
+					if n:find(k, 1, true) then
+						return true
+					end
+				end
+				return false
+			end
+
+			local function collectBossRouteStops()
+				local found = {}
+				local names = listSoloWaypoints()
+				for _, wpName in ipairs(names) do
+					if wpName ~= WP_NONE and findSoloWaypointRec(wpName) then
+						for _, def in ipairs(BOSS_ROUTE_DEFS) do
+							if wpKeyHit(wpName, def.keys) and not found[def.order] then
+								found[def.order] = {
+									order = def.order,
+									wpName = wpName,
+									hints = def.hints,
+								}
+								break
+							end
+						end
+					end
+				end
+				local stops = {}
+				for i = 1, #BOSS_ROUTE_DEFS do
+					if found[i] then
+						stops[#stops + 1] = found[i]
+					end
+				end
+				return stops
+			end
+
+			local function mobMatchesBossHints(mob, hints)
+				if not mob then
+					return false
+				end
+				local raw = string.lower(tostring(mob.Name or ''))
+				local key = normBossKey(mob.Name)
+				for _, h in ipairs(hints) do
+					local hl = string.lower(tostring(h))
+					local hk = normBossKey(h)
+					if raw == hl or key == hk then
+						return true
+					end
+					if #hk >= 4 and (key:find(hk, 1, true) or hk:find(key, 1, true)) then
+						return true
+					end
+					if #hl >= 4 and raw:find(hl, 1, true) then
+						return true
+					end
+				end
+				return false
+			end
+
+			local function findAliveBossForHints(hints)
+				local mobs = workspace:FindFirstChild('Mobs')
+				if not mobs then
+					return nil
+				end
+				for _, mob in ipairs(mobs:GetChildren()) do
+					if mobMatchesBossHints(mob, hints) and not isDeadMob(mob) then
+						return mob
+					end
+				end
+				return nil
+			end
+
+			local function teleportBossRouteWp(wpName)
+				local wp = findSoloWaypointRec(wpName)
+				if not wp then
+					return false, 'missing waypoint'
+				end
+				local setter = getgenv().SB2WaypointsSetSelected
+				if type(setter) == 'function' then
+					pcall(setter, wpName, true)
+				end
+				if Options.SoloResumeWaypoint and type(Options.SoloResumeWaypoint.SetValue) == 'function' then
+					pcall(function()
+						Options.SoloResumeWaypoint:SetValue(wpName)
+					end)
+				end
+				local cf = CFrame.new(tonumber(wp.x) or 0, tonumber(wp.y) or 0, tonumber(wp.z) or 0)
+				return applyCharacterCFrame(cf)
+			end
+
+			local function stopBossRoute(reason)
+				bossRouteToken += 1
+				paintBossRoute(reason and ('Boss WP route: ' .. tostring(reason)) or 'Boss WP route: off')
+			end
+
+			local runBossRouteLoop
+
+			-- Like Resume: toggle stays ON; pause combat/loop while strangers are here.
+			local function pauseBossRouteForStranger(plr)
+				if not isToggleOn('BossWaypointRoute') then
+					return
+				end
+				bossRouteToken += 1
+				setCombatTrio(false)
+				local who = plr and (plr.DisplayName or plr.Name) or 'player'
+				paintBossRoute(('Boss WP route: paused — %s'):format(tostring(who)))
+				Library:Notify(
+					('Boss WP route paused — %s here (resumes when empty)'):format(tostring(who)),
+					6
+				)
+			end
+
+			local function tryResumeBossRoute(reason)
+				if not isToggleOn('BossWaypointRoute') then
+					return
+				end
+				if otherPlayersPresent() == true then
+					paintBossRoute('Boss WP route: paused (waiting for empty)')
+					return
+				end
+				local stops = collectBossRouteStops()
+				if #stops < 2 then
+					paintBossRoute('Boss WP route: need 2+ boss WPs on this floor')
+					return
+				end
+				Library:Notify(('Boss WP route resume — %s'):format(tostring(reason or 'empty')), 4)
+				runBossRouteLoop()
+			end
+
+			local function clearBossRouteWatchers()
+				local joinConn = getgenv().SB2BossRouteJoinConn
+				if joinConn then
+					pcall(function()
+						joinConn:Disconnect()
+					end)
+					getgenv().SB2BossRouteJoinConn = nil
+				end
+				local leaveConn = getgenv().SB2BossRouteLeaveConn
+				if leaveConn then
+					pcall(function()
+						leaveConn:Disconnect()
+					end)
+					getgenv().SB2BossRouteLeaveConn = nil
+				end
+			end
+
+			local function ensureBossRouteWatchers()
+				clearBossRouteWatchers()
+				getgenv().SB2BossRouteJoinConn = Players.PlayerAdded:Connect(function(plr)
+					if not isToggleOn('BossWaypointRoute') then
+						return
+					end
+					if not plr or plr == LocalPlayer or isOwnAlt(plr) then
+						return
+					end
+					pauseBossRouteForStranger(plr)
+				end)
+				getgenv().SB2BossRouteLeaveConn = Players.PlayerRemoving:Connect(function(leaver)
+					if not leaver or leaver == LocalPlayer then
+						return
+					end
+					if not isToggleOn('BossWaypointRoute') then
+						return
+					end
+					-- Leaving alts shouldn't matter; strangers leaving should resume.
+					task.defer(function()
+						task.wait(0.35)
+						if not isToggleOn('BossWaypointRoute') then
+							return
+						end
+						if otherPlayersPresent() then
+							return
+						end
+						tryResumeBossRoute('empty')
+					end)
+				end)
+			end
+
+			runBossRouteLoop = function()
+				bossRouteToken += 1
+				local token = bossRouteToken
+				ensureBossRouteWatchers()
+				task.spawn(function()
+					while token == bossRouteToken and isToggleOn('BossWaypointRoute') do
+						if otherPlayersPresent() == true then
+							local who = nil
+							for _, plr in ipairs(Players:GetPlayers()) do
+								if plr ~= LocalPlayer and not isOwnAlt(plr) then
+									who = plr
+									break
+								end
+							end
+							pauseBossRouteForStranger(who)
+							return
+						end
+						local stops = collectBossRouteStops()
+						if #stops < 2 then
+							paintBossRoute('Boss WP route: need 2+ boss WPs on this floor')
+							Library:Notify('Boss route needs warlord/hunter/limor/radioactive waypoints', 6)
+							task.wait(3)
+							continue
+						end
+
+						local firstKillClock = nil
+						local firstStop = stops[1]
+
+						for i, stop in ipairs(stops) do
+							if token ~= bossRouteToken or not isToggleOn('BossWaypointRoute') then
+								return
+							end
+							if otherPlayersPresent() == true then
+								local who = nil
+								for _, plr in ipairs(Players:GetPlayers()) do
+									if plr ~= LocalPlayer and not isOwnAlt(plr) then
+										who = plr
+										break
+									end
+								end
+								pauseBossRouteForStranger(who)
+								return
+							end
+
+							paintBossRoute(('Boss route [%d/%d] → %s'):format(i, #stops, stop.wpName))
+							local okTp, errTp = teleportBossRouteWp(stop.wpName)
+							if not okTp then
+								Library:Notify(('Boss route TP failed: %s'):format(tostring(errTp)), 5)
+								task.wait(1)
+								continue
+							end
+							setCombatTrio(true)
+							holdCombatAnchor(0.4)
+
+							-- Wait until this boss is alive (spawn / already up).
+							paintBossRoute(('Boss route [%d/%d] waiting %s…'):format(i, #stops, stop.wpName))
+							local mob = nil
+							local spawnDeadline = os.clock() + 150
+							while os.clock() < spawnDeadline
+								and token == bossRouteToken
+								and isToggleOn('BossWaypointRoute')
+							do
+								if otherPlayersPresent() == true then
+									local who = nil
+									for _, plr in ipairs(Players:GetPlayers()) do
+										if plr ~= LocalPlayer and not isOwnAlt(plr) then
+											who = plr
+											break
+										end
+									end
+									pauseBossRouteForStranger(who)
+									return
+								end
+								mob = findAliveBossForHints(stop.hints)
+								if mob then
+									break
+								end
+								task.wait(0.35)
+							end
+							if not mob then
+								paintBossRoute(('Boss route: no %s — skip'):format(stop.wpName))
+								task.wait(0.5)
+								continue
+							end
+
+							paintBossRoute(('Boss route [%d/%d] fighting %s'):format(i, #stops, mob.Name))
+							Library:Notify(('Boss route — %s'):format(tostring(mob.Name)), 4)
+							-- Stay until dead / despawned.
+							while token == bossRouteToken and isToggleOn('BossWaypointRoute') do
+								if otherPlayersPresent() == true then
+									local who = nil
+									for _, plr in ipairs(Players:GetPlayers()) do
+										if plr ~= LocalPlayer and not isOwnAlt(plr) then
+											who = plr
+											break
+										end
+									end
+									pauseBossRouteForStranger(who)
+									return
+								end
+								if not mob or not mob.Parent or isDeadMob(mob) then
+									break
+								end
+								-- Re-acquire if instance swapped.
+								local alive = findAliveBossForHints(stop.hints)
+								if not alive then
+									break
+								end
+								mob = alive
+								task.wait(0.25)
+							end
+
+							local killAt = os.clock()
+							if not firstKillClock then
+								firstKillClock = killAt
+								firstStop = stop
+							end
+							paintBossRoute(('Boss route: killed %s'):format(stop.wpName))
+							task.wait(0.45)
+						end
+
+						if token ~= bossRouteToken or not isToggleOn('BossWaypointRoute') then
+							return
+						end
+
+						-- After the last kill: sit on the first-killed boss pad until its respawn window.
+						if firstKillClock and firstStop then
+							teleportBossRouteWp(firstStop.wpName)
+							setCombatTrio(true)
+							local readyAt = firstKillClock + BOSS_ROUTE_RESPAWN_SEC
+							while token == bossRouteToken and isToggleOn('BossWaypointRoute') do
+								if otherPlayersPresent() == true then
+									local who = nil
+									for _, plr in ipairs(Players:GetPlayers()) do
+										if plr ~= LocalPlayer and not isOwnAlt(plr) then
+											who = plr
+											break
+										end
+									end
+									pauseBossRouteForStranger(who)
+									return
+								end
+								local left = readyAt - os.clock()
+								if left <= 0 or findAliveBossForHints(firstStop.hints) then
+									break
+								end
+								paintBossRoute(
+									('Boss route: wait @ %s — %ds (sync respawn)'):format(
+										firstStop.wpName,
+										math.max(0, math.ceil(left))
+									)
+								)
+								task.wait(0.5)
+							end
+						end
+					end
+					if token == bossRouteToken and not isToggleOn('BossWaypointRoute') then
+						paintBossRoute('Boss WP route: off')
+					end
+				end)
+			end
+
+			SoloBox:AddToggle('BossWaypointRoute', {
+				Text = 'Boss WP route (multi)',
+				Default = false,
+				Tooltip = 'Cycles floor boss waypoints (warlord→hunter→limor→radioactive). Next WP only after kill. After last kill, waits ~90s at the first-killed boss. Like Resume: pauses if a non-alt joins, resumes when empty.',
+			}):OnChanged(function(on)
+				if on then
+					local stops = collectBossRouteStops()
+					if #stops < 2 then
+						Library:Notify('Need 2+ boss waypoints on this floor (warlord/hunter/limor/radioactive)', 7)
+						task.defer(function()
+							if Toggles.BossWaypointRoute then
+								Toggles.BossWaypointRoute:SetValue(false)
+							end
+						end)
+						return
+					end
+					ensureBossRouteWatchers()
+					if otherPlayersPresent() == true then
+						-- Same as Resume: stay ON, wait for empty.
+						paintBossRoute('Boss WP route: paused (waiting for empty)')
+						Library:Notify('Boss WP route on — paused until only you/alts remain', 5)
+						return
+					end
+					Library:Notify(('Boss WP route on — %d stops'):format(#stops), 5)
+					runBossRouteLoop()
+				else
+					stopBossRoute('off')
+					clearBossRouteWatchers()
+					-- Don't kill combat if Resume still wants the trio armed.
+					if not isToggleOn('SoloCombatResume') then
+						setCombatTrio(false)
+					end
+				end
+			end)
+			getgenv().SB2StopBossWaypointRoute = function(reason)
+				stopBossRoute(reason)
+				clearBossRouteWatchers()
+				pcall(function()
+					if Toggles.BossWaypointRoute and Toggles.BossWaypointRoute.Value == true then
+						Toggles.BossWaypointRoute:SetValue(false)
+					end
+				end)
+			end
+		end)()
 
 		getgenv().SB2OnWaypointSelected = function(name)
 			if not Options.SoloResumeWaypoint then
