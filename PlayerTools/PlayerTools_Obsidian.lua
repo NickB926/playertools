@@ -13634,6 +13634,22 @@ local ok, err = pcall(function()
 					end
 				end)
 			end
+			-- HiveMind / MCP can't see Starlight's local Toggles — use this helper.
+			getgenv().SB2SetBossWaypointRoute = function(enabled)
+				local toggle = Toggles.BossWaypointRoute
+				if type(toggle) ~= 'table' or type(toggle.SetValue) ~= 'function' then
+					return false
+				end
+				enabled = enabled == true
+				pcall(function()
+					if toggle.Value == enabled then
+						toggle:SetValue(not enabled)
+						task.wait()
+					end
+					toggle:SetValue(enabled)
+				end)
+				return true
+			end
 		end)()
 
 		getgenv().SB2OnWaypointSelected = function(name)
@@ -17049,6 +17065,7 @@ local ok, err = pcall(function()
 				and type(existing.start) == 'function'
 				and type(existing.isAlive) == 'function'
 				and existing.isAlive()
+				and existing._orderRev == 4
 			then
 				return existing
 			end
@@ -17319,6 +17336,38 @@ local ok, err = pcall(function()
 					end
 				end)
 				Hive.issue('solo_resume', {})
+				refreshHiveLabels()
+			end)
+			OrdersBox:AddButton('Boss WP route ON (all clients)', function()
+				pcall(function()
+					if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
+						getgenv().SB2SetBossWaypointRoute(true)
+					else
+						local t = Toggles.BossWaypointRoute
+						if type(t) == 'table' and type(t.SetValue) == 'function' then
+							if t.Value == true then
+								t:SetValue(false)
+								task.wait()
+							end
+							t:SetValue(true)
+						end
+					end
+				end)
+				Hive.issue('boss_route_on', {})
+				refreshHiveLabels()
+			end)
+			OrdersBox:AddButton('Boss WP route OFF (all clients)', function()
+				pcall(function()
+					if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
+						getgenv().SB2SetBossWaypointRoute(false)
+					else
+						local t = Toggles.BossWaypointRoute
+						if type(t) == 'table' and type(t.SetValue) == 'function' and t.Value ~= false then
+							t:SetValue(false)
+						end
+					end
+				end)
+				Hive.issue('boss_route_off', {})
 				refreshHiveLabels()
 			end)
 

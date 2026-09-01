@@ -14,7 +14,7 @@
 	  worker    — executes orders
 	  idle      — heartbeat only
 
-	Orders: stop | follow | stack | rally | combat_on | combat_off | solo_resume | deposit_crystals | dump_items
+	Orders: stop | follow | stack | rally | combat_on | combat_off | solo_resume | boss_route_on | boss_route_off | deposit_crystals | dump_items
 
 	Usage from PlayerTools (or alone):
 	  local Hive = loadstring(readfile('PlayerTools/HiveMind.lua'))()
@@ -138,6 +138,7 @@ Hive = {
 	_tributeWebhookUrl = '',
 	_tributeWebhookOn = false,
 	_tributePing = '', -- each user sets their own Discord snowflake; never hardcode
+	_orderRev = 4, -- bump when order handlers change so soft reload re-loadstrings HiveMind
 }
 getgenv().SB2Hive = Hive
 
@@ -268,13 +269,31 @@ local function crystalCounts()
 	return out
 end
 
+local function resolveToggles()
+	-- Starlight keeps toggles on Library.Toggles only — global `Toggles` is often nil
+	-- in separately loadstring'd modules like this one.
+	local t = rawget(_G, 'Toggles')
+	if type(t) == 'table' and (t.BossWaypointRoute or t.SoloCombatResume or t.AutoAttack or next(t) ~= nil) then
+		return t
+	end
+	local L = rawget(_G, 'Library')
+	if type(L) ~= 'table' then
+		L = getgenv().SB2Library or getgenv().Library
+	end
+	if type(L) == 'table' and type(L.Toggles) == 'table' then
+		return L.Toggles
+	end
+	return type(t) == 'table' and t or nil
+end
+
 local function setCombatToggles(attack, skill)
+	local toggles = resolveToggles()
 	pcall(function()
-		if Toggles and Toggles.AutoAttack and type(attack) == 'boolean' then
-			Toggles.AutoAttack:SetValue(attack)
+		if toggles and toggles.AutoAttack and type(attack) == 'boolean' then
+			toggles.AutoAttack:SetValue(attack)
 		end
-		if Toggles and Toggles.AutoSkill and type(skill) == 'boolean' then
-			Toggles.AutoSkill:SetValue(skill)
+		if toggles and toggles.AutoSkill and type(skill) == 'boolean' then
+			toggles.AutoSkill:SetValue(skill)
 		end
 	end)
 end
@@ -2349,8 +2368,9 @@ local function handleOrder(order)
 
 	local t = order.type
 	-- The selected commander is the TP target — they do not run most worker orders.
-	-- solo_resume applies to every hive client including the commander.
-	if tonumber(order.commanderId) == USER_ID and t ~= 'solo_resume' then
+	-- These apply to every hive client including the commander.
+	local allClients = t == 'solo_resume' or t == 'boss_route_on' or t == 'boss_route_off'
+	if tonumber(order.commanderId) == USER_ID and not allClients then
 		-- Still arm trade accept when workers are dumping to us.
 		if t == 'dump_items' or t == 'deposit_crystals' then
 			Hive._acceptHiveTrades = true
@@ -2359,6 +2379,32 @@ local function handleOrder(order)
 			notify('Workers dumping — accepting hive trades')
 		end
 		return
+	end
+
+	local function setBossRouteToggle(on)
+		local okSet = false
+		pcall(function()
+			if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
+				okSet = getgenv().SB2SetBossWaypointRoute(on == true) == true
+			end
+		end)
+		if okSet then
+			return true
+		end
+		pcall(function()
+			local toggles = resolveToggles()
+			local toggle = toggles and toggles.BossWaypointRoute
+			if type(toggle) == 'table' and type(toggle.SetValue) == 'function' then
+				if toggle.Value == on then
+					-- Force OnChanged so a stuck-on/off still restarts or clears.
+					toggle:SetValue(not on)
+					task.wait()
+				end
+				toggle:SetValue(on == true)
+				okSet = true
+			end
+		end)
+		return okSet
 	end
 
 	if t == 'stop' then
@@ -2392,12 +2438,22 @@ local function handleOrder(order)
 			if type(getgenv().SB2SetSoloResume) == 'function' then
 				okSet = getgenv().SB2SetSoloResume(true) == true
 			end
-			if not okSet and Toggles and Toggles.SoloCombatResume and type(Toggles.SoloCombatResume.SetValue) == 'function' then
-				Toggles.SoloCombatResume:SetValue(true)
-				okSet = true
+			if not okSet then
+				local toggles = resolveToggles()
+				local resume = toggles and toggles.SoloCombatResume
+				if type(resume) == 'table' and type(resume.SetValue) == 'function' then
+					resume:SetValue(true)
+					okSet = true
+				end
 			end
 		end)
 		notify(okSet and 'Order: resume on' or 'Order: resume missing toggle')
+	elseif t == 'boss_route_on' then
+		local okSet = setBossRouteToggle(true)
+		notify(okSet and 'Order: boss route on' or 'Order: boss route missing toggle')
+	elseif t == 'boss_route_off' then
+		local okSet = setBossRouteToggle(false)
+		notify(okSet and 'Order: boss route off' or 'Order: boss route missing toggle')
 	elseif t == 'deposit_crystals' then
 		depositCrystals(order)
 	elseif t == 'dump_items' then
@@ -2796,6 +2852,20 @@ local function inventoryInstanceId(item)
 	return item:GetFullName()
 end
 
+local function readLocalTestPing()
+	-- Machine-local only (PlayerTools/hive/LOCAL_TEST_PING). Never shipped in version.json.
+	-- Lets your Potassium testing copy default <@you> without baking an ID into published HiveMind.
+	local path = HIVE_DIR .. '/LOCAL_TEST_PING'
+	if type(isfile) ~= 'function' or not isfile(path) then
+		return ''
+	end
+	local ok, body = pcall(readfile, path)
+	if not ok or type(body) ~= 'string' then
+		return ''
+	end
+	return tostring(body):gsub('%D', '')
+end
+
 local function writeTributeWebhookConfig(url, enabled, ping)
 	ensureDirs()
 	writeJson(tributeWebhookPath(), {
@@ -2815,13 +2885,17 @@ local function readTributeWebhookConfig()
 		local url = type(data.url) == 'string' and data.url or ''
 		local on = data.enabled == true
 		local ping = type(data.ping) == 'string' and data.ping:gsub('%D', '') or ''
+		if ping == '' then
+			ping = readLocalTestPing()
+		end
 		return url, on, ping
 	end
 	-- Legacy shared hive/tribute_webhook.json — migrate once.
 	-- Never reuse another account's Discord ping (friend must not get Nick's <@id>).
 	local legacy = readJson(TRIBUTE_WEBHOOK_PATH)
 	if type(legacy) ~= 'table' then
-		return '', false, ''
+		local localPing = readLocalTestPing()
+		return '', false, localPing
 	end
 	local url = type(legacy.url) == 'string' and legacy.url or ''
 	local on = legacy.enabled == true
@@ -2829,6 +2903,9 @@ local function readTributeWebhookConfig()
 	local legacyOwner = tonumber(legacy.userId)
 	if legacyOwner and legacyOwner == tonumber(USER_ID) and type(legacy.ping) == 'string' then
 		ping = legacy.ping:gsub('%D', '')
+	end
+	if ping == '' then
+		ping = readLocalTestPing()
 	end
 	-- Persist per-account immediately so later logins don't keep reading the shared file.
 	if url ~= '' or on then
