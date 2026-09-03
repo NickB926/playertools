@@ -1,69 +1,62 @@
 --[[
-  Switch PlayerTools to Obsidian and load it — Potassium Execute:
-    loadstring(readfile('PlayerTools/use_obsidian.lua'))()
+  use_obsidian.lua — pin backend to Obsidian UI and force a full rebuild
 ]]
-print('[use_obsidian] switching backend to Obsidian')
+if type(makefolder) == 'function' and type(isfolder) == 'function' then
+	if not isfolder('PlayerTools') then
+		pcall(makefolder, 'PlayerTools')
+	end
+end
+if type(writefile) == 'function' then
+	writefile('PlayerTools/backend', 'obsidian')
+end
 
 local g = getgenv()
+g.SB2UseAtaraxiaLib = nil
 
-pcall(function()
-	if g.SB2HookWatchdogConn then
-		g.SB2HookWatchdogConn:Disconnect()
-	end
-end)
-g.SB2HookWatchdogConn = nil
-
-if type(g.SB2TeardownStarlightLeaks) == 'function' then
-	pcall(g.SB2TeardownStarlightLeaks)
-elseif type(g.SB2ScrubAllLeakedHooks) == 'function' then
-	pcall(g.SB2ScrubAllLeakedHooks)
-end
-
-if type(g.SB2StarlightLib) == 'table' then
+local lib = g.SB2PlayerToolsLibrary
+if type(lib) == 'table' and type(lib.Unload) == 'function' then
 	pcall(function()
-		g.SB2StarlightLib:Destroy()
+		lib:Unload()
 	end)
 end
-g.SB2StarlightLib = nil
-g.SB2StarlightAdapterSource = nil
-g.SB2PlayerTools = false
-g.SB2RefreshPlayerTools = nil
-g.SB2PlayerToolsGui = nil
-g.SB2PlayerToolsLibrary = nil
-g.SB2PlayerToolsBackend = nil
 
-local function destroyStarlightGui(parent)
-	if not parent then
+local function nuke(root)
+	if not root then
 		return
 	end
-	for _, child in ipairs(parent:GetChildren()) do
-		if child:IsA('ScreenGui') then
-			if child:GetAttribute('SB2StarlightPlayerTools') == true
-				or child.Name == 'Starlight Interface Suite'
-				or child.Name == 'Starlight'
-				or (child:FindFirstChild('MainWindow') and child.MainWindow:FindFirstChild('Sidebar'))
+	for _, gui in ipairs(root:GetChildren()) do
+		if gui:IsA('ScreenGui') then
+			local n = gui.Name
+			if n == 'SB2PlayerTools'
+				or n == 'Ataraxia'
+				or n == 'AtaraxiaLab'
+				or n == 'RosterLab'
+				or gui:GetAttribute('SB2PlayerTools') == true
 			then
 				pcall(function()
-					child:Destroy()
+					gui:Destroy()
 				end)
 			end
 		end
 	end
 end
-
-destroyStarlightGui(game:GetService('CoreGui'))
-destroyStarlightGui(game:GetService('CoreGui'):FindFirstChild('RobloxGui'))
-if type(gethui) == 'function' then
-	pcall(function()
-		destroyStarlightGui(gethui())
-	end)
-end
 local lp = game:GetService('Players').LocalPlayer
-destroyStarlightGui(lp and lp:FindFirstChild('PlayerGui'))
-
-if type(writefile) == 'function' then
-	pcall(writefile, 'PlayerTools/backend', 'obsidian')
+nuke(lp and lp:FindFirstChild('PlayerGui'))
+nuke(game:GetService('CoreGui'))
+if gethui then
+	local ok, h = pcall(gethui)
+	if ok then
+		nuke(h)
+	end
 end
 
+g.SB2PlayerTools = false
+g.SB2PlayerToolsGui = nil
+g.SB2RefreshPlayerTools = nil
+g.SB2PlayerToolsLibrary = nil
+g.SB2PlayerToolsLoading = false
+g.SB2PlayerToolsLoadingSince = nil
 g.SB2AllowObsidianFallback = true
-loadstring(readfile('PlayerTools/launch.lua'))()
+
+warn('[PlayerTools] backend=obsidian — full rebuild')
+loadstring(readfile('PlayerTools/PlayerTools.lua'))()

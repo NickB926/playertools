@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.8",
+    "version":  "1.0.9",
     "message":  "bootstrap skip same-version; fresh finder current floor only",
     "files":  [
                   "PlayerTools/launch.lua",
@@ -11,6 +11,7 @@
                   "PlayerTools/PlayerTools_Starlight.lua",
                   "PlayerTools/PlayerTools_event_dive.lua",
                   "PlayerTools/StarlightAdapter.lua",
+                  "PlayerTools/AtaraxiaLibrary.lua",
                   "PlayerTools/TagWiki.lua",
                   "PlayerTools/Titling.lua",
                   "PlayerTools/PillDock.lua",
@@ -26,6 +27,7 @@
                   "PlayerTools/StuckLoadRejoin.iy",
                   "PlayerTools/AutoHideIY.iy",
                   "PlayerTools/use_obsidian.lua",
+                  "PlayerTools/use_ataraxia.lua",
                   "PlayerTools/version.json"
               ]
 }

@@ -14,7 +14,7 @@
 	  worker    — executes orders
 	  idle      — heartbeat only
 
-	Orders: stop | follow | stack | rally | combat_on | combat_off | solo_resume | boss_route_on | boss_route_off | hide_menu | deposit_crystals | dump_items
+	Orders: stop | follow | stack | rally | combat_on | combat_off | solo_resume | solo_resume_off | boss_route_on | boss_route_off | hide_menu | deposit_crystals | dump_items
 
 	Usage from PlayerTools (or alone):
 	  local Hive = loadstring(readfile('PlayerTools/HiveMind.lua'))()
@@ -2369,7 +2369,11 @@ local function handleOrder(order)
 	local t = order.type
 	-- The selected commander is the TP target — they do not run most worker orders.
 	-- These apply to every hive client including the commander.
-	local allClients = t == 'solo_resume' or t == 'boss_route_on' or t == 'boss_route_off' or t == 'hide_menu'
+	local allClients = t == 'solo_resume'
+		or t == 'solo_resume_off'
+		or t == 'boss_route_on'
+		or t == 'boss_route_off'
+		or t == 'hide_menu'
 	if tonumber(order.commanderId) == USER_ID and not allClients then
 		-- Still arm trade accept when workers are dumping to us.
 		if t == 'dump_items' or t == 'deposit_crystals' then
@@ -2441,22 +2445,35 @@ local function handleOrder(order)
 			Hive.status = 'idle'
 		end
 		notify('Order: combat off')
-	elseif t == 'solo_resume' then
+	elseif t == 'solo_resume' or t == 'solo_resume_off' then
+		local payload = type(order.payload) == 'table' and order.payload or {}
+		local on = true
+		if t == 'solo_resume_off' then
+			on = false
+		elseif payload.on ~= nil then
+			on = payload.on == true
+		elseif payload.enabled ~= nil then
+			on = payload.enabled == true
+		end
 		local okSet = false
 		pcall(function()
 			if type(getgenv().SB2SetSoloResume) == 'function' then
-				okSet = getgenv().SB2SetSoloResume(true) == true
+				okSet = getgenv().SB2SetSoloResume(on) == true
 			end
 			if not okSet then
 				local toggles = resolveToggles()
 				local resume = toggles and toggles.SoloCombatResume
 				if type(resume) == 'table' and type(resume.SetValue) == 'function' then
-					resume:SetValue(true)
+					if resume.Value == on then
+						resume:SetValue(not on)
+						task.wait()
+					end
+					resume:SetValue(on)
 					okSet = true
 				end
 			end
 		end)
-		notify(okSet and 'Order: resume on' or 'Order: resume missing toggle')
+		notify(okSet and (on and 'Order: resume on' or 'Order: resume off') or 'Order: resume missing toggle')
 	elseif t == 'boss_route_on' then
 		local okSet = setBossRouteToggle(true)
 		notify(okSet and 'Order: boss route on' or 'Order: boss route missing toggle')

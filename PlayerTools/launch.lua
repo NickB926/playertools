@@ -6,7 +6,8 @@
 	KeepPlayerTools.iy teleport stub, AutoBlock.iy and init.lua.
 
 	Backend is chosen by PlayerTools/backend:
-	    "obsidian" / missing / anything else -> PlayerTools_Obsidian.lua (Ataraxia default)
+	    missing / empty / "ataraxia" -> PlayerTools_Obsidian.lua + AtaraxiaLibrary.lua (Roster chrome)
+	    "obsidian" -> PlayerTools_Obsidian.lua (Obsidian UI)
 	    "starlight" -> PlayerTools_Starlight.lua
 
 	PlayerTools.lua itself is a thin shim that always calls this file.
@@ -329,19 +330,28 @@ local function exists(path)
 end
 
 local function wantedBackend()
-	-- Default Ataraxia/Obsidian. Only use Starlight when backend file says so.
+	-- Default Ataraxia (Roster chrome). File still overrides: obsidian / starlight / ataraxia.
 	if not exists(BACKEND_FILE) then
-		return 'obsidian'
+		return 'ataraxia'
 	end
 	local ok, body = pcall(readfile, BACKEND_FILE)
 	if not ok then
-		return 'obsidian'
+		return 'ataraxia'
 	end
 	local v = (tostring(body):lower():gsub('%s', ''))
+	if v == '' then
+		return 'ataraxia'
+	end
 	if v == 'starlight' then
 		return 'starlight'
 	end
-	return 'obsidian'
+	if v == 'ataraxia' then
+		return 'ataraxia'
+	end
+	if v == 'obsidian' then
+		return 'obsidian'
+	end
+	return 'ataraxia'
 end
 
 local function run(path)
@@ -429,6 +439,22 @@ end
 
 local requested = wantedBackend()
 local reason
+
+if requested == 'ataraxia' then
+	getgenv().SB2UseAtaraxiaLib = true
+	for _, path in ipairs(OBSIDIAN_PATHS) do
+		if exists(path) then
+			record('ataraxia', 'PlayerTools/backend requests ataraxia chrome')
+			hideRobloxChat()
+			ensureGameChatVisible()
+			warn('[PlayerTools] launching Ataraxia chrome (full PlayerTools port test)')
+			return run(path)
+		end
+	end
+	error('[PlayerTools] ataraxia backend needs PlayerTools_Obsidian.lua + AtaraxiaLibrary.lua')
+end
+
+getgenv().SB2UseAtaraxiaLib = nil
 
 local starlightPath
 for _, path in ipairs(STARLIGHT_PATHS) do

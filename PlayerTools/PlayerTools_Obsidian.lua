@@ -30,15 +30,16 @@
     Inventory / Items / HiveMind already use own function scopes; new tabs too.
 ]]
 
--- Direct execution of this file loads Obsidian's Library.lua. When backend is Starlight,
--- PlayerTools_Starlight.lua must patch in StarlightAdapter first — use launch.lua.
+-- Direct execution of this file loads Obsidian's Library.lua (or AtaraxiaLibrary).
+-- When backend is Starlight, PlayerTools_Starlight.lua must patch in StarlightAdapter first — use launch.lua.
 do
 	local g = getgenv()
-	if not g.SB2AllowObsidianFallback and not g.SB2StarlightAdapterSource then
+	if not g.SB2AllowObsidianFallback and not g.SB2StarlightAdapterSource and not g.SB2UseAtaraxiaLib then
 		local backendPath = 'PlayerTools/backend'
 		if type(isfile) == 'function' and isfile(backendPath) and type(readfile) == 'function' then
 			local ok, body = pcall(readfile, backendPath)
-			if ok and tostring(body):lower():gsub('%s', '') ~= 'obsidian' then
+			local v = ok and tostring(body):lower():gsub('%s', '') or 'obsidian'
+			if v ~= 'obsidian' and v ~= 'ataraxia' then
 				error(
 					'[PlayerTools] backend is Starlight — run PlayerTools/launch.lua (not PlayerTools_Obsidian.lua directly)',
 					0
@@ -2348,6 +2349,31 @@ local ok, err = pcall(function()
 	end
 
 	local okLib, librarySource = pcall(httpGet, CONFIG.UIRepo .. 'Library.lua')
+	-- Ataraxia chrome test: use local Obsidian-compatible Roster UI instead of Obsidian.
+	do
+		local wantAtaraxia = getgenv().SB2UseAtaraxiaLib == true
+		if not wantAtaraxia and type(isfile) == 'function' and type(readfile) == 'function' then
+			local okB, body = pcall(readfile, 'PlayerTools/backend')
+			if okB and tostring(body):lower():gsub('%s', '') == 'ataraxia' then
+				wantAtaraxia = true
+			end
+		end
+		if wantAtaraxia then
+			local ataPath = 'PlayerTools/AtaraxiaLibrary.lua'
+			if type(isfile) == 'function' and isfile(ataPath) then
+				local okA, ataSrc = pcall(readfile, ataPath)
+				if okA and type(ataSrc) == 'string' and #ataSrc > 500 and ataSrc:find('CreateWindow', 1, true) then
+					librarySource = ataSrc
+					okLib = true
+					warn('[PlayerTools] using AtaraxiaLibrary (custom chrome)')
+				else
+					warn('[PlayerTools] AtaraxiaLibrary missing/invalid — falling back to Obsidian')
+				end
+			else
+				warn('[PlayerTools] AtaraxiaLibrary.lua not found — falling back to Obsidian')
+			end
+		end
+	end
 	if not okLib or type(librarySource) ~= 'string' or librarySource == '' then
 		local cached = readLibCache()
 		if not cached then
@@ -2356,7 +2382,12 @@ local ok, err = pcall(function()
 		librarySource = cached
 		warn('[PlayerTools] Obsidian HttpGet failed — using cached Library.lua')
 	else
-		writeLibCache(librarySource)
+		-- Don't overwrite Obsidian cache with Ataraxia source
+		if not tostring(librarySource):find('AtaraxiaLibrary', 1, true)
+			and not tostring(librarySource):find("Backend = 'Ataraxia'", 1, true)
+		then
+			writeLibCache(librarySource)
+		end
 	end
 
 	local deadLucide =
@@ -3024,16 +3055,23 @@ local ok, err = pcall(function()
 		Library.OriginalMinSize = minSize
 		Library.MinSize = minSize * (Library.DPIScale or 1)
 	end)
-	-- Re-apply size in case CreateWindow snapped up to the old 480×360 floor.
-	-- Starlight needs its adapter-computed width (~900px); Obsidian's 300×260 breaks labels.
 	pcall(function()
+		local main = Library.ScreenGui and Library.ScreenGui:FindFirstChild('Main')
+		if not main then
+			return
+		end
+		if Library.Backend == 'Ataraxia' then
+			local w = math.max(880, windowSize.X.Offset)
+			local h = math.max(560, windowSize.Y.Offset)
+			main.Size = UDim2.fromOffset(w, h)
+			Library.MinSize = Vector2.new(880, 560)
+			Library.OriginalMinSize = Library.MinSize
+			return
+		end
 		if Library.Backend == 'Starlight' then
 			return
 		end
-		local main = Library.ScreenGui and Library.ScreenGui:FindFirstChild('Main')
-		if main then
-			main.Size = windowSize
-		end
+		main.Size = windowSize
 	end)
 	-- Kill any cursor frames already created before the flag applied.
 	pcall(function()
@@ -3161,15 +3199,37 @@ local ok, err = pcall(function()
 	getgenv().SB2ForceShowPlayerTools = forceShowWindow
 
 	-- Same as pressing the menu keybind (Home): hide UI, do not Unload.
+	-- DEV copy only: NickB926 keeps the menu; alts still hide.
+	local function isDevCopy()
+		if type(isfile) ~= 'function' then
+			return false
+		end
+		local ok, exists = pcall(isfile, 'PlayerTools/_dev_copy')
+		return ok and exists == true
+	end
+	local function isMainDevClient()
+		local lp = LocalPlayer
+		if not lp then
+			return false
+		end
+		if tonumber(lp.UserId) == 105008790 then
+			return true
+		end
+		return string.lower(tostring(lp.Name or '')) == 'nickb926'
+	end
+	getgenv().SB2IsDevCopy = isDevCopy
+	getgenv().SB2IsMainDevClient = isMainDevClient
+
 	getgenv().SB2HidePlayerToolsMenu = function()
+		if isDevCopy() and isMainDevClient() then
+			return
+		end
 		getgenv().SB2MenuWantOpen = false
 		getgenv().SB2MenuPinGen = (tonumber(getgenv().SB2MenuPinGen) or 0) + 1
-		local gui = Library.ScreenGui or getgenv().SB2PlayerToolsGui
-		local main = gui and gui:FindFirstChild('Main')
-		local open = (main and main.Visible == true) or Library.Toggled == true
-		if open and type(Library.Toggle) == 'function' then
+		-- Prefer forced close so Ataraxia shows the Tap-to-show pill.
+		if type(Library.Toggle) == 'function' then
 			pcall(function()
-				Library:Toggle()
+				Library:Toggle(false)
 			end)
 		end
 		getgenv().SB2MenuWantOpen = false
@@ -3179,39 +3239,77 @@ local ok, err = pcall(function()
 				Library.Open = false
 			end
 		end)
+		local gui = Library.ScreenGui or getgenv().SB2PlayerToolsGui
+		local main = gui and gui:FindFirstChild('Main')
 		if main then
 			main.Visible = false
+		end
+		local pill = gui and gui:FindFirstChild('ShowPill')
+		if pill then
+			pill.Visible = true
 		end
 	end
 
 	local HIDE_MENU_FILE = joinPath(CONFIG.ConfigFolder, '_hide_menu')
+	local HIDE_MENU_FILE_ALT = 'PlayerTools/_hide_menu'
 	local TILE_NOW_FILE = joinPath(CONFIG.ConfigFolder, '_tile_now')
 	getgenv().SB2HideMenuLast = getgenv().SB2HideMenuLast or ''
-	if not getgenv().SB2HideMenuPoller then
-		getgenv().SB2HideMenuPoller = true
-		task.spawn(function()
-			while getgenv()[CONFIG.GenvKey] do
-				if type(isfile) == 'function' and isfile(HIDE_MENU_FILE) and type(readfile) == 'function' then
-					local ok, body = pcall(readfile, HIDE_MENU_FILE)
-					if ok and type(body) == 'string' and body ~= '' and body ~= getgenv().SB2HideMenuLast then
-						getgenv().SB2HideMenuLast = body
-						if type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
-							pcall(getgenv().SB2HidePlayerToolsMenu)
-						end
-					end
+
+	local function readHideStamp()
+		if type(readfile) ~= 'function' then
+			return nil
+		end
+		for _, path in ipairs({ HIDE_MENU_FILE, HIDE_MENU_FILE_ALT }) do
+			local okExists, exists = pcall(function()
+				return type(isfile) == 'function' and isfile(path)
+			end)
+			if okExists and exists then
+				local ok, body = pcall(readfile, path)
+				if ok and type(body) == 'string' and body ~= '' then
+					return body
 				end
-				task.wait(0.35)
 			end
-			getgenv().SB2HideMenuPoller = nil
-		end)
+		end
+		return nil
 	end
 
+	local function ensureHideMenuPoller()
+		-- Soft reloads used to kill the loop (GenvKey flicker) and never restart it.
+		if getgenv().SB2HideMenuPollerAlive == true then
+			return
+		end
+		getgenv().SB2HideMenuPollGen = (tonumber(getgenv().SB2HideMenuPollGen) or 0) + 1
+		local myGen = getgenv().SB2HideMenuPollGen
+		getgenv().SB2HideMenuPoller = true
+		getgenv().SB2HideMenuPollerAlive = true
+		task.spawn(function()
+			while getgenv()[CONFIG.GenvKey] and getgenv().SB2HideMenuPollGen == myGen do
+				local body = readHideStamp()
+				if body and body ~= getgenv().SB2HideMenuLast then
+					getgenv().SB2HideMenuLast = body
+					if type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
+						pcall(getgenv().SB2HidePlayerToolsMenu)
+					end
+				end
+				task.wait(0.25)
+			end
+			if getgenv().SB2HideMenuPollGen == myGen then
+				getgenv().SB2HideMenuPoller = nil
+				getgenv().SB2HideMenuPollerAlive = nil
+			end
+		end)
+	end
+	ensureHideMenuPoller()
+
 	getgenv().SB2BroadcastHideMenus = function()
+		ensureHideMenuPoller()
 		local stamp = tostring(os.clock()) .. ':' .. tostring(math.random(1, 1e9))
 		getgenv().SB2HideMenuLast = stamp
 		if type(writefile) == 'function' then
 			pcall(writefile, HIDE_MENU_FILE, stamp)
+			pcall(writefile, HIDE_MENU_FILE_ALT, stamp)
 		end
+		-- Self-hide still goes through SB2HidePlayerToolsMenu (DEV main no-ops).
 		if type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
 			pcall(getgenv().SB2HidePlayerToolsMenu)
 		end
@@ -3225,9 +3323,11 @@ local ok, err = pcall(function()
 
 	-- Tile = write flags only. Roblox/Potassium cannot launch PowerShell.
 	-- Host watcher (Tile Roblox.bat / watch-tile.ps1) tiles when _tile_now changes.
-	-- Every client polls _hide_menu and closes the UI.
+	-- Every client polls _hide_menu and closes the UI (DEV main skips).
 	getgenv().SB2TileRobloxWindows = function()
+		ensureHideMenuPoller()
 		local stamp = tostring(os.clock()) .. ':' .. tostring(math.random(1, 1e9))
+		local altsOnly = isDevCopy()
 		if type(getgenv().SB2BroadcastHideMenus) == 'function' then
 			pcall(getgenv().SB2BroadcastHideMenus)
 		elseif type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
@@ -3237,9 +3337,21 @@ local ok, err = pcall(function()
 			-- Workspace + scripts paths so the Windows watcher sees either.
 			pcall(writefile, TILE_NOW_FILE, stamp)
 			pcall(writefile, 'PlayerTools/_tile_now', stamp)
+			if altsOnly then
+				pcall(writefile, joinPath(CONFIG.ConfigFolder, '_tile_alts_only'), stamp)
+				pcall(writefile, 'PlayerTools/_tile_alts_only', stamp)
+				-- Title match beats "largest window" (that was tiling Nick / crashing him).
+				local skipBody = "nickb926\nNickB926\n"
+				pcall(writefile, joinPath(CONFIG.ConfigFolder, '_tile_skip_names'), skipBody)
+				pcall(writefile, 'PlayerTools/_tile_skip_names', skipBody)
+			end
 		end
 		if type(Library.Notify) == 'function' then
-			Library:Notify('Tile signal sent — host watcher tiles all windows + every client hides UI.', 5)
+			if altsOnly then
+				Library:Notify('Tile signal sent — alts only (DEV); NickB926 window never resized.', 5)
+			else
+				Library:Notify('Tile signal sent — host watcher tiles all windows + every client hides UI.', 5)
+			end
 		end
 	end
 
@@ -13315,8 +13427,11 @@ local ok, err = pcall(function()
 			Library:Notify('Told IY to arm everyone already here', 4)
 		end)
 
+		-- Own IIFE: fresh-finder locals were tipping the Solo/Combat 200-register limit.
+		;(function()
 		local freshFinderLabel
 		local freshFinderBusy = false
+		local freshFinderSyncing = false
 		local FRESH_FINDER_MAX_HOPS = 60
 		local HttpService = game:GetService('HttpService')
 
@@ -13326,6 +13441,22 @@ local ok, err = pcall(function()
 			elseif freshFinderLabel then
 				freshFinderLabel.Text = tostring(text or 'Fresh finder: off')
 			end
+		end
+
+		local function syncFreshFinderToggle(on)
+			local t = Toggles and Toggles.FreshServerFinder
+			if type(t) ~= 'table' or type(t.SetValue) ~= 'function' then
+				return
+			end
+			local want = on == true
+			if t.Value == want then
+				return
+			end
+			freshFinderSyncing = true
+			pcall(function()
+				t:SetValue(want)
+			end)
+			freshFinderSyncing = false
 		end
 
 		local function readFreshFinderState()
@@ -13435,6 +13566,7 @@ local ok, err = pcall(function()
 		local function stopFreshServerFinder(msg)
 			freshFinderBusy = false
 			paintFreshFinder('Fresh finder: off')
+			syncFreshFinderToggle(false)
 			if type(getgenv().SB2StopFreshServerFinder) == 'function' then
 				pcall(getgenv().SB2StopFreshServerFinder, msg)
 			else
@@ -13589,7 +13721,7 @@ local ok, err = pcall(function()
 		local function startFreshServerFinder()
 			if getgenv().SB2AutoBlockIyOwner ~= true then
 				Library:Notify('Install IY plugin AutoBlock.iy first', 6)
-				return
+				return false
 			end
 			-- Always hop THIS floor.
 			local targetPlace = tonumber(game.PlaceId) or game.PlaceId
@@ -13605,6 +13737,7 @@ local ok, err = pcall(function()
 				started = os.time(),
 			})
 			paintFreshFinder('Fresh finder: starting on this floor…')
+			syncFreshFinderToggle(true)
 			Library:Notify('Fresh server finder — block & hop on this floor until solo', 7)
 			if type(getgenv().SB2ArmAutoBlockTimers) == 'function' then
 				pcall(getgenv().SB2ArmAutoBlockTimers, 0)
@@ -13632,7 +13765,7 @@ local ok, err = pcall(function()
 					end
 				end
 				if actionable <= 0 and type(getgenv().SB2HopCurrentFloorNow) == 'function' then
-					pcall(getgenv().SB2HopCurrentFloorNow, 'button — all blocked, hopping…')
+					pcall(getgenv().SB2HopCurrentFloorNow, 'finder — all blocked, hopping…')
 				end
 			end)
 			-- Keep ticking while finder runs (AutoBlock may lack hop exports).
@@ -13650,15 +13783,34 @@ local ok, err = pcall(function()
 					pcall(freshServerFinderTick)
 				end
 			end)
+			return true
 		end
 
-		freshFinderLabel = SoloBox:AddLabel('Fresh finder: off')
-		SoloBox:AddButton('Fresh server finder', function()
-			task.spawn(startFreshServerFinder)
+		local freshFinderDefault = false
+		do
+			local st = readFreshFinderState()
+			freshFinderDefault = type(st) == 'table' and st.active == true
+		end
+		freshFinderLabel = SoloBox:AddLabel(freshFinderDefault and 'Fresh finder: on' or 'Fresh finder: off')
+		SoloBox:AddToggle('FreshServerFinder', {
+			Text = 'Fresh server finder',
+			Default = freshFinderDefault,
+			Tooltip = 'Block & hop on this floor until the server is empty (you + alts only). Needs AutoBlock.iy.',
+		}):OnChanged(function(value)
+			if freshFinderSyncing then
+				return
+			end
+			if value then
+				task.spawn(function()
+					if startFreshServerFinder() == false then
+						syncFreshFinderToggle(false)
+					end
+				end)
+			else
+				stopFreshServerFinder('Fresh server finder stopped')
+			end
 		end)
-		SoloBox:AddButton('Stop fresh server finder', function()
-			stopFreshServerFinder('Fresh server finder stopped')
-		end)
+		end)()
 
 		local wpValues = listSoloWaypoints()
 		local wpDefault = WP_NONE
@@ -17980,50 +18132,62 @@ local ok, err = pcall(function()
 				Hive.issue('stop', {})
 				refreshHiveLabels()
 			end)
-			OrdersBox:AddButton('Resume ON (all clients)', function()
-				-- Local first so the issuer does not wait for the file poll.
+			do
+				local resumeDefault = false
 				pcall(function()
-					if type(getgenv().SB2SetSoloResume) == 'function' then
-						getgenv().SB2SetSoloResume(true)
-					elseif Toggles.SoloCombatResume and Toggles.SoloCombatResume.SetValue then
-						Toggles.SoloCombatResume:SetValue(true)
-					end
+					resumeDefault = Toggles.SoloCombatResume and Toggles.SoloCombatResume.Value == true
 				end)
-				Hive.issue('solo_resume', {})
-				refreshHiveLabels()
-			end)
-			OrdersBox:AddButton('Boss WP route ON (all clients)', function()
-				pcall(function()
-					if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
-						getgenv().SB2SetBossWaypointRoute(true)
+				OrdersBox:AddToggle('HiveResumeAll', {
+					Text = 'Resume (all clients)',
+					Default = resumeDefault,
+					Tooltip = 'Turns Solo resume ON/OFF on every hive client (including this one).',
+				}):OnChanged(function(value)
+					pcall(function()
+						if type(getgenv().SB2SetSoloResume) == 'function' then
+							getgenv().SB2SetSoloResume(value == true)
+						elseif Toggles.SoloCombatResume and Toggles.SoloCombatResume.SetValue then
+							Toggles.SoloCombatResume:SetValue(value == true)
+						end
+					end)
+					if value then
+						Hive.issue('solo_resume', { on = true })
 					else
-						local t = Toggles.BossWaypointRoute
-						if type(t) == 'table' and type(t.SetValue) == 'function' then
-							if t.Value == true then
-								t:SetValue(false)
-								task.wait()
+						Hive.issue('solo_resume_off', { on = false })
+					end
+					refreshHiveLabels()
+				end)
+
+				local bossDefault = false
+				pcall(function()
+					bossDefault = Toggles.BossWaypointRoute and Toggles.BossWaypointRoute.Value == true
+				end)
+				OrdersBox:AddToggle('HiveBossRouteAll', {
+					Text = 'Boss WP route (all clients)',
+					Default = bossDefault,
+					Tooltip = 'Turns Boss WP route ON/OFF on every hive client (including this one).',
+				}):OnChanged(function(value)
+					pcall(function()
+						if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
+							getgenv().SB2SetBossWaypointRoute(value == true)
+						else
+							local t = Toggles.BossWaypointRoute
+							if type(t) == 'table' and type(t.SetValue) == 'function' then
+								if t.Value == value then
+									t:SetValue(not value)
+									task.wait()
+								end
+								t:SetValue(value == true)
 							end
-							t:SetValue(true)
 						end
-					end
-				end)
-				Hive.issue('boss_route_on', {})
-				refreshHiveLabels()
-			end)
-			OrdersBox:AddButton('Boss WP route OFF (all clients)', function()
-				pcall(function()
-					if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
-						getgenv().SB2SetBossWaypointRoute(false)
+					end)
+					if value then
+						Hive.issue('boss_route_on', {})
 					else
-						local t = Toggles.BossWaypointRoute
-						if type(t) == 'table' and type(t.SetValue) == 'function' and t.Value ~= false then
-							t:SetValue(false)
-						end
+						Hive.issue('boss_route_off', {})
 					end
+					refreshHiveLabels()
 				end)
-				Hive.issue('boss_route_off', {})
-				refreshHiveLabels()
-			end)
+			end
 
 			TradeBox:AddLabel('Workers must be HERE (TP first). Commander auto-accepts hive trades.')
 			TradeBox:AddDropdown('HiveCrystalType', {

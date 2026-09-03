@@ -6,12 +6,14 @@ Friends install / update with one line in their executor:
 loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/playertools/main/bootstrap.lua"))()
 ```
 
+That loadstring pulls **Ataraxia** chrome (Roster-style UI) by default. Same URL as before — no string change needed.
+
 ## How it works
 
 1. `bootstrap.lua` downloads `PlayerTools/Updater.lua`
 2. Updater reads `version.json` from this repo
-3. Listed files are written into the executor `PlayerTools/` folder
-4. `launch.lua` starts as usual
+3. Listed files are written into the executor `PlayerTools/` folder (includes `AtaraxiaLibrary.lua`)
+4. Publish writes `PlayerTools/backend` = `ataraxia`; `launch.lua` defaults to Ataraxia when the file is missing
 
 Each person keeps **their own** Hive tribute webhook + Discord ping under:
 `PlayerTools/hive/tribute_webhook_<robloxUserId>.json`

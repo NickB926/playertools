@@ -864,6 +864,54 @@ end
 getgenv().SB2StartFreshServerHop = startFreshServerHop
 
 -- Fresh finder: strangers present but all already blocked → hop same floor.
+local function clearSkipForPresentStrangers()
+	local skip = getgenv().SB2AutoBlockSkipUntil
+	if type(skip) ~= 'table' then
+		return 0
+	end
+	local n = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and not isOwnAlt(plr) and skip[plr.UserId] ~= nil then
+			skip[plr.UserId] = nil
+			n += 1
+		end
+	end
+	return n
+end
+
+-- Stale persist + temp skips cause "nobody unblocked" hop loops on the same JobId.
+-- Once per server: clear skips + unpersist present strangers so we re-PromptBlock.
+local function recheckStaleBlockedPresent()
+	local job = tostring(game.JobId or '')
+	if job == '' then
+		job = tostring(game.PlaceId) .. ':' .. tostring(math.floor(os.clock()))
+	end
+	if getgenv().SB2FreshBlockRecheckJob == job then
+		return false
+	end
+	getgenv().SB2FreshBlockRecheckJob = job
+	local clearedSkip = clearSkipForPresentStrangers()
+	local clearedPersist = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and not isOwnAlt(plr) and plr.UserId and blockedUserIds[plr.UserId] then
+			if unpersistBlockedUserId(plr.UserId) then
+				clearedPersist += 1
+			end
+		end
+	end
+	if clearedSkip > 0 or clearedPersist > 0 then
+		say(
+			('re-check: cleared %d skip + %d stale persist — retrying block (not hopping yet)'):format(
+				clearedSkip,
+				clearedPersist
+			)
+		)
+	else
+		say('re-check: retrying block on present strangers (not hopping yet)')
+	end
+	return true
+end
+
 local function hopFreshIfNoUnblocked(reason)
 	local fresh = freshFinderActive()
 	local actionable = countActionableStrangers()
@@ -879,6 +927,17 @@ local function hopFreshIfNoUnblocked(reason)
 		return stopFreshFinderIfEmpty(reason or 'Empty server found on this floor')
 	end
 	if stopFreshFinderIfEmpty('Empty server found on this floor') then
+		return true
+	end
+	-- Same-server hop loop: everyone "known blocked" but aren't → recheck once, then hop.
+	if recheckStaleBlockedPresent() then
+		pcall(function()
+			if type(armPresent) == 'function' then
+				armPresent(0)
+			elseif type(getgenv().SB2ArmAutoBlockTimers) == 'function' then
+				getgenv().SB2ArmAutoBlockTimers(0)
+			end
+		end)
 		return true
 	end
 	say(reason or 'all present already blocked — hopping…')
@@ -1011,17 +1070,21 @@ local function findModalBlockButton()
 			return
 		end
 		local ps = pick.AbsoluteSize
-		if ps.X < 40 or ps.Y < 16 then
-			return
+		-- During modal open AbsoluteSize can be 0 for a frame — still allow.
+		if ps.X > 0 and ps.Y > 0 then
+			if ps.X < 28 or ps.Y < 12 then
+				return
+			end
+			if ps.Y > 120 or ps.X > vp.X * 0.9 then
+				return
+			end
+			if ps.X > vp.X * 0.75 and ps.Y > vp.Y * 0.25 then
+				return
+			end
 		end
-		if ps.Y > 96 or ps.X > vp.X * 0.85 then
-			return
-		end
-		if ps.X > vp.X * 0.7 and ps.Y > vp.Y * 0.2 then
-			return
-		end
-		local cy = pick.AbsolutePosition.Y + ps.Y * 0.5
-		if cy < vp.Y * 0.35 then
+		local cy = pick.AbsolutePosition.Y + math.max(ps.Y, 1) * 0.5
+		-- Tiled/small clients often place the modal higher — don't require lower 65%.
+		if vp.Y > 500 and cy < vp.Y * 0.12 then
 			return
 		end
 		local score = 0
@@ -1030,6 +1093,9 @@ local function findModalBlockButton()
 		end
 		if path:find('buttons', 1, true) then
 			score += 40
+		end
+		if path:find('blockingmodal', 1, true) then
+			score += 50
 		end
 		if pick.Name:match('^%d+$') then
 			score += 25
@@ -1042,8 +1108,10 @@ local function findModalBlockButton()
 		elseif ps.Y <= 80 then
 			score += 10
 		end
-		score += math.min(40, (cy / vp.Y) * 40)
-		if path:find('footer', 1, true) then
+		if vp.Y > 0 then
+			score += math.min(40, (cy / vp.Y) * 40)
+		end
+		if path:find('footer', 1, true) and vp.Y > 0 then
 			score -= (cy / vp.Y) * 8
 		end
 		score -= ps.Y * 0.15
@@ -1099,6 +1167,7 @@ local function findModalBlockButton()
 		return best
 	end
 
+	-- Text "Block" label → parent GuiButton
 	for _, root in ipairs(coreGuiRoots()) do
 		pcall(function()
 			for _, label in ipairs(root:GetDescendants()) do
@@ -1132,6 +1201,63 @@ local function findModalBlockButton()
 				end
 			end
 		end)
+	end
+
+	if best then
+		return best
+	end
+
+	-- Last resort: Footer.Buttons.* inside BlockingModalScreen (Block is usually lowest index).
+	for _, root in ipairs(coreGuiRoots()) do
+		pcall(function()
+			for _, d in ipairs(root:GetDescendants()) do
+				if d.Name == 'BlockingModalScreen' then
+					local path = string.lower(d:GetFullName())
+					if path:find('modules.settings', 1, true) then
+						continue
+					end
+					local footerBtns = nil
+					pcall(function()
+						local footer = d:FindFirstChild('Footer', true)
+						footerBtns = footer and footer:FindFirstChild('Buttons', true)
+					end)
+					if footerBtns then
+						local numbered = {}
+						for _, c in ipairs(footerBtns:GetChildren()) do
+							if c:IsA('GuiButton') and c.Name:match('^%d+$') then
+								numbered[#numbered + 1] = c
+							end
+						end
+						table.sort(numbered, function(a, b)
+							return (tonumber(a.Name) or 0) < (tonumber(b.Name) or 0)
+						end)
+						for _, c in ipairs(numbered) do
+							local t = buttonPlainText(c)
+							local childTxt = ''
+							for _, ch in ipairs(c:GetDescendants()) do
+								if ch:IsA('TextLabel') or ch:IsA('TextButton') then
+									childTxt = buttonPlainText(ch)
+									if childTxt ~= '' then
+										break
+									end
+								end
+							end
+							local label = t ~= '' and t or childTxt
+							if label:find('cancel', 1, true) or label:find('report', 1, true) then
+								continue
+							end
+							scoreCandidate(c, path .. '.footer.buttons.' .. c.Name)
+						end
+						if not best and numbered[1] then
+							scoreCandidate(numbered[1], path .. '.footer.buttons.' .. numbered[1].Name)
+						end
+					end
+				end
+			end
+		end)
+		if best then
+			break
+		end
 	end
 	return best
 end
@@ -1282,6 +1408,8 @@ local function modalStillUp()
 end
 
 local function alreadyBlockedUi()
+	-- Only trust Unblock inside Roblox's block prompt — scanning all CoreGui
+	-- false-positives on other UIs and permanently "blocks" people → hop loops.
 	for _, root in ipairs(coreGuiRoots()) do
 		local ok, hit = pcall(function()
 			for _, d in ipairs(root:GetDescendants()) do
@@ -1292,10 +1420,20 @@ local function alreadyBlockedUi()
 						if path:find('joinlogs', 1, true)
 							or path:find('playertools', 1, true)
 							or path:find('modules.settings', 1, true)
+							or path:find('infiniteyield', 1, true)
+							or path:find('iy_', 1, true)
 						then
 							continue
 						end
-						return true
+						-- Must look like the Roblox block / account prompt, not random chrome.
+						if path:find('blockingmodal', 1, true)
+							or path:find('foundationoverlay', 1, true)
+							or path:find('promptblock', 1, true)
+							or path:find('blockplayer', 1, true)
+							or path:find('playeractivation', 1, true)
+						then
+							return true
+						end
 					end
 				end
 			end
@@ -1608,8 +1746,9 @@ runAutoBlockSequence = function(plr)
 				return
 			end
 			say('waiting for Block menu…')
-			local sawModal = waitForBlockModal(2.5)
-			if waitForBlockedUi(1.5) then
+			local sawModal = waitForBlockModal(3.5)
+			-- Quick already-blocked check only (don't burn 1.5s before clicking).
+			if alreadyBlockedUi() then
 				markConfirmedBlocked(plr, 86400)
 				finishHop(plr, ('%s already blocked — hopping…'):format(tostring(plr.DisplayName or plr.Name)), {
 					allowFreshHop = true,
@@ -1620,26 +1759,80 @@ runAutoBlockSequence = function(plr)
 			if cancelled() then
 				return
 			end
-			if alreadyBlockedUi() then
-				markConfirmedBlocked(plr, 300)
-				finishHop(plr, ('%s already blocked — hopping…'):format(tostring(plr.DisplayName or plr.Name)), {
-					allowFreshHop = true,
-					fromFreshFinder = forFreshFinder,
-				})
-				return
+			local clickedBlock = false
+			local btn = nil
+			local findUntil = os.clock() + 3
+			while os.clock() < findUntil do
+				btn = findModalBlockButton()
+				if btn then
+					break
+				end
+				if not (modalStillUp() or findBlockingModal()) and os.clock() > findUntil - 2.2 then
+					break
+				end
+				task.wait(0.12)
 			end
-			local btn = findModalBlockButton()
 			if btn then
-				gentleBlockClick(btn)
-				task.wait(0.45)
+				say('pressing Block…')
+				clickedBlock = gentleBlockClick(btn) == true
+				task.wait(0.4)
 				if modalStillUp() then
 					clickBlockWithMouse(btn, true)
-					task.wait(0.45)
+					clickedBlock = true
+					task.wait(0.4)
 				end
-			elseif sawModal then
-				task.wait(0.65)
+				if modalStillUp() then
+					-- Second pass: re-resolve button (Foundation sometimes rebuilds).
+					local btn2 = findModalBlockButton() or btn
+					gentleBlockClick(btn2)
+					task.wait(0.25)
+					if modalStillUp() then
+						clickBlockWithMouse(btn2, true)
+					end
+					clickedBlock = true
+					task.wait(0.35)
+				end
+			elseif sawModal or modalStillUp() or findBlockingModal() then
+				-- Modal up but button finder failed — Cancel is default focus; Up → Block → Enter.
+				say('Block button missing — keyboard fallback')
+				sendNavKey(Enum.KeyCode.Up)
+				task.wait(0.08)
+				sendNavKey(Enum.KeyCode.Up)
+				task.wait(0.08)
+				sendNavKey(Enum.KeyCode.Return)
+				task.wait(0.45)
+				if modalStillUp() then
+					sendNavKey(Enum.KeyCode.Return)
+					task.wait(0.35)
+				end
+				if modalStillUp() then
+					local btn3 = findModalBlockButton()
+					if btn3 then
+						clickBlockWithMouse(btn3, true)
+					end
+				end
+				clickedBlock = true
 			end
-			local blocked = alreadyBlockedUi() or (sawModal and not modalStillUp())
+			-- Strong confirm only: Unblock UI after a Block attempt.
+			-- Modal closing alone is NOT a block (Cancel / error / dismiss) — that
+			-- used to persist false positives and cause infinite same-server hops.
+			local blocked = alreadyBlockedUi()
+			if not blocked and clickedBlock then
+				-- Give Unblock UI a moment to appear after a successful click.
+				local untilUnblock = os.clock() + 1.2
+				while os.clock() < untilUnblock do
+					if alreadyBlockedUi() then
+						blocked = true
+						break
+					end
+					if not modalStillUp() and not findBlockingModal() then
+						-- Modal closed after click without Unblock — treat as weak success.
+						break
+					end
+					task.wait(0.12)
+				end
+				blocked = blocked or alreadyBlockedUi()
+			end
 			if cancelled() then
 				return
 			end
@@ -1655,9 +1848,19 @@ runAutoBlockSequence = function(plr)
 				})
 				return
 			end
-			-- Fresh finder: confirm failed — short temp skip only (never persist).
+			-- Weak signal: modal went away after we clicked Block but no Unblock UI.
 			if forFreshFinder then
-				markSkipBlocked(plr, 20)
+				if clickedBlock and sawModal and not modalStillUp() then
+					-- Short skip only — do not persist.
+					markSkipBlocked(plr, 25)
+					finishHop(
+						plr,
+						('block unclear for %s — short skip, hopping…'):format(tostring(plr.DisplayName or plr.Name)),
+						{ allowFreshHop = true, fromFreshFinder = true }
+					)
+					return
+				end
+				markSkipBlocked(plr, 12)
 				finishHop(
 					plr,
 					('no unblocked action for %s — hopping…'):format(tostring(plr.DisplayName or plr.Name)),
@@ -1849,6 +2052,9 @@ local function resumeFreshServerFinder()
 	markJustLanded(14)
 	ensureFreshFinderWatchdog()
 	getgenv().SB2AutoBlockHopping = nil
+	-- New server (or same JobId retry): allow one stale-block recheck and drop temp skips.
+	getgenv().SB2FreshBlockRecheckJob = nil
+	clearSkipForPresentStrangers()
 	writeHop({ active = false, phase = 'off' })
 	wireWatchers()
 	ensurePresenceWatchdog()

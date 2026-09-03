@@ -75,6 +75,20 @@ foreach ($rel in $ver.files) {
 Write-Host "==> Copied $copied files from Potassium scripts"
 
 Copy-Item -Force (Join-Path $srcRoot 'bootstrap.lua') (Join-Path $repoRoot 'bootstrap.lua')
+$ataraxiaEntry = Join-Path $srcRoot 'Ataraxia.lua'
+if (Test-Path $ataraxiaEntry) {
+  Copy-Item -Force $ataraxiaEntry (Join-Path $repoRoot 'Ataraxia.lua')
+  Write-Host '==> Copied Ataraxia.lua (optional direct entry)'
+}
+
+# Friends get Ataraxia chrome by default. Never publish local-only markers.
+Write-Utf8NoBom (Join-Path $ptDst 'backend') "ataraxia`n"
+Write-Host '==> Wrote PlayerTools/backend = ataraxia (publish tree only)'
+foreach ($junk in @('_dev_copy', '_hide_menu', '_tile_now', '_tile_alts_only')) {
+  $junkPath = Join-Path $ptDst $junk
+  if (Test-Path $junkPath) { Remove-Item -Force $junkPath }
+}
+
 $verJson = ($ver | ConvertTo-Json -Depth 5) + [Environment]::NewLine
 Write-Utf8NoBom (Join-Path $repoRoot 'version.json') $verJson
 Write-Utf8NoBom (Join-Path $ptSrc 'version.json') $verJson
@@ -136,6 +150,6 @@ try {
 
 Write-Host ""
 Write-Host "==> Published $($ver.version)  (was $oldVersion) --- pushed to GitHub"
-Write-Host "Friend / reinstall:"
+Write-Host "Friend / reinstall (Ataraxia chrome by default):"
 Write-Host 'loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/playertools/main/bootstrap.lua"))()'
 Write-Host "Or in-game: Settings -> GitHub updates -> Check / Apply"
