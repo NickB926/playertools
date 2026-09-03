@@ -6,8 +6,8 @@
 	KeepPlayerTools.iy teleport stub, AutoBlock.iy and init.lua.
 
 	Backend is chosen by PlayerTools/backend:
-	    "obsidian"  -> PlayerTools_Obsidian.lua   (backed-up Obsidian UI)
-	    anything else / missing -> PlayerTools_Starlight.lua when it exists
+	    "obsidian" / missing / anything else -> PlayerTools_Obsidian.lua (Ataraxia default)
+	    "starlight" -> PlayerTools_Starlight.lua
 
 	PlayerTools.lua itself is a thin shim that always calls this file.
 
@@ -27,6 +27,10 @@ local LIVE_CONN_KEYS = {
 	'SB2DiveFarmConn',
 	'SB2BossComboScanConn',
 	'SB2NoStreamConn',
+	'SB2SkillFxJanitorAddConn',
+	'SB2SkillFxJanitorHbConn',
+	'SB2FarmFpsConn',
+	'SB2FarmFpsLightConn',
 	'SB2DefaultCursorLockConn',
 	'SB2ExposureLockConn',
 	'SB2MaxZoomLockConn',
@@ -77,17 +81,20 @@ local function disconnectOrphanAnonymousHeartbeats()
 	if not ok or type(cons) ~= 'table' then
 		return 0
 	end
+	local live = buildLiveConnSet()
 	for _, cn in ipairs(cons) do
-		local src = ''
-		pcall(function()
-			src = debug.info(cn.Function, 's') or ''
-		end)
-		-- Orphaned PlayerTools reloads often show as "?" on Potassium.
-		if src == '' or src == '?' then
+		if not live[cn] then
+			local src = ''
 			pcall(function()
-				cn:Disconnect()
+				src = debug.info(cn.Function, 's') or ''
 			end)
-			n += 1
+			-- Orphaned PlayerTools reloads often show as "?" on Potassium.
+			if src == '' or src == '?' then
+				pcall(function()
+					cn:Disconnect()
+				end)
+				n += 1
+			end
 		end
 	end
 	return n
@@ -322,14 +329,19 @@ local function exists(path)
 end
 
 local function wantedBackend()
+	-- Default Ataraxia/Obsidian. Only use Starlight when backend file says so.
 	if not exists(BACKEND_FILE) then
-		return nil
+		return 'obsidian'
 	end
 	local ok, body = pcall(readfile, BACKEND_FILE)
 	if not ok then
-		return nil
+		return 'obsidian'
 	end
-	return (tostring(body):lower():gsub('%s', ''))
+	local v = (tostring(body):lower():gsub('%s', ''))
+	if v == 'starlight' then
+		return 'starlight'
+	end
+	return 'obsidian'
 end
 
 local function run(path)

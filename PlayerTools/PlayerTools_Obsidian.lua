@@ -246,7 +246,7 @@ local configFolder = fileExists('PlayerTools/autoexec') and 'PlayerTools'
 
 local CONFIG = {
 	GenvKey = 'SB2PlayerTools',
-	Title = 'Starlight',
+	Title = 'Ataraxia',
 	Footer = 'If you gaze long into an abyss, the abyss also gazes into you.',
 	WindowSize = UDim2.fromOffset(560, 520),
 	WindowMinSize = Vector2.new(520, 460), -- Obsidian defaults to 480×360 min otherwise
@@ -506,6 +506,10 @@ local unloadExisting = function()
 			'SB2CombatSoloResumeConn',
 			'SB2CombatAltSeedConn',
 			'SB2NoStreamConn',
+			'SB2SkillFxJanitorAddConn',
+			'SB2SkillFxJanitorHbConn',
+			'SB2FarmFpsConn',
+			'SB2FarmFpsLightConn',
 			'SB2WsDeleteLogConn',
 			'SB2VoidProbeHbConn',
 		}) do
@@ -1328,6 +1332,345 @@ local ok, err = pcall(function()
 			end
 		end)
 	end
+
+	-- Sweeping Strike / Water Blast / Infinity Slash clone BodyVelocity parts into
+	-- Workspace and never destroy them (7k+ per farm client). TTL then batch-delete.
+	-- Vampiric bats also block other casts until cleared.
+	;(function()
+		local RunService = game:GetService('RunService')
+		local ATTR = 'SB2FxJ'
+		local pending = {}
+		local queued = {}
+		local lastSweep = 0
+		local FX_NAME = {
+			SweepingStrike = true,
+			Bat = true,
+			ActiveBats = true,
+			Trail = true,
+			SoulLightning = true,
+			Meteor = true,
+			Soul = true,
+			Whirlpool = true,
+			Lava = true,
+			Indicator = true,
+			Lines = true,
+			['Trail/Slash'] = true,
+			Circle = true,
+			EffectHitbox = true,
+			Skill = true,
+			SummonPortal = true,
+			TreeEffect = true,
+		}
+		local PROTECT_NAME = {
+			Characters = true,
+			Mobs = true,
+			Terrain = true,
+			Camera = true,
+			CurrentCamera = true,
+		}
+
+		local function dropConn(key)
+			local c = getgenv()[key]
+			if c then
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+			getgenv()[key] = nil
+		end
+
+		local function hasBodyMover(inst)
+			return inst:FindFirstChildWhichIsA('BodyVelocity') ~= nil
+				or inst:FindFirstChildWhichIsA('LinearVelocity') ~= nil
+				or inst:FindFirstChildWhichIsA('VectorForce') ~= nil
+		end
+
+		local function isSkillFxDebris(inst)
+			if not inst or inst.Parent ~= workspace then
+				return false
+			end
+			local name = inst.Name
+			if PROTECT_NAME[name] then
+				return false
+			end
+			-- Summoned undead / map mobs — never janitor these.
+			if name ~= 'Bat' then
+				local hum = inst:FindFirstChildWhichIsA('Humanoid')
+					or inst:FindFirstChildWhichIsA('Humanoid', true)
+				if hum then
+					return false
+				end
+			end
+			if FX_NAME[name] then
+				return true
+			end
+			local cls = inst.ClassName
+			if cls == 'Sound' or cls == 'Attachment' then
+				return true
+			end
+			if cls ~= 'Part' and cls ~= 'MeshPart' then
+				return false
+			end
+			return hasBodyMover(inst)
+		end
+
+		local function debrisTtl(inst)
+			local name = inst and inst.Name or ''
+			if name == 'Bat' or name == 'ActiveBats' or name == 'Trail' then
+				return 10
+			end
+			if name == 'Meteor' or name == 'Whirlpool' or name == 'Lava' then
+				return 6
+			end
+			if name == 'SweepingStrike' or hasBodyMover(inst) then
+				return 1.35
+			end
+			return 2.4
+		end
+
+		local function neutralize(inst)
+			pcall(function()
+				if inst:IsA('BasePart') then
+					inst.CanCollide = false
+					inst.CastShadow = false
+					inst.CanQuery = false
+					inst.CanTouch = false
+				end
+				local desc = inst:GetDescendants()
+				for i = 1, #desc do
+					local d = desc[i]
+					local dCls = d.ClassName
+					if dCls == 'ParticleEmitter' or dCls == 'Trail' or dCls == 'Beam'
+						or dCls == 'Fire' or dCls == 'Smoke' or dCls == 'Sparkles'
+					then
+						d.Enabled = false
+					elseif dCls == 'PointLight' or dCls == 'SpotLight' or dCls == 'SurfaceLight' then
+						d.Enabled = false
+					elseif d:IsA('BasePart') then
+						d.CanCollide = false
+						d.CastShadow = false
+					end
+				end
+			end)
+		end
+
+		local function killMoversAndAnchor(inst)
+			pcall(function()
+				if inst:IsA('BasePart') then
+					inst.Anchored = true
+					inst.AssemblyLinearVelocity = Vector3.zero
+				end
+				local desc = inst:GetDescendants()
+				for i = 1, #desc do
+					local d = desc[i]
+					local dCls = d.ClassName
+					if dCls == 'BodyVelocity' or dCls == 'BodyGyro' or dCls == 'BodyThrust'
+						or dCls == 'LinearVelocity' or dCls == 'VectorForce'
+					then
+						d:Destroy()
+					elseif d:IsA('BasePart') then
+						d.Anchored = true
+					end
+				end
+			end)
+		end
+
+		local function stamp(inst)
+			pcall(function()
+				if inst:GetAttribute(ATTR) == nil then
+					inst:SetAttribute(ATTR, os.clock())
+				end
+			end)
+		end
+
+		local function age(inst)
+			local t = nil
+			pcall(function()
+				t = inst:GetAttribute(ATTR)
+			end)
+			t = tonumber(t)
+			if not t then
+				return 99
+			end
+			return os.clock() - t
+		end
+
+		local function enqueue(inst)
+			if queued[inst] or not isSkillFxDebris(inst) then
+				return
+			end
+			stamp(inst)
+			neutralize(inst)
+			queued[inst] = true
+			pending[#pending + 1] = inst
+		end
+
+		local function flushBatch()
+			if #pending == 0 then
+				return
+			end
+			local overload = #pending > 400
+			local batch = overload and 280 or 160
+			local n = 0
+			local keep = {}
+			for i = 1, #pending do
+				local inst = pending[i]
+				if not inst or inst.Parent ~= workspace or not isSkillFxDebris(inst) then
+					queued[inst] = nil
+				else
+					local a = age(inst)
+					if a >= math.max(0.45, debrisTtl(inst) - 0.35) then
+						killMoversAndAnchor(inst)
+					end
+					local ttl = overload and math.min(debrisTtl(inst), 0.8) or debrisTtl(inst)
+					if a >= ttl then
+						if n < batch then
+							queued[inst] = nil
+							pcall(function()
+								inst:Destroy()
+							end)
+							n += 1
+						else
+							keep[#keep + 1] = inst
+						end
+					else
+						keep[#keep + 1] = inst
+					end
+				end
+			end
+			pending = keep
+		end
+
+		local function scanWorkspace()
+			local kids = workspace:GetChildren()
+			for i = 1, #kids do
+				enqueue(kids[i])
+			end
+		end
+
+		dropConn('SB2SkillFxJanitorAddConn')
+		dropConn('SB2SkillFxJanitorHbConn')
+		scanWorkspace()
+		getgenv().SB2SkillFxJanitorAddConn = workspace.ChildAdded:Connect(function(ch)
+			if not getgenv()[CONFIG.GenvKey] then
+				return
+			end
+			task.defer(function()
+				enqueue(ch)
+			end)
+		end)
+		getgenv().SB2SkillFxJanitorHbConn = RunService.Heartbeat:Connect(function()
+			if not getgenv()[CONFIG.GenvKey] then
+				return
+			end
+			flushBatch()
+			local now = os.clock()
+			if now - lastSweep >= 1.5 then
+				lastSweep = now
+				scanWorkspace()
+			end
+		end)
+		getgenv().SB2SweepSkillFx = function()
+			scanWorkspace()
+			for i = 1, #pending do
+				local inst = pending[i]
+				pcall(function()
+					if inst then
+						inst:SetAttribute(ATTR, 0)
+					end
+				end)
+			end
+			flushBatch()
+		end
+	end)()
+
+	-- Potato render: quality 1, no global shadows, mute lighting post-fx.
+	-- Does not Destroy skill clones (janitor owns those) and does not strip GUIs.
+	;(function()
+		local Lighting = game:GetService('Lighting')
+		local RunService = game:GetService('RunService')
+		local lastPin = 0
+
+		local function dropConn(key)
+			local c = getgenv()[key]
+			if c then
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+			getgenv()[key] = nil
+		end
+
+		local function pinQuality()
+			pcall(function()
+				settings().Rendering.QualityLevel = 1
+			end)
+			pcall(function()
+				local gs = UserSettings():GetService('UserGameSettings')
+				gs.SavedQualityLevel = Enum.SavedQualityLevel.QualityLevel1
+			end)
+			pcall(function()
+				Lighting.GlobalShadows = false
+				Lighting.FogEnd = 400
+				Lighting.FogStart = 0
+			end)
+			pcall(function()
+				local kids = Lighting:GetChildren()
+				for i = 1, #kids do
+					local ch = kids[i]
+					if ch:IsA('BlurEffect') or ch:IsA('BloomEffect') or ch:IsA('SunRaysEffect')
+						or ch:IsA('DepthOfFieldEffect')
+					then
+						ch.Enabled = false
+					end
+				end
+			end)
+		end
+
+		local function startFarmFps()
+			getgenv().SB2FarmFpsOn = true
+			pinQuality()
+			dropConn('SB2FarmFpsConn')
+			dropConn('SB2FarmFpsLightConn')
+			getgenv().SB2FarmFpsLightConn = Lighting.ChildAdded:Connect(function(ch)
+				if getgenv().SB2FarmFpsOn ~= true then
+					return
+				end
+				task.defer(function()
+					if ch:IsA('BlurEffect') or ch:IsA('BloomEffect') or ch:IsA('SunRaysEffect')
+						or ch:IsA('DepthOfFieldEffect')
+					then
+						pcall(function()
+							ch.Enabled = false
+						end)
+					end
+				end)
+			end)
+			getgenv().SB2FarmFpsConn = RunService.Heartbeat:Connect(function()
+				if getgenv().SB2FarmFpsOn ~= true or not getgenv()[CONFIG.GenvKey] then
+					return
+				end
+				local now = os.clock()
+				if now - lastPin < 5 then
+					return
+				end
+				lastPin = now
+				pinQuality()
+			end)
+		end
+
+		local function stopFarmFps()
+			getgenv().SB2FarmFpsOn = false
+			dropConn('SB2FarmFpsConn')
+			dropConn('SB2FarmFpsLightConn')
+		end
+
+		getgenv().SB2StartFarmFps = startFarmFps
+		getgenv().SB2StopFarmFps = stopFarmFps
+		if getgenv().SB2FarmFpsOn ~= false then
+			startFarmFps()
+		end
+	end)()
 
 	local function getLiveCamera()
 		local cam = workspace.CurrentCamera
@@ -2817,6 +3160,89 @@ local ok, err = pcall(function()
 	end
 	getgenv().SB2ForceShowPlayerTools = forceShowWindow
 
+	-- Same as pressing the menu keybind (Home): hide UI, do not Unload.
+	getgenv().SB2HidePlayerToolsMenu = function()
+		getgenv().SB2MenuWantOpen = false
+		getgenv().SB2MenuPinGen = (tonumber(getgenv().SB2MenuPinGen) or 0) + 1
+		local gui = Library.ScreenGui or getgenv().SB2PlayerToolsGui
+		local main = gui and gui:FindFirstChild('Main')
+		local open = (main and main.Visible == true) or Library.Toggled == true
+		if open and type(Library.Toggle) == 'function' then
+			pcall(function()
+				Library:Toggle()
+			end)
+		end
+		getgenv().SB2MenuWantOpen = false
+		pcall(function()
+			Library.Toggled = false
+			if Library.Open ~= nil then
+				Library.Open = false
+			end
+		end)
+		if main then
+			main.Visible = false
+		end
+	end
+
+	local HIDE_MENU_FILE = joinPath(CONFIG.ConfigFolder, '_hide_menu')
+	local TILE_NOW_FILE = joinPath(CONFIG.ConfigFolder, '_tile_now')
+	getgenv().SB2HideMenuLast = getgenv().SB2HideMenuLast or ''
+	if not getgenv().SB2HideMenuPoller then
+		getgenv().SB2HideMenuPoller = true
+		task.spawn(function()
+			while getgenv()[CONFIG.GenvKey] do
+				if type(isfile) == 'function' and isfile(HIDE_MENU_FILE) and type(readfile) == 'function' then
+					local ok, body = pcall(readfile, HIDE_MENU_FILE)
+					if ok and type(body) == 'string' and body ~= '' and body ~= getgenv().SB2HideMenuLast then
+						getgenv().SB2HideMenuLast = body
+						if type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
+							pcall(getgenv().SB2HidePlayerToolsMenu)
+						end
+					end
+				end
+				task.wait(0.35)
+			end
+			getgenv().SB2HideMenuPoller = nil
+		end)
+	end
+
+	getgenv().SB2BroadcastHideMenus = function()
+		local stamp = tostring(os.clock()) .. ':' .. tostring(math.random(1, 1e9))
+		getgenv().SB2HideMenuLast = stamp
+		if type(writefile) == 'function' then
+			pcall(writefile, HIDE_MENU_FILE, stamp)
+		end
+		if type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
+			pcall(getgenv().SB2HidePlayerToolsMenu)
+		end
+		local hive = getgenv().SB2Hive
+		if type(hive) == 'table' and hive._alive == true and type(hive.issue) == 'function' then
+			pcall(function()
+				hive.issue('hide_menu', {})
+			end)
+		end
+	end
+
+	-- Tile = write flags only. Roblox/Potassium cannot launch PowerShell.
+	-- Host watcher (Tile Roblox.bat / watch-tile.ps1) tiles when _tile_now changes.
+	-- Every client polls _hide_menu and closes the UI.
+	getgenv().SB2TileRobloxWindows = function()
+		local stamp = tostring(os.clock()) .. ':' .. tostring(math.random(1, 1e9))
+		if type(getgenv().SB2BroadcastHideMenus) == 'function' then
+			pcall(getgenv().SB2BroadcastHideMenus)
+		elseif type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
+			pcall(getgenv().SB2HidePlayerToolsMenu)
+		end
+		if type(writefile) == 'function' then
+			-- Workspace + scripts paths so the Windows watcher sees either.
+			pcall(writefile, TILE_NOW_FILE, stamp)
+			pcall(writefile, 'PlayerTools/_tile_now', stamp)
+		end
+		if type(Library.Notify) == 'function' then
+			Library:Notify('Tile signal sent — host watcher tiles all windows + every client hides UI.', 5)
+		end
+	end
+
 	-- Track intentional close vs hop races. During hop grace, ignore closes.
 	do
 		local rawToggle = Library.Toggle
@@ -3190,6 +3616,10 @@ local ok, err = pcall(function()
 		end
 	end)
 	-- #endregion
+
+	local HomeTab = Window:AddTab('Home', 'home')
+	local HomeBox = HomeTab:AddLeftGroupbox('Ataraxia')
+	assert(HomeBox, 'Home groupbox nil')
 
 	local PlayersTab = Window:AddTab('Players', 'users')
 	local PlayersBox = PlayersTab:AddLeftGroupbox('Players')
@@ -7258,8 +7688,14 @@ local ok, err = pcall(function()
 
 		;(function()
 		local CombatTab = Window:AddTab('Combat', 'swords')
+		local FarmTab = Window:AddTab('Farm', 'swords')
+		local BossTab = Window:AddTab('Boss', 'swords')
 		local CombatBox = CombatTab:AddLeftGroupbox('Combat')
+		local FarmBox = FarmTab:AddLeftGroupbox('Event dive')
+		local BossBox = BossTab:AddLeftGroupbox('Boss route')
 		assert(CombatBox, 'Combat groupbox nil')
+		assert(FarmBox, 'Farm groupbox nil')
+		assert(BossBox, 'Boss groupbox nil')
 
 		CombatBox:AddToggle('AutoSkill', {
 			Text = 'Auto skill damage',
@@ -11675,7 +12111,7 @@ local ok, err = pcall(function()
 			end)
 		end
 
-		CombatBox:AddToggle('DiveFarm', {
+		FarmBox:AddToggle('DiveFarm', {
 			Text = 'Event vacuum (hover farm)',
 			Default = false,
 			Tooltip = 'AutoFarm-style vacuum. On F5 Desolate Dunes: farms the labyrinth only and stays out of the boss room. Noclip + fly while on. Auto-off when a non-alt joins.',
@@ -11698,7 +12134,7 @@ local ok, err = pcall(function()
 			end)
 		end)
 
-		CombatBox:AddToggle('DiveAutoHeight', {
+		FarmBox:AddToggle('DiveAutoHeight', {
 			Text = 'Auto farm height',
 			Default = false,
 			Tooltip = 'ON: raises Farm height to at least ~blade reach (never lowers your slider). OFF: exact Farm height slider only.',
@@ -11716,7 +12152,7 @@ local ok, err = pcall(function()
 			end
 		end)
 
-		CombatBox:AddSlider('DiveFarmHeight', {
+		FarmBox:AddSlider('DiveFarmHeight', {
 			Text = 'Farm height (vs mob top)',
 			Default = 12,
 			Min = -40,
@@ -11763,7 +12199,7 @@ local ok, err = pcall(function()
 			end
 		end)
 
-		CombatBox:AddSlider('DiveFleeDepth', {
+		FarmBox:AddSlider('DiveFleeDepth', {
 			Text = 'Flee depth (under floor)',
 			Default = 38,
 			Min = 10,
@@ -11776,7 +12212,7 @@ local ok, err = pcall(function()
 			end
 		end)
 
-		CombatBox:AddSlider('DiveFleeDepthBoss', {
+		FarmBox:AddSlider('DiveFleeDepthBoss', {
 			Text = 'Flee depth (bosses)',
 			Default = 58,
 			Min = 10,
@@ -11854,7 +12290,7 @@ local ok, err = pcall(function()
 			end
 			local defaultFarmSupport = table.find(farmSupport, 'Cursed Enhancement') and 'Cursed Enhancement' or farmSupport[1]
 			local defaultFarmHeal = table.find(farmHeal, 'Heal') and 'Heal' or farmHeal[2]
-			CombatBox:AddDropdown('FarmSkillName', {
+			FarmBox:AddDropdown('FarmSkillName', {
 				Text = 'Dive weapon skill',
 				Values = farmSkills,
 				Default = defaultFarmSkill,
@@ -11862,7 +12298,7 @@ local ok, err = pcall(function()
 				Searchable = true,
 				Tooltip = 'Weapon skill used while Event dive is on.',
 			})
-			CombatBox:AddDropdown('FarmSupportSkillName', {
+			FarmBox:AddDropdown('FarmSupportSkillName', {
 				Text = 'Dive support skills',
 				Values = farmSupport,
 				Default = defaultFarmSupport and { defaultFarmSupport } or {},
@@ -11879,7 +12315,7 @@ local ok, err = pcall(function()
 					end
 				end)
 			end)
-			CombatBox:AddDropdown('FarmHealSkillName', {
+			FarmBox:AddDropdown('FarmHealSkillName', {
 				Text = 'Dive heal (burst)',
 				Values = farmHeal,
 				Default = defaultFarmHeal or 'Heal',
@@ -11888,7 +12324,7 @@ local ok, err = pcall(function()
 				Tooltip = 'Heal — one-shot HP dump. Used on poison, fire, or low HP.',
 			})
 			local defaultFarmMend = table.find(farmHeal, 'Mending Spirit') and 'Mending Spirit' or 'Mending Spirit'
-			CombatBox:AddDropdown('FarmMendSkillName', {
+			FarmBox:AddDropdown('FarmMendSkillName', {
 				Text = 'Dive heal (AoE)',
 				Values = farmHeal,
 				Default = defaultFarmMend,
@@ -12339,7 +12775,53 @@ local ok, err = pcall(function()
 			return nil
 		end
 
+		local function destIsBossRouteWp(pos)
+			if typeof(pos) ~= 'Vector3' then
+				return false
+			end
+			local store = getgenv().SB2Waypoints and getgenv().SB2Waypoints.store
+			if not (store and type(store.waypoints) == 'table') then
+				return false
+			end
+			local keys = { 'warlord', 'hunter', 'limor', 'radioactive', 'radio', 'experiment' }
+			for _, rec in ipairs(store.waypoints) do
+				if type(rec) == 'table' and type(rec.name) == 'string' then
+					local n = string.lower(rec.name)
+					local hit = false
+					for _, k in ipairs(keys) do
+						if n:find(k, 1, true) then
+							hit = true
+							break
+						end
+					end
+					if hit then
+						local p = Vector3.new(tonumber(rec.x) or 0, tonumber(rec.y) or 0, tonumber(rec.z) or 0)
+						if (pos - p).Magnitude <= 22 then
+							return true
+						end
+					end
+				end
+			end
+			return false
+		end
+
 		local function applyCharacterCFrame(cf)
+			-- Hard gate: kills zombie boss-route / resume TP loops after soft-reload.
+			local gate = getgenv().SB2TpGate
+			if type(gate) == 'table' and gate.block == true then
+				return false, 'tp blocked'
+			end
+			-- Zombie boss-route loops ignore the new toggle. Never CFrame onto boss pads
+			-- unless the route is actually wanted (or Resume is using that pad).
+			if getgenv().SB2BossRouteWanted ~= true and not isToggleOn('SoloCombatResume') then
+				local pos = nil
+				pcall(function()
+					pos = cf.Position
+				end)
+				if pos and destIsBossRouteWp(pos) then
+					return false, 'boss route off'
+				end
+			end
 			holdCombatAnchor(0.5)
 			local model = getMyCharacterModel() or LocalPlayer.Character
 			if not model then
@@ -12610,7 +13092,7 @@ local ok, err = pcall(function()
 			}
 		end)()
 
-		local SoloBox = CombatTab:AddRightGroupbox('Solo resume')
+		local SoloBox = FarmTab:AddRightGroupbox('Solo resume')
 		assert(SoloBox, 'Solo resume groupbox nil')
 		SoloBox:AddToggle('SoloCombatResume', {
 			Text = 'Resume',
@@ -12659,6 +13141,7 @@ local ok, err = pcall(function()
 				getgenv().SB2ResumeAssertUntil = 0
 				getgenv().SB2ResumeGuardUntil = 0
 				getgenv().SB2ResumeAfterConfig = false
+				getgenv().SB2SoloBootTpGen = (tonumber(getgenv().SB2SoloBootTpGen) or 0) + 1
 				local last = getgenv().SB2LastSoloBlock
 				if type(last) == 'table' then
 					last.SoloCombatResume = false
@@ -12675,6 +13158,9 @@ local ok, err = pcall(function()
 			getgenv().SB2StickyResumeWanted = true
 			getgenv().SB2ForceResumeWanted = false
 			getgenv().SB2ResumeAssertUntil = 0
+			-- Allow intentional Resume TPs after a boss-route hard-stop.
+			getgenv().SB2TpGate = getgenv().SB2TpGate or {}
+			getgenv().SB2TpGate.block = false
 			if otherPlayersPresent() then
 				-- Don't arm combat while strangers are here — wait for empty.
 				Library:Notify('Resume on — combat stays off until only you/alts remain, then TP', 4)
@@ -13227,8 +13713,10 @@ local ok, err = pcall(function()
 		-- Own IIFE: bare do/end still burns the Combat/Solo 200-local budget.
 		;(function()
 			local BOSS_ROUTE_RESPAWN_SEC = 90
+			-- Global gen survives soft-reload / nested IIFEs so OFF always kills zombie loops.
+			getgenv().SB2BossRouteGen = tonumber(getgenv().SB2BossRouteGen) or 0
 			local bossRouteToken = 0
-			local bossRouteLabel = SoloBox:AddLabel('Boss WP route: off')
+			local bossRouteLabel = BossBox:AddLabel('Boss WP route: off')
 
 			local function paintBossRoute(text)
 				pcall(function()
@@ -13238,6 +13726,16 @@ local ok, err = pcall(function()
 						bossRouteLabel.Text = tostring(text)
 					end
 				end)
+			end
+
+			local function bossRouteAlive(token, myGen)
+				if token ~= bossRouteToken then
+					return false
+				end
+				if (tonumber(getgenv().SB2BossRouteGen) or 0) ~= myGen then
+					return false
+				end
+				return isToggleOn('BossWaypointRoute')
 			end
 
 			-- Preferred kill order; waypoint names are matched by substring (your WPs: warlord/hunter/limor/radioactive shit).
@@ -13324,6 +13822,13 @@ local ok, err = pcall(function()
 			end
 
 			local function teleportBossRouteWp(wpName)
+				if getgenv().SB2BossRouteWanted ~= true or not isToggleOn('BossWaypointRoute') then
+					return false, 'boss route off'
+				end
+				local gate = getgenv().SB2TpGate
+				if type(gate) == 'table' and gate.block == true then
+					return false, 'tp blocked'
+				end
 				local wp = findSoloWaypointRec(wpName)
 				if not wp then
 					return false, 'missing waypoint'
@@ -13343,6 +13848,11 @@ local ok, err = pcall(function()
 
 			local function stopBossRoute(reason)
 				bossRouteToken += 1
+				getgenv().SB2BossRouteGen = (tonumber(getgenv().SB2BossRouteGen) or 0) + 1
+				getgenv().SB2BossRouteWanted = false
+				getgenv().SB2TpGate = getgenv().SB2TpGate or {}
+				getgenv().SB2TpGate.block = true
+				getgenv().SB2SoloBootTpGen = (tonumber(getgenv().SB2SoloBootTpGen) or 0) + 1
 				paintBossRoute(reason and ('Boss WP route: ' .. tostring(reason)) or 'Boss WP route: off')
 			end
 
@@ -13354,6 +13864,7 @@ local ok, err = pcall(function()
 					return
 				end
 				bossRouteToken += 1
+				getgenv().SB2BossRouteGen = (tonumber(getgenv().SB2BossRouteGen) or 0) + 1
 				setCombatTrio(false)
 				local who = plr and (plr.DisplayName or plr.Name) or 'player'
 				paintBossRoute(('Boss WP route: paused — %s'):format(tostring(who)))
@@ -13432,9 +13943,14 @@ local ok, err = pcall(function()
 			runBossRouteLoop = function()
 				bossRouteToken += 1
 				local token = bossRouteToken
+				getgenv().SB2BossRouteGen = (tonumber(getgenv().SB2BossRouteGen) or 0) + 1
+				local myGen = getgenv().SB2BossRouteGen
+				getgenv().SB2BossRouteWanted = true
+				getgenv().SB2TpGate = getgenv().SB2TpGate or {}
+				getgenv().SB2TpGate.block = false
 				ensureBossRouteWatchers()
 				task.spawn(function()
-					while token == bossRouteToken and isToggleOn('BossWaypointRoute') do
+					while bossRouteAlive(token, myGen) do
 						if otherPlayersPresent() == true then
 							local who = nil
 							for _, plr in ipairs(Players:GetPlayers()) do
@@ -13458,7 +13974,7 @@ local ok, err = pcall(function()
 						local firstStop = stops[1]
 
 						for i, stop in ipairs(stops) do
-							if token ~= bossRouteToken or not isToggleOn('BossWaypointRoute') then
+							if not bossRouteAlive(token, myGen) then
 								return
 							end
 							if otherPlayersPresent() == true then
@@ -13487,10 +14003,7 @@ local ok, err = pcall(function()
 							paintBossRoute(('Boss route [%d/%d] waiting %s…'):format(i, #stops, stop.wpName))
 							local mob = nil
 							local spawnDeadline = os.clock() + 150
-							while os.clock() < spawnDeadline
-								and token == bossRouteToken
-								and isToggleOn('BossWaypointRoute')
-							do
+							while os.clock() < spawnDeadline and bossRouteAlive(token, myGen) do
 								if otherPlayersPresent() == true then
 									local who = nil
 									for _, plr in ipairs(Players:GetPlayers()) do
@@ -13517,7 +14030,7 @@ local ok, err = pcall(function()
 							paintBossRoute(('Boss route [%d/%d] fighting %s'):format(i, #stops, mob.Name))
 							Library:Notify(('Boss route — %s'):format(tostring(mob.Name)), 4)
 							-- Stay until dead / despawned.
-							while token == bossRouteToken and isToggleOn('BossWaypointRoute') do
+							while bossRouteAlive(token, myGen) do
 								if otherPlayersPresent() == true then
 									local who = nil
 									for _, plr in ipairs(Players:GetPlayers()) do
@@ -13550,7 +14063,7 @@ local ok, err = pcall(function()
 							task.wait(0.45)
 						end
 
-						if token ~= bossRouteToken or not isToggleOn('BossWaypointRoute') then
+						if not bossRouteAlive(token, myGen) then
 							return
 						end
 
@@ -13559,7 +14072,7 @@ local ok, err = pcall(function()
 							teleportBossRouteWp(firstStop.wpName)
 							setCombatTrio(true)
 							local readyAt = firstKillClock + BOSS_ROUTE_RESPAWN_SEC
-							while token == bossRouteToken and isToggleOn('BossWaypointRoute') do
+							while bossRouteAlive(token, myGen) do
 								if otherPlayersPresent() == true then
 									local who = nil
 									for _, plr in ipairs(Players:GetPlayers()) do
@@ -13585,13 +14098,13 @@ local ok, err = pcall(function()
 							end
 						end
 					end
-					if token == bossRouteToken and not isToggleOn('BossWaypointRoute') then
+					if not isToggleOn('BossWaypointRoute') then
 						paintBossRoute('Boss WP route: off')
 					end
 				end)
 			end
 
-			SoloBox:AddToggle('BossWaypointRoute', {
+			BossBox:AddToggle('BossWaypointRoute', {
 				Text = 'Boss WP route (multi)',
 				Default = false,
 				Tooltip = 'Cycles floor boss waypoints (warlord→hunter→limor→radioactive). Next WP only after kill. After last kill, waits ~90s at the first-killed boss. Like Resume: pauses if a non-alt joins, resumes when empty.',
@@ -13619,32 +14132,44 @@ local ok, err = pcall(function()
 				else
 					stopBossRoute('off')
 					clearBossRouteWatchers()
-					-- Don't kill combat if Resume still wants the trio armed.
-					if not isToggleOn('SoloCombatResume') then
-						setCombatTrio(false)
-					end
+					-- Always disarm combat on route OFF. Leaving trio on (because Resume
+					-- was still true) made OFF look like the route kept running.
+					setCombatTrio(false)
 				end
 			end)
 			getgenv().SB2StopBossWaypointRoute = function(reason)
-				stopBossRoute(reason)
+				-- Always bump gen even when toggle is already false (OnChanged won't fire).
+				stopBossRoute(reason or 'stopped')
 				clearBossRouteWatchers()
+				setCombatTrio(false)
 				pcall(function()
-					if Toggles.BossWaypointRoute and Toggles.BossWaypointRoute.Value == true then
-						Toggles.BossWaypointRoute:SetValue(false)
+					local toggle = Toggles.BossWaypointRoute
+					if type(toggle) == 'table' and type(toggle.SetValue) == 'function' and toggle.Value == true then
+						toggle:SetValue(false)
 					end
 				end)
 			end
 			-- HiveMind / MCP can't see Starlight's local Toggles — use this helper.
 			getgenv().SB2SetBossWaypointRoute = function(enabled)
 				local toggle = Toggles.BossWaypointRoute
+				enabled = enabled == true
+				if not enabled then
+					-- Force-stop first so already-false toggles still kill zombie loops.
+					stopBossRoute('off')
+					clearBossRouteWatchers()
+					setCombatTrio(false)
+				end
 				if type(toggle) ~= 'table' or type(toggle.SetValue) ~= 'function' then
 					return false
 				end
-				enabled = enabled == true
 				pcall(function()
 					if toggle.Value == enabled then
-						toggle:SetValue(not enabled)
-						task.wait()
+						if enabled then
+							toggle:SetValue(false)
+							task.wait()
+							toggle:SetValue(true)
+						end
+						return
 					end
 					toggle:SetValue(enabled)
 				end)
@@ -14260,7 +14785,7 @@ local ok, err = pcall(function()
 			end
 		end
 
-		local ComboBox = CombatTab:AddRightGroupbox('Boss combo')
+		local ComboBox = BossTab:AddRightGroupbox('Boss combo')
 		assert(ComboBox, 'Boss combo groupbox nil')
 		local bossValues = listFloorComboBosses()
 		local defaultBoss = pickDefaultComboBoss(bossValues)
@@ -14402,6 +14927,135 @@ local ok, err = pcall(function()
 		end
 
 		local InvTab = Window:AddTab('Inventory', 'package')
+
+		-- Top-right: hide unlocked inventory tiles (show Locked attribute only).
+		local FilterBox = InvTab:AddRightGroupbox('View filter')
+		assert(FilterBox, 'View filter groupbox nil')
+		do
+			local inventoryUI = RequiredServices and RequiredServices.InventoryUI
+			local originalGet = nil
+			if inventoryUI and type(inventoryUI.GetInventoryData) == 'function' then
+				originalGet = getgenv().SB2OrigGetInventoryData
+				if type(originalGet) ~= 'function' then
+					originalGet = inventoryUI.GetInventoryData
+					getgenv().SB2OrigGetInventoryData = originalGet
+				end
+			end
+
+			local function isInventoryItemLocked(entry)
+				if type(entry) ~= 'table' then
+					return false
+				end
+				if entry.Locked == true or entry.locked == true then
+					return true
+				end
+				local it = entry.item or entry.Item
+				if typeof(it) ~= 'Instance' then
+					return false
+				end
+				if it:GetAttribute('Locked') == true then
+					return true
+				end
+				local ch = it:FindFirstChild('Locked')
+				if ch then
+					if ch:IsA('BoolValue') then
+						return ch.Value == true
+					end
+					-- Non-bool Locked child still marks locked in this game.
+					return true
+				end
+				return false
+			end
+
+			local function filterLockedOnly(data)
+				if type(data) ~= 'table' then
+					return data
+				end
+				local out = table.create(#data)
+				for i = 1, #data do
+					local entry = data[i]
+					if isInventoryItemLocked(entry) then
+						out[#out + 1] = entry
+					end
+				end
+				return out
+			end
+
+			local function rebuildInventoryList()
+				local ui = RequiredServices and RequiredServices.UI
+				local im = ui and ui.InventoryMenu
+				if im and type(im.BuildInv) == 'function' then
+					pcall(im.BuildInv)
+					return true
+				end
+				return false
+			end
+
+			local function restoreDataHook()
+				if inventoryUI and type(originalGet) == 'function' then
+					pcall(function()
+						inventoryUI.GetInventoryData = originalGet
+					end)
+				end
+				getgenv().SB2InvLockedOnlyHooked = false
+			end
+
+			local function installDataHook()
+				if not inventoryUI or type(originalGet) ~= 'function' then
+					return false
+				end
+				inventoryUI.GetInventoryData = function(...)
+					local data = originalGet(...)
+					if isToggleOn('InvShowLockedOnly') then
+						return filterLockedOnly(data)
+					end
+					return data
+				end
+				getgenv().SB2InvLockedOnlyHooked = true
+				return true
+			end
+
+			getgenv().SB2InvFilterCleanup = function()
+				restoreDataHook()
+			end
+
+			FilterBox:AddLabel('Hides every unlocked tile in the in-game inventory grid.')
+			FilterBox:AddToggle('InvShowLockedOnly', {
+				Text = 'Show locked items only',
+				Default = false,
+				Tooltip = 'Filters GetInventoryData so unlocked gear is hidden. Turn off to restore the full list.',
+			}):OnChanged(function(on)
+				if on then
+					if not installDataHook() then
+						Library:Notify('Inventory filter unavailable (InventoryUI missing)', 5)
+						task.defer(function()
+							if Toggles.InvShowLockedOnly then
+								Toggles.InvShowLockedOnly:SetValue(false)
+							end
+						end)
+						return
+					end
+				else
+					restoreDataHook()
+				end
+				local rebuilt = rebuildInventoryList()
+				Library:Notify(
+					on and (rebuilt and 'Showing locked items only' or 'Filter on — reopen inventory to refresh')
+						or (rebuilt and 'Full inventory restored' or 'Filter off — reopen inventory to refresh'),
+					5
+				)
+			end)
+			FilterBox:AddButton('Refresh inventory list', function()
+				if isToggleOn('InvShowLockedOnly') then
+					installDataHook()
+				end
+				if rebuildInventoryList() then
+					Library:Notify('Inventory list rebuilt', 3)
+				else
+					Library:Notify('Open your inventory once, then try again', 5)
+				end
+			end)
+		end
 
 		-- Stations + remote upgrade (CardinalUI Upgrade remote / openUpgrade).
 		local StationsBox = InvTab:AddLeftGroupbox('Stations')
@@ -17065,7 +17719,7 @@ local ok, err = pcall(function()
 				and type(existing.start) == 'function'
 				and type(existing.isAlive) == 'function'
 				and existing.isAlive()
-				and existing._orderRev == 4
+				and existing._orderRev == 6
 			then
 				return existing
 			end
@@ -17464,21 +18118,35 @@ local ok, err = pcall(function()
 	end)()
 
 	local Settings = Window:AddTab('Settings', 'settings')
-	local Menu = Settings:AddLeftGroupbox('Menu')
+	local Menu = Settings:AddLeftGroupbox('Script')
 
 	pcall(function()
-		local combat = Library.Tabs and Library.Tabs.Combat
-		if combat and type(combat.Show) == 'function' then
-			combat:Show()
+		local home = Library.Tabs and Library.Tabs.Home
+		if home and type(home.Show) == 'function' then
+			home:Show()
 		end
 		if type(repairObsidianTabCanvas) == 'function' then
 			repairObsidianTabCanvas()
 		end
 	end)
 
-	-- Home — AutoFarm defaults to End so both can toggle independently.
-	Menu:AddLabel('Menu keybind'):AddKeyPicker('MenuKeybind', { Default = 'Home', NoUI = true })
+	-- Home keybind vs AutoFarm (End).
+	HomeBox:AddLabel('Menu keybind'):AddKeyPicker('MenuKeybind', { Default = 'Home', NoUI = true })
 	Library.ToggleKeybind = Options.MenuKeybind
+
+	HomeBox:AddButton('Hide menu (same as keybind)', function()
+		if type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
+			getgenv().SB2HidePlayerToolsMenu()
+		elseif type(Library.Toggle) == 'function' then
+			Library:Toggle()
+		end
+	end)
+
+	HomeBox:AddButton('Tile Roblox windows', function()
+		if type(getgenv().SB2TileRobloxWindows) == 'function' then
+			getgenv().SB2TileRobloxWindows()
+		end
+	end)
 
 	local function antiafkStatusText()
 		if getgenv().SB2AntiAfkOn ~= true then
@@ -17492,7 +18160,7 @@ local ok, err = pcall(function()
 		return 'Anti-AFK: armed (IY-style) — no jump / no keys'
 	end
 
-	local afkStatus = Menu:AddLabel(antiafkStatusText())
+	local afkStatus = HomeBox:AddLabel(antiafkStatusText())
 	getgenv().SB2AntiAfkPaint = function()
 		pcall(function()
 			if afkStatus and afkStatus.SetText then
@@ -17509,7 +18177,7 @@ local ok, err = pcall(function()
 		end
 	end)
 
-	Menu:AddToggle('AntiAFK', {
+	HomeBox:AddToggle('AntiAFK', {
 		Text = 'Anti-AFK',
 		Default = antiafkFileOn(),
 		Tooltip = 'Same as Infinite Yield antiafk: blocks the idle kick. No jump, no keys, no camera. Stays on after teleport if Autoexecute is on.',
@@ -17526,7 +18194,7 @@ local ok, err = pcall(function()
 		startAntiAfk()
 	end
 
-	Menu:AddToggle('HideGameplayPaused', {
+	HomeBox:AddToggle('HideGameplayPaused', {
 		Text = 'Hide gameplay paused screen',
 		Default = getgenv().SB2HideGameplayPaused ~= false,
 		Tooltip = 'Hides Roblox streaming "Gameplay paused" overlay. Does not stop streaming itself — only the full-screen notice.',
@@ -17538,6 +18206,24 @@ local ok, err = pcall(function()
 			end
 		elseif type(getgenv().SB2SetGameplayPausedUi) == 'function' then
 			getgenv().SB2SetGameplayPausedUi(true)
+		end
+	end)
+
+	HomeBox:AddToggle('FarmFps', {
+		Text = 'Farm FPS (potato graphics)',
+		Default = getgenv().SB2FarmFpsOn ~= false,
+		Tooltip = 'Quality 1 + no global shadows + no bloom/blur. Skill clone janitor always runs separately. Turn off on the main if you want pretty graphics.',
+	}):OnChanged(function(value)
+		if value then
+			if type(getgenv().SB2StartFarmFps) == 'function' then
+				getgenv().SB2StartFarmFps()
+			else
+				getgenv().SB2FarmFpsOn = true
+			end
+		elseif type(getgenv().SB2StopFarmFps) == 'function' then
+			getgenv().SB2StopFarmFps()
+		else
+			getgenv().SB2FarmFpsOn = false
 		end
 	end)
 
@@ -19307,6 +19993,117 @@ local ok, err = pcall(function()
 			pcall(tickFn)
 		end
 	end)
+
+	-- Custom Cardinal chat focuses on click, but `/` is eaten by TextChatService
+	-- (Roblox's hidden chat bar). Steal focus back onto the in-game box.
+	;(function()
+		local UIS = game:GetService('UserInputService')
+		local PlayersSvc = game:GetService('Players')
+		local prev = getgenv().SB2ChatSlashFixConn
+		if prev then
+			pcall(function()
+				prev:Disconnect()
+			end)
+		end
+
+		local function findCardinalChatBox()
+			local lp = PlayersSvc.LocalPlayer
+			local pg = lp and lp:FindFirstChild('PlayerGui')
+			if not pg then
+				return nil
+			end
+			local chat = nil
+			local cardinal = pg:FindFirstChild('CardinalUI')
+			local playerUI = cardinal and cardinal:FindFirstChild('PlayerUI')
+			chat = playerUI and playerUI:FindFirstChild('Chat')
+			if not chat then
+				local ok, found = pcall(function()
+					return pg:FindFirstChild('Chat', true)
+				end)
+				if ok then
+					chat = found
+				end
+			end
+			if not chat then
+				return nil
+			end
+			local fallback = nil
+			for _, d in ipairs(chat:GetDescendants()) do
+				if d:IsA('TextBox') then
+					local ph = string.lower(tostring(d.PlaceholderText or ''))
+					if ph:find('chat', 1, true) or ph:find('message', 1, true) then
+						return d
+					end
+					fallback = fallback or d
+				end
+			end
+			return fallback
+		end
+
+		local function isRobloxChatBox(box)
+			if not box then
+				return false
+			end
+			local core = box:FindFirstAncestorOfClass('CoreGui')
+			if not core then
+				return false
+			end
+			local n = string.lower(box.Name .. ' ' .. tostring(box.PlaceholderText or ''))
+			if n:find('chat', 1, true) or n:find('experience', 1, true) then
+				return true
+			end
+			local p = box.Parent
+			while p and p ~= core do
+				local pn = string.lower(p.Name)
+				if pn:find('chat', 1, true) or pn:find('experiencechat', 1, true) then
+					return true
+				end
+				p = p.Parent
+			end
+			return false
+		end
+
+		pcall(function()
+			local tcs = game:GetService('TextChatService')
+			local cfg = tcs:FindFirstChildOfClass('ChatInputBarConfiguration')
+			if cfg then
+				-- Keep TCS channels for send; just stop `/` opening the hidden bar.
+				if cfg.KeyboardKeyCode ~= nil then
+					cfg.KeyboardKeyCode = Enum.KeyCode.Unknown
+				end
+			end
+		end)
+
+		getgenv().SB2ChatSlashFixConn = UIS.InputBegan:Connect(function(input)
+			if getgenv().SB2ChatSlashFix == false then
+				return
+			end
+			if input.UserInputType ~= Enum.UserInputType.Keyboard then
+				return
+			end
+			if input.KeyCode ~= Enum.KeyCode.Slash then
+				return
+			end
+			task.defer(function()
+				task.wait()
+				local box = findCardinalChatBox()
+				if not box then
+					return
+				end
+				local focused = UIS:GetFocusedTextBox()
+				if focused == box then
+					return
+				end
+				if focused and not isRobloxChatBox(focused) then
+					-- IY / Starlight / inventory search — leave it.
+					return
+				end
+				pcall(function()
+					box:CaptureFocus()
+				end)
+			end)
+		end)
+	end)()
 
 	if not getgenv().SB2PlayerToolsLoadedNotify then
 		getgenv().SB2PlayerToolsLoadedNotify = true

@@ -1,8 +1,9 @@
 --[[
-    PlayerTools.lua — entry shim (Starlight by default)
+    PlayerTools.lua — entry shim (Obsidian / Ataraxia by default)
 
     Full Obsidian build: PlayerTools/PlayerTools_Obsidian.lua
-    To force Obsidian: write "obsidian" to PlayerTools/backend, then reload.
+    To force Starlight: write "starlight" to PlayerTools/backend, then reload
+    (or run PlayerTools/use_starlight.lua).
 ]]
 
 if getgenv().SB2PlayerTools == true
@@ -26,8 +27,8 @@ then
 		return getgenv().SB2RefreshPlayerTools()
 	else
 		warn('[PlayerTools] already loaded — skipping duplicate execute')
-			return
-		end
+				return
+			end
 	end
 
 	local compile = loadstring or load

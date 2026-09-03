@@ -1217,7 +1217,7 @@ function Library:CreateWindow(info)
 	local slWindow
 	local ok, err = pcall(function()
 		slWindow = Starlight:CreateWindow({
-			Name = tostring(info.Title or 'Starlight'),
+			Name = tostring(info.Title or 'Ataraxia'),
 			Subtitle = tostring(info.Footer or 'If you gaze long into an abyss, the abyss also gazes into you.'),
 			Icon = iconFor(info.Icon),
 			LoadingEnabled = false,
@@ -1325,7 +1325,7 @@ function Library:CreateWindow(info)
 
 	pcall(function()
 		game:GetService('StarterGui'):SetCore('SendNotification', {
-			Title = 'Starlight',
+			Title = 'Ataraxia',
 			Text = 'UI loaded — If you gaze long into an abyss, the abyss also gazes into you.',
 			Duration = 8,
 		})
@@ -1341,7 +1341,7 @@ function Library:Notify(text, duration)
 	end
 	safe(function()
 		Starlight:Notification({
-			Title = 'Starlight',
+			Title = 'Ataraxia',
 			Content = tostring(text),
 			Duration = tonumber(duration) or 5,
 		})

@@ -68,13 +68,18 @@ end
 
 do
 	local g = getgenv()
+	-- launch.lua sets SB2PlayerToolsLoading before calling us — that is normal.
+	-- Only skip a true duplicate (another Starlight session already mid-build / live).
 	if g.SB2PlayerToolsLoading == true then
 		local since = tonumber(g.SB2PlayerToolsLoadingSince) or 0
-		if since > 0 and (os.clock() - since) < 90 then
+		local live = type(g.SB2StarlightLib) == 'table' or g.SB2PlayerTools == true
+		if live and since > 0 and (os.clock() - since) < 90 then
 			warn('[PlayerTools/Starlight] load already in progress — skipping duplicate run')
 			return
 		end
 	end
+	g.SB2PlayerToolsLoading = true
+	g.SB2PlayerToolsLoadingSince = os.clock()
 end
 
 local function disconnectStarlightLibHooks()

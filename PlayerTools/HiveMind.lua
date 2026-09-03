@@ -14,7 +14,7 @@
 	  worker    — executes orders
 	  idle      — heartbeat only
 
-	Orders: stop | follow | stack | rally | combat_on | combat_off | solo_resume | boss_route_on | boss_route_off | deposit_crystals | dump_items
+	Orders: stop | follow | stack | rally | combat_on | combat_off | solo_resume | boss_route_on | boss_route_off | hide_menu | deposit_crystals | dump_items
 
 	Usage from PlayerTools (or alone):
 	  local Hive = loadstring(readfile('PlayerTools/HiveMind.lua'))()
@@ -138,7 +138,7 @@ Hive = {
 	_tributeWebhookUrl = '',
 	_tributeWebhookOn = false,
 	_tributePing = '', -- each user sets their own Discord snowflake; never hardcode
-	_orderRev = 4, -- bump when order handlers change so soft reload re-loadstrings HiveMind
+	_orderRev = 6, -- bump when order handlers / webhook payload change so soft reload re-loadstrings HiveMind
 }
 getgenv().SB2Hive = Hive
 
@@ -2369,7 +2369,7 @@ local function handleOrder(order)
 	local t = order.type
 	-- The selected commander is the TP target — they do not run most worker orders.
 	-- These apply to every hive client including the commander.
-	local allClients = t == 'solo_resume' or t == 'boss_route_on' or t == 'boss_route_off'
+	local allClients = t == 'solo_resume' or t == 'boss_route_on' or t == 'boss_route_off' or t == 'hide_menu'
 	if tonumber(order.commanderId) == USER_ID and not allClients then
 		-- Still arm trade accept when workers are dumping to us.
 		if t == 'dump_items' or t == 'deposit_crystals' then
@@ -2384,6 +2384,10 @@ local function handleOrder(order)
 	local function setBossRouteToggle(on)
 		local okSet = false
 		pcall(function()
+			if on ~= true and type(getgenv().SB2StopBossWaypointRoute) == 'function' then
+				-- Hard stop (bumps gen) even when the toggle is already false.
+				pcall(getgenv().SB2StopBossWaypointRoute, 'hive-off')
+			end
 			if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
 				okSet = getgenv().SB2SetBossWaypointRoute(on == true) == true
 			end
@@ -2395,6 +2399,11 @@ local function handleOrder(order)
 			local toggles = resolveToggles()
 			local toggle = toggles and toggles.BossWaypointRoute
 			if type(toggle) == 'table' and type(toggle.SetValue) == 'function' then
+				if on ~= true then
+					if type(getgenv().SB2StopBossWaypointRoute) == 'function' then
+						pcall(getgenv().SB2StopBossWaypointRoute, 'hive-off')
+					end
+				end
 				if toggle.Value == on then
 					-- Force OnChanged so a stuck-on/off still restarts or clears.
 					toggle:SetValue(not on)
@@ -2454,6 +2463,13 @@ local function handleOrder(order)
 	elseif t == 'boss_route_off' then
 		local okSet = setBossRouteToggle(false)
 		notify(okSet and 'Order: boss route off' or 'Order: boss route missing toggle')
+	elseif t == 'hide_menu' then
+		pcall(function()
+			if type(getgenv().SB2HidePlayerToolsMenu) == 'function' then
+				getgenv().SB2HidePlayerToolsMenu()
+			end
+		end)
+		notify('Order: hide menu')
 	elseif t == 'deposit_crystals' then
 		depositCrystals(order)
 	elseif t == 'dump_items' then
@@ -2945,24 +2961,18 @@ local function postTributeWebhook(payload)
 	if type(url) ~= 'string' or url == '' or not url:find('discord.com/api/webhooks', 1, true) then
 		return
 	end
-	local who = LocalPlayer and (LocalPlayer.DisplayName or LocalPlayer.Name) or '?'
 	local user = LocalPlayer and LocalPlayer.Name or '?'
 	local title = payload.name or 'Tribute'
-	local desc = ('**Tribute drop** on `%s`\nAccount: **%s** (@%s)\nPlace `%s` · Job `%s`'):format(
-		tostring(title),
-		tostring(who),
-		tostring(user),
-		tostring(game.PlaceId),
-		tostring(game.JobId)
-	)
 	if payload.upgrade then
-		desc = desc .. ('\nUpgrade: +%s'):format(tostring(payload.upgrade))
+		title = ('%s (+%s)'):format(tostring(title), tostring(payload.upgrade))
 	end
+	local timeStr = os.date('%Y-%m-%d %H:%M:%S')
 	local pingId = tostring(Hive._tributePing or ''):gsub('%D', '')
+	-- Message body is ping-only (no extra text). Details live in the embed fields.
 	local content = ''
 	local allowed = { parse = {} }
 	if pingId ~= '' then
-		content = ('<@%s> Tribute drop: **%s**'):format(pingId, tostring(title))
+		content = ('<@%s>'):format(pingId)
 		allowed = { parse = {}, users = { pingId } }
 	end
 	task.spawn(function()
@@ -2971,25 +2981,17 @@ local function postTributeWebhook(payload)
 			Method = 'POST',
 			Headers = { ['Content-Type'] = 'application/json' },
 			Body = HttpService:JSONEncode({
-				username = 'HiveMind',
 				content = content,
 				allowed_mentions = allowed,
 				embeds = {
 					{
 						title = '🏆 Tribute drop',
-						description = desc,
 						color = 0xF1C40F,
 						fields = {
-							{ name = 'Item', value = tostring(title), inline = true },
-							{ name = 'Rarity', value = 'Tribute', inline = true },
-							{
-								name = 'Account',
-								value = tostring(user),
-								inline = true,
-							},
+							{ name = 'ITEM', value = tostring(title), inline = false },
+							{ name = 'ACCOUNT', value = tostring(user), inline = false },
+							{ name = 'TIME', value = tostring(timeStr), inline = false },
 						},
-						footer = { text = 'PlayerTools HiveMind' },
-						timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ'),
 					},
 				},
 			}),
