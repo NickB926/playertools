@@ -578,6 +578,11 @@ local function addInput(box, idx, opts)
 	end
 
 	if opts.Finished then
+		-- Keep Value live while typing so other buttons (e.g. Test webhook) can read
+		-- the pasted URL before FocusLost commits / fires Callback.
+		boxIn:GetPropertyChangedSignal('Text'):Connect(function()
+			obj.Value = boxIn.Text
+		end)
 		boxIn.FocusLost:Connect(function(enter)
 			if enter or true then
 				commit()

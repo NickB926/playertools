@@ -18073,13 +18073,13 @@ local ok, err = pcall(function()
 				Text = 'Your Discord webhook URL',
 				Default = webhookUrl or '',
 				Placeholder = 'https://discord.com/api/webhooks/...',
-				Finished = true,
+				Finished = false,
 				ClearTextOnFocus = false,
 				Callback = function(value)
 					local on = Toggles.HiveTributeWebhook and Toggles.HiveTributeWebhook.Value
 					local ping = Options.HiveTributePing and Options.HiveTributePing.Value or ''
 					if type(Hive.setTributeWebhook) == 'function' then
-						Hive.setTributeWebhook(tostring(value or ''), on == true, tostring(ping or ''))
+						Hive.setTributeWebhook(tostring(value or ''), on == true, tostring(ping or ''), { quiet = true })
 					end
 				end,
 			})
@@ -18087,13 +18087,13 @@ local ok, err = pcall(function()
 				Text = 'Your Discord user ID (who to ping)',
 				Default = webhookPing or '',
 				Placeholder = 'numbers only — leave blank for no ping',
-				Finished = true,
+				Finished = false,
 				ClearTextOnFocus = false,
 				Callback = function(value)
 					local on = Toggles.HiveTributeWebhook and Toggles.HiveTributeWebhook.Value
 					local url = Options.HiveTributeWebhook and Options.HiveTributeWebhook.Value or ''
 					if type(Hive.setTributeWebhook) == 'function' then
-						Hive.setTributeWebhook(tostring(url or ''), on == true, tostring(value or ''))
+						Hive.setTributeWebhook(tostring(url or ''), on == true, tostring(value or ''), { quiet = true })
 					end
 				end,
 			})

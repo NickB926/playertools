@@ -138,7 +138,7 @@ Hive = {
 	_tributeWebhookUrl = '',
 	_tributeWebhookOn = false,
 	_tributePing = '', -- each user sets their own Discord snowflake; never hardcode
-	_orderRev = 7, -- bump when order handlers / webhook payload change so soft reload re-loadstrings HiveMind
+	_orderRev = 8, -- bump when order handlers / webhook payload change so soft reload re-loadstrings HiveMind
 }
 getgenv().SB2Hive = Hive
 
@@ -2845,6 +2845,36 @@ end
 
 -- ── Tribute drop → Discord webhook ───────────────────────────────
 
+local function normalizeDiscordWebhookUrl(raw)
+	local url = tostring(raw or '')
+	-- People paste <url>, quotes, newlines, or trailing junk.
+	url = url:gsub('^%s+', ''):gsub('%s+$', '')
+	url = url:gsub('^<', ''):gsub('>$', '')
+	url = url:gsub('^["\']', ''):gsub('["\']$', '')
+	url = url:gsub('%s+', '')
+	-- discordapp.com / canary / ptb all work; normalize host for our checks + POST.
+	url = url:gsub('^https://discordapp%.com/', 'https://discord.com/')
+	url = url:gsub('^https://canary%.discord%.com/', 'https://discord.com/')
+	url = url:gsub('^https://ptb%.discord%.com/', 'https://discord.com/')
+	url = url:gsub('^http://discord%.com/', 'https://discord.com/')
+	url = url:gsub('^http://discordapp%.com/', 'https://discord.com/')
+	return url
+end
+
+local function isDiscordWebhookUrl(url)
+	if type(url) ~= 'string' or url == '' then
+		return false
+	end
+	-- Accept discord.com and legacy discordapp.com (pre-normalize or raw).
+	if url:find('discord.com/api/webhooks/', 1, true) then
+		return true
+	end
+	if url:find('discordapp.com/api/webhooks/', 1, true) then
+		return true
+	end
+	return false
+end
+
 local function httpRequest(opts)
 	local req = (syn and syn.request)
 		or http_request
@@ -2915,7 +2945,7 @@ local function readTributeWebhookConfig()
 	-- Prefer per-account file so Nick/friend don't share URL/ping on the same PC.
 	local data = readJson(tributeWebhookPath())
 	if type(data) == 'table' then
-		local url = type(data.url) == 'string' and data.url or ''
+		local url = normalizeDiscordWebhookUrl(type(data.url) == 'string' and data.url or '')
 		local on = data.enabled == true
 		local ping = type(data.ping) == 'string' and data.ping:gsub('%D', '') or ''
 		if ping == '' then
@@ -2930,7 +2960,7 @@ local function readTributeWebhookConfig()
 		local localPing = readLocalTestPing()
 		return '', false, localPing
 	end
-	local url = type(legacy.url) == 'string' and legacy.url or ''
+	local url = normalizeDiscordWebhookUrl(type(legacy.url) == 'string' and legacy.url or '')
 	local on = legacy.enabled == true
 	local ping = ''
 	local legacyOwner = tonumber(legacy.userId)
@@ -2974,9 +3004,10 @@ local function snapshotTributeInventory()
 end
 
 local function postTributeWebhook(payload)
-	local url = Hive._tributeWebhookUrl
-	if type(url) ~= 'string' or url == '' or not url:find('discord.com/api/webhooks', 1, true) then
-		return
+	local url = normalizeDiscordWebhookUrl(Hive._tributeWebhookUrl)
+	Hive._tributeWebhookUrl = url
+	if not isDiscordWebhookUrl(url) then
+		return false, 'bad url'
 	end
 	local user = LocalPlayer and LocalPlayer.Name or '?'
 	local title = payload.name or 'Tribute'
@@ -2992,28 +3023,41 @@ local function postTributeWebhook(payload)
 		content = ('<@%s>'):format(pingId)
 		allowed = { parse = {}, users = { pingId } }
 	end
+	local body = HttpService:JSONEncode({
+		content = content,
+		allowed_mentions = allowed,
+		embeds = {
+			{
+				title = '🏆 Tribute drop',
+				color = 0xF1C40F,
+				fields = {
+					{ name = 'ITEM', value = tostring(title), inline = false },
+					{ name = 'ACCOUNT', value = tostring(user), inline = false },
+					{ name = 'TIME', value = tostring(timeStr), inline = false },
+				},
+			},
+		},
+	})
+	local done, result
+	local finished = false
 	task.spawn(function()
-		httpRequest({
+		local ok, res = httpRequest({
 			Url = url,
 			Method = 'POST',
 			Headers = { ['Content-Type'] = 'application/json' },
-			Body = HttpService:JSONEncode({
-				content = content,
-				allowed_mentions = allowed,
-				embeds = {
-					{
-						title = '🏆 Tribute drop',
-						color = 0xF1C40F,
-						fields = {
-							{ name = 'ITEM', value = tostring(title), inline = false },
-							{ name = 'ACCOUNT', value = tostring(user), inline = false },
-							{ name = 'TIME', value = tostring(timeStr), inline = false },
-						},
-					},
-				},
-			}),
+			Body = body,
 		})
+		done, result = ok, res
+		finished = true
 	end)
+	-- Non-blocking for drops; test path can wait briefly via returned waiter.
+	return true, function(timeout)
+		local deadline = os.clock() + (tonumber(timeout) or 4)
+		while not finished and os.clock() < deadline do
+			task.wait(0.05)
+		end
+		return done, result
+	end
 end
 
 local function onTributeInventoryItem(item)
@@ -3048,8 +3092,9 @@ local function startTributeWatch()
 	if not Hive._tributeWebhookOn then
 		return
 	end
-	local url = Hive._tributeWebhookUrl
-	if type(url) ~= 'string' or url == '' then
+	local url = normalizeDiscordWebhookUrl(Hive._tributeWebhookUrl)
+	Hive._tributeWebhookUrl = url
+	if not isDiscordWebhookUrl(url) then
 		return
 	end
 	Hive._tributeKnown = snapshotTributeInventory()
@@ -3081,8 +3126,10 @@ function Hive.getTributeWebhook()
 	return url, on, Hive._tributePing
 end
 
-function Hive.setTributeWebhook(url, enabled, ping)
-	url = type(url) == 'string' and url:gsub('^%s+', ''):gsub('%s+$', '') or ''
+function Hive.setTributeWebhook(url, enabled, ping, opts)
+	opts = type(opts) == 'table' and opts or {}
+	local quiet = opts.quiet == true
+	url = normalizeDiscordWebhookUrl(url)
 	Hive._tributeWebhookUrl = url
 	if enabled ~= nil then
 		Hive._tributeWebhookOn = enabled == true
@@ -3092,12 +3139,22 @@ function Hive.setTributeWebhook(url, enabled, ping)
 		Hive._tributePing = ping:gsub('%D', '')
 	end
 	writeTributeWebhookConfig(Hive._tributeWebhookUrl, Hive._tributeWebhookOn, Hive._tributePing)
-	if Hive._tributeWebhookOn and Hive._tributeWebhookUrl ~= '' then
+	if Hive._tributeWebhookOn and isDiscordWebhookUrl(Hive._tributeWebhookUrl) then
 		startTributeWatch()
-		notify('Tribute webhook armed')
+		if not quiet then
+			notify('Tribute webhook armed')
+		end
 	else
 		stopTributeWatch()
-		notify('Tribute webhook off')
+		if Hive._tributeWebhookOn and Hive._tributeWebhookUrl ~= '' and not isDiscordWebhookUrl(Hive._tributeWebhookUrl) then
+			if not quiet then
+				notify('Webhook URL looks invalid (need discord.com/api/webhooks/...)')
+			end
+			Hive._tributeWebhookOn = false
+			writeTributeWebhookConfig(Hive._tributeWebhookUrl, false, Hive._tributePing)
+		elseif not quiet then
+			notify('Tribute webhook off')
+		end
 	end
 end
 
@@ -3113,22 +3170,53 @@ end
 
 -- Sends a sample Discord post using the current (or override) URL/ping. Does not require the toggle.
 function Hive.testTributeWebhook(urlOverride, pingOverride)
-	if type(urlOverride) == 'string' and urlOverride:gsub('%s', '') ~= '' then
-		Hive._tributeWebhookUrl = urlOverride:gsub('^%s+', ''):gsub('%s+$', '')
+	local fromUi = normalizeDiscordWebhookUrl(urlOverride)
+	if fromUi ~= '' then
+		Hive._tributeWebhookUrl = fromUi
+	else
+		-- Fall back to saved config if UI Value was empty (pre-commit paste).
+		local saved = select(1, readTributeWebhookConfig())
+		saved = normalizeDiscordWebhookUrl(saved)
+		if saved ~= '' then
+			Hive._tributeWebhookUrl = saved
+		end
 	end
 	if type(pingOverride) == 'string' then
 		Hive._tributePing = pingOverride:gsub('%D', '')
 	end
-	local url = Hive._tributeWebhookUrl
-	if type(url) ~= 'string' or url == '' or not url:find('discord.com/api/webhooks', 1, true) then
-		notify('Set a Discord webhook URL first')
+	local url = normalizeDiscordWebhookUrl(Hive._tributeWebhookUrl)
+	Hive._tributeWebhookUrl = url
+	if not isDiscordWebhookUrl(url) then
+		local preview = url ~= '' and url:sub(1, 40) or '(empty)'
+		notify('Need a Discord webhook URL (got: ' .. preview .. ')')
 		return false
 	end
-	postTributeWebhook({
+	-- Persist what we're testing so reinject keeps it.
+	writeTributeWebhookConfig(url, Hive._tributeWebhookOn == true, Hive._tributePing)
+	local okStart, waiter = postTributeWebhook({
 		name = 'Webhook test',
 		upgrade = nil,
 		instanceId = 'test',
 	})
+	if not okStart then
+		notify('Webhook POST could not start')
+		return false
+	end
+	if type(waiter) == 'function' then
+		local okHttp, res = waiter(5)
+		local code = 0
+		if type(res) == 'table' then
+			code = tonumber(res.StatusCode or res.Status or res.statusCode) or 0
+		end
+		if okHttp == false then
+			notify('Webhook request failed (executor HTTP?)')
+			return false
+		end
+		if code ~= 0 and (code < 200 or code >= 300) then
+			notify(('Webhook HTTP %s — check URL / channel'):format(tostring(code)))
+			return false
+		end
+	end
 	notify('Test webhook sent')
 	return true
 end
