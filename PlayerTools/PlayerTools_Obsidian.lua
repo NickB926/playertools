@@ -2349,14 +2349,18 @@ local ok, err = pcall(function()
 	end
 
 	local okLib, librarySource = pcall(httpGet, CONFIG.UIRepo .. 'Library.lua')
-	-- Ataraxia chrome test: use local Obsidian-compatible Roster UI instead of Obsidian.
+	-- Ataraxia chrome: default unless backend explicitly pins obsidian/starlight.
 	do
 		local wantAtaraxia = getgenv().SB2UseAtaraxiaLib == true
 		if not wantAtaraxia and type(isfile) == 'function' and type(readfile) == 'function' then
 			local okB, body = pcall(readfile, 'PlayerTools/backend')
-			if okB and tostring(body):lower():gsub('%s', '') == 'ataraxia' then
+			local v = okB and tostring(body):lower():gsub('%s', '') or ''
+			-- Match launch.lua: missing / empty / ataraxia → Ataraxia. Only obsidian/starlight opt out.
+			if v == '' or v == 'ataraxia' then
 				wantAtaraxia = true
 			end
+		elseif not wantAtaraxia then
+			wantAtaraxia = true
 		end
 		if wantAtaraxia then
 			local ataPath = 'PlayerTools/AtaraxiaLibrary.lua'
@@ -12685,13 +12689,13 @@ local ok, err = pcall(function()
 			end)
 			CombatBox:AddToggle('SupportSkill', {
 				Text = 'Auto support skill',
-				Default = true,
-				Tooltip = 'Cast the support buff (CE etc.) on its cooldown while Auto skill is on.',
+				Default = false,
+				Tooltip = 'Cast the support buff (CE etc.) on its cooldown while Auto skill is on. Saved with your autoload profile.',
 			})
 			CombatBox:AddToggle('SupportBossOnly', {
 				Text = 'Support only on bosses',
-				Default = true,
-				Tooltip = 'Only cast support near bosses / event elites (Aeganatos, Saurus, Meta Figure, DJ Reaper). Off = cast whenever Auto support is on.',
+				Default = false,
+				Tooltip = 'Only cast support near bosses / event elites (Aeganatos, Saurus, Meta Figure, DJ Reaper). Off = cast whenever Auto support is on. Saved with your autoload profile.',
 			})
 			CombatBox:AddButton('Refresh skills', function()
 				refreshSkillDropdown(true)
@@ -18106,6 +18110,15 @@ local ok, err = pcall(function()
 					Hive.setTributeWebhookEnabled(on == true)
 				end
 			end)
+			HiveBox:AddButton('Test webhook', function()
+				local url = Options.HiveTributeWebhook and Options.HiveTributeWebhook.Value or ''
+				local ping = Options.HiveTributePing and Options.HiveTributePing.Value or ''
+				if type(Hive.testTributeWebhook) == 'function' then
+					Hive.testTributeWebhook(tostring(url or ''), tostring(ping or ''))
+				else
+					Library:Notify('Reload HiveMind for test webhook')
+				end
+			end)
 
 			OrdersBox:AddLabel('TP hops to the commander then free roam. Follow/Stack keep locking until Stop workers.')
 			OrdersBox:AddButton('TP others to commander', function()
@@ -18213,13 +18226,10 @@ local ok, err = pcall(function()
 			})
 			TradeBox:AddToggle('HiveAcceptTrades', {
 				Text = 'Commander: accept hive trades',
-				Default = true,
+				Default = false,
+				Tooltip = 'Saved with your autoload profile — stays off after reinject if you leave it off.',
 			}):OnChanged(function(on)
-				Hive.setAcceptHiveTrades(on)
-			end)
-			-- Default=true does not always fire OnChanged — arm accept immediately.
-			pcall(function()
-				Hive.setAcceptHiveTrades(true)
+				Hive.setAcceptHiveTrades(on == true)
 			end)
 			TradeBox:AddButton('Workers: deposit to commander', function()
 				local rarity = Options.HiveCrystalType and Options.HiveCrystalType.Value or 'Legendary'
@@ -18515,7 +18525,7 @@ local ok, err = pcall(function()
 			'AutoSkipLoading',
 			'HiveEnabled',
 			'HiveCommander',
-			'HiveAcceptTrades',
+			-- HiveAcceptTrades is profile-saved (was ignored → always Default=true after reinject).
 			'HiveCrystalType',
 			'HiveCrystalAmount',
 			-- Owned by combat_prefs.json — survive profile switch / autoload.
@@ -18659,7 +18669,6 @@ local ok, err = pcall(function()
 			AutoSkipLoading = true,
 			HiveEnabled = true,
 			HiveCommander = true,
-			HiveAcceptTrades = true,
 			HiveCrystalType = true,
 			HiveCrystalAmount = true,
 			-- combat_prefs.json owns these across profiles
@@ -19156,32 +19165,43 @@ local ok, err = pcall(function()
 					end
 				end
 			end
-			-- Sidecars fill gaps only — never let a Default=false wipe override a profile that had Resume ON.
+			-- Sidecars are written on every Resume / Auto block toggle — they win over
+			-- a stale autoload JSON until autosave catches up (and when Overwrite was skipped).
 			local fileBlock = readAutoblockFileWanted()
-			if lastSoloBlock.AutoBlockJoin == nil and fileBlock ~= nil then
+			if fileBlock ~= nil then
 				lastSoloBlock.AutoBlockJoin = fileBlock
-			elseif fileBlock == true then
-				lastSoloBlock.AutoBlockJoin = true
+				lastProfileToggles.AutoBlockJoin = fileBlock
+			elseif lastSoloBlock.AutoBlockJoin == nil and lastProfileToggles.AutoBlockJoin ~= nil then
+				lastSoloBlock.AutoBlockJoin = lastProfileToggles.AutoBlockJoin == true
 			end
 			local fileSolo = readSoloResumeFileWanted()
-			if lastSoloBlock.SoloCombatResume == true then
-				-- Profile JSON already said ON — keep it and repair a wiped sidecar.
-				writeSoloResumeFile(true)
-			elseif lastSoloBlock.SoloCombatResume == nil and fileSolo ~= nil then
+			if fileSolo ~= nil then
 				lastSoloBlock.SoloCombatResume = fileSolo
-			elseif fileSolo == true then
-				lastSoloBlock.SoloCombatResume = true
-			elseif lastSoloBlock.SoloCombatResume == nil and lastProfileToggles.SoloCombatResume == true then
-				lastSoloBlock.SoloCombatResume = true
-				writeSoloResumeFile(true)
+				lastProfileToggles.SoloCombatResume = fileSolo
+			elseif lastSoloBlock.SoloCombatResume == nil and lastProfileToggles.SoloCombatResume ~= nil then
+				lastSoloBlock.SoloCombatResume = lastProfileToggles.SoloCombatResume == true
 			elseif lastSoloBlock.SoloCombatResume == nil
 				and type(lastCombatOptions.SoloResumeWaypoint) == 'string'
 				and lastCombatOptions.SoloResumeWaypoint ~= ''
 				and lastCombatOptions.SoloResumeWaypoint ~= '(none)'
 			then
-				-- Saved waypoint implies Resume should come back on.
+				-- Saved waypoint with no sidecar yet — assume Resume should come back on.
 				lastSoloBlock.SoloCombatResume = true
 				writeSoloResumeFile(true)
+			end
+			if lastSoloBlock.SoloCombatResume == true then
+				writeSoloResumeFile(true)
+			elseif lastSoloBlock.SoloCombatResume == false then
+				writeSoloResumeFile(false)
+			end
+			if lastSoloBlock.AutoBlockJoin == true then
+				if type(writefile) == 'function' then
+					pcall(writefile, AUTOBLOCK_PATH, 'true')
+				end
+			elseif lastSoloBlock.AutoBlockJoin == false then
+				if type(writefile) == 'function' then
+					pcall(writefile, AUTOBLOCK_PATH, 'false')
+				end
 			end
 			local sidecar = readCombatSkillsSidecar()
 			if type(sidecar) == 'table' then
@@ -19901,7 +19921,8 @@ local ok, err = pcall(function()
 
 		SaveManager:BuildConfigSection(Settings)
 		Settings:AddLabel('Autoload is per account. Profiles are shared — Set as autoload only changes this client.')
-		Settings:AddLabel('Resume / Auto block save into the profile JSON + sidecars. Farm height, flee depth, and skills save in combat_prefs.json (survive profile switch).')
+		Settings:AddLabel('Autosave: toggles you flip are written to your autoload profile (debounced). No need to smash Overwrite after every change.')
+		Settings:AddLabel('Resume / Auto block also use sidecars. Farm height, flee depth, and skills save in combat_prefs.json (survive profile switch).')
 
 		do
 			local UpdateBox = Settings:AddRightGroupbox('GitHub updates')
@@ -20086,6 +20107,127 @@ local ok, err = pcall(function()
 				pcall(getgenv().SB2AssertResumeOn, 'delay20')
 			end
 		end)
+
+		-- Per-account profile + debounced autosave so OFF stays OFF after reinject.
+		do
+			local autosaveEnabled = false
+			local autosaveToken = 0
+			local lastAutosaveAt = 0
+			local hookedAutosave = false
+
+			local function defaultAccountProfileName()
+				return 'account_' .. autoloadAccountKey()
+			end
+
+			local function ensureAccountAutoload()
+				local name = resolveAutoloadName()
+				if name then
+					return name
+				end
+				local key = defaultAccountProfileName()
+				getgenv().SB2ConfigLoading = true
+				pcall(function()
+					SaveManager:Save(key)
+				end)
+				pcall(function()
+					SaveManager:SaveAutoloadConfig(key)
+				end)
+				getgenv().SB2ConfigLoading = false
+				return key
+			end
+
+			local function runAutosave(reason)
+				if getgenv().SB2ConfigLoading == true then
+					return false
+				end
+				if getgenv().SB2PlayerToolsManualUnload == true then
+					return false
+				end
+				local name = ensureAccountAutoload()
+				if not name or name == '' or name == 'none' then
+					return false
+				end
+				local okSave = false
+				pcall(function()
+					okSave = SaveManager:Save(name) == true
+				end)
+				if okSave then
+					lastAutosaveAt = os.clock()
+					-- Keep in-memory last toggles aligned with what we just wrote.
+					pcall(function()
+						for idx, toggle in pairs(Toggles or {}) do
+							if type(idx) == 'string' and type(toggle) == 'table' and not PROFILE_SKIP[idx] then
+								lastProfileToggles[idx] = toggle.Value == true
+							end
+						end
+					end)
+				end
+				return okSave
+			end
+
+			local function scheduleAutosave(reason)
+				if not autosaveEnabled then
+					return
+				end
+				if getgenv().SB2ConfigLoading == true then
+					return
+				end
+				autosaveToken += 1
+				local token = autosaveToken
+				task.delay(1.4, function()
+					if token ~= autosaveToken then
+						return
+					end
+					if getgenv().SB2ConfigLoading == true then
+						return
+					end
+					pcall(runAutosave, reason or 'change')
+				end)
+			end
+
+			getgenv().SB2ScheduleProfileAutosave = scheduleAutosave
+			getgenv().SB2EnsureAccountAutoload = ensureAccountAutoload
+
+			local function hookAutosaveListeners()
+				if hookedAutosave then
+					return
+				end
+				hookedAutosave = true
+				pcall(function()
+					for idx, toggle in pairs(Toggles or {}) do
+						if type(toggle) == 'table' and type(toggle.OnChanged) == 'function' then
+							toggle:OnChanged(function()
+								scheduleAutosave('toggle:' .. tostring(idx))
+							end)
+						end
+					end
+				end)
+				pcall(function()
+					for idx, opt in pairs(Options or {}) do
+						if type(idx) == 'string' and string.find(idx, 'SaveManager', 1, true) then
+							continue
+						end
+						if type(opt) == 'table' and type(opt.OnChanged) == 'function' then
+							opt:OnChanged(function()
+								scheduleAutosave('option:' .. tostring(idx))
+							end)
+						end
+					end
+				end)
+			end
+
+			-- After boot settle: create account profile if missing, then arm autosave.
+			task.delay(3.5, function()
+				pcall(ensureAccountAutoload)
+				autosaveEnabled = true
+				hookAutosaveListeners()
+			end)
+			-- Catch late-created toggles (hive/orders etc.).
+			task.delay(8, function()
+				hookedAutosave = false
+				hookAutosaveListeners()
+			end)
+		end
 
 		-- continueAfterConfig runs from scheduleSoloBlockApply after deferred loads.
 		if lastSoloBlock.SoloCombatResume == nil and lastSoloBlock.AutoBlockJoin == nil then

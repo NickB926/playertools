@@ -91,6 +91,37 @@ else
 	end
 end
 
+-- Friends stuck on Obsidian chrome: ensure Ataraxia bits even when version matches.
+do
+	local function ensureFile(rel)
+		local path = rel
+		if type(isfile) == 'function' and isfile(path) then
+			return true
+		end
+		local body = httpGet(BASE .. '/' .. rel)
+		if type(body) == 'string' and body ~= '' then
+			pcall(writefile, path, body)
+			return true
+		end
+		return false
+	end
+	ensureFile('PlayerTools/AtaraxiaLibrary.lua')
+	-- Migrate default chrome. Explicit starlight pin is left alone.
+	local be = ''
+	if type(isfile) == 'function' and isfile('PlayerTools/backend') and type(readfile) == 'function' then
+		local okBe, bodyBe = pcall(readfile, 'PlayerTools/backend')
+		if okBe then
+			be = tostring(bodyBe):lower():gsub('%s', '')
+		end
+	end
+	if be ~= 'starlight' then
+		pcall(writefile, 'PlayerTools/backend', 'ataraxia\n')
+		if be == 'obsidian' or be == '' then
+			say('chrome → ataraxia (was ' .. (be == '' and 'unset' or be) .. ')')
+		end
+	end
+end
+
 local launch = (isfile and isfile('PlayerTools/launch.lua') and readfile('PlayerTools/launch.lua')) or nil
 if type(launch) ~= 'string' or launch == '' then
 	launch = httpGet(BASE .. '/PlayerTools/launch.lua')

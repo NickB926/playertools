@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.9",
-    "message":  "bootstrap skip same-version; fresh finder current floor only",
+    "version":  "1.0.10",
+    "message":  "Ataraxia chrome: ship backend file + migrate friends off Obsidian",
     "files":  [
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",
@@ -26,6 +26,7 @@
                   "PlayerTools/ClearCharItems.iy",
                   "PlayerTools/StuckLoadRejoin.iy",
                   "PlayerTools/AutoHideIY.iy",
+                  "PlayerTools/backend",
                   "PlayerTools/use_obsidian.lua",
                   "PlayerTools/use_ataraxia.lua",
                   "PlayerTools/version.json"

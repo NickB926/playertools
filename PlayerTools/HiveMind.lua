@@ -138,7 +138,7 @@ Hive = {
 	_tributeWebhookUrl = '',
 	_tributeWebhookOn = false,
 	_tributePing = '', -- each user sets their own Discord snowflake; never hardcode
-	_orderRev = 6, -- bump when order handlers / webhook payload change so soft reload re-loadstrings HiveMind
+	_orderRev = 7, -- bump when order handlers / webhook payload change so soft reload re-loadstrings HiveMind
 }
 getgenv().SB2Hive = Hive
 
@@ -3109,6 +3109,28 @@ function Hive.setTributeWebhookEnabled(on)
 	else
 		stopTributeWatch()
 	end
+end
+
+-- Sends a sample Discord post using the current (or override) URL/ping. Does not require the toggle.
+function Hive.testTributeWebhook(urlOverride, pingOverride)
+	if type(urlOverride) == 'string' and urlOverride:gsub('%s', '') ~= '' then
+		Hive._tributeWebhookUrl = urlOverride:gsub('^%s+', ''):gsub('%s+$', '')
+	end
+	if type(pingOverride) == 'string' then
+		Hive._tributePing = pingOverride:gsub('%D', '')
+	end
+	local url = Hive._tributeWebhookUrl
+	if type(url) ~= 'string' or url == '' or not url:find('discord.com/api/webhooks', 1, true) then
+		notify('Set a Discord webhook URL first')
+		return false
+	end
+	postTributeWebhook({
+		name = 'Webhook test',
+		upgrade = nil,
+		instanceId = 'test',
+	})
+	notify('Test webhook sent')
+	return true
 end
 
 -- Restore webhook watch across reloads (does not require Join hive).

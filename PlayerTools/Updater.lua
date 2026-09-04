@@ -213,6 +213,18 @@ function Updater.apply(opts)
 	end
 
 	say(('Update done - %d ok, %d failed. Rejoin / reload PlayerTools.'):format(okCount, failCount))
+	-- Pin Ataraxia chrome after apply (friends often still had local backend=obsidian).
+	pcall(function()
+		if type(writefile) == 'function' then
+			local be = ''
+			if type(isfile) == 'function' and isfile('PlayerTools/backend') and type(readfile) == 'function' then
+				be = tostring(readfile('PlayerTools/backend')):lower():gsub('%s', '')
+			end
+			if be ~= 'starlight' then
+				writefile('PlayerTools/backend', 'ataraxia\n')
+			end
+		end
+	end)
 	return failCount == 0, ('%d/%d'):format(okCount, #files)
 end
 
