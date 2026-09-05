@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.13",
+    "version":  "1.0.14",
     "message":  "Ataraxia chrome: ship backend file + migrate friends off Obsidian",
     "files":  [
                   "PlayerTools/launch.lua",

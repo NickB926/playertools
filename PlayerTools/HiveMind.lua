@@ -214,10 +214,12 @@ local function getRoot(player)
 	if not player then
 		return nil
 	end
-	local chars = workspace:FindFirstChild('Characters')
-	local char = chars and chars:FindFirstChild(player.Name)
+	-- Prefer the live Player.Character. workspace.Characters can lag a replica
+	-- at an old pad, which made hive warps rewind / jump ahead.
+	local char = player.Character
 	if not (char and char.Parent) then
-		char = player.Character
+		local chars = workspace:FindFirstChild('Characters')
+		char = chars and chars:FindFirstChild(player.Name)
 	end
 	if not char then
 		return nil
@@ -225,13 +227,21 @@ local function getRoot(player)
 	return char:FindFirstChild('HumanoidRootPart') or char:FindFirstChild('UpperTorso')
 end
 
--- Bare HRP.CFrame every Heartbeat desyncs the server (and the sword) → 0 killaura.
+-- One owner for hive motion. Overlapping 0.85s pins + Combat Anchor lock = rewind.
 local function warpToCFrame(cf)
 	if typeof(cf) ~= 'CFrame' then
 		return false
 	end
+	if type(getgenv().SB2SetAnchorLockCF) == 'function' then
+		pcall(getgenv().SB2SetAnchorLockCF, cf)
+	else
+		getgenv().SB2AnchorLockCF = cf
+	end
+	if type(getgenv().SB2MoveCharacter) == 'function' then
+		return pcall(getgenv().SB2MoveCharacter, cf)
+	end
 	if type(getgenv().SB2PinTeleportCFrame) == 'function' then
-		return pcall(getgenv().SB2PinTeleportCFrame, cf, 0.85)
+		return pcall(getgenv().SB2PinTeleportCFrame, cf, 0.55)
 	end
 	local model = LocalPlayer.Character
 	local root = getRoot(LocalPlayer)
@@ -564,17 +574,42 @@ local function followOffset(mode, order)
 	return Vector3.new(math.cos(angle) * radius, 3, math.sin(angle) * radius)
 end
 
+local function commanderDestCFrame(order, mode)
+	mode = mode or 'stack'
+	local offset = followOffset(mode, order)
+	local cmd = commanderPlayer(order)
+	local theirRoot = cmd and getRoot(cmd)
+	local cmdId = order and tonumber(order.commanderId)
+	local peer
+	for _, p in ipairs(listPeers()) do
+		if p.userId == cmdId and p.pos then
+			peer = p
+			break
+		end
+	end
+	local peerPos = peer and peer.pos and Vector3.new(peer.pos.x, peer.pos.y, peer.pos.z) or nil
+	if theirRoot and peerPos and (theirRoot.Position - peerPos).Magnitude > 20 then
+		-- Streamed commander is stale; peer heartbeat is this machine's live pad.
+		return CFrame.new(peerPos) * CFrame.new(offset)
+	end
+	if theirRoot then
+		return theirRoot.CFrame * CFrame.new(offset)
+	end
+	if peerPos then
+		return CFrame.new(peerPos) * CFrame.new(offset)
+	end
+	return nil
+end
+
 local function startFollow(mode, order)
 	stopFollow()
 	if not Hive._alive then
 		return
 	end
 	Hive.status = mode
-	if type(getgenv().SB2HoldCombatAnchor) == 'function' then
-		pcall(getgenv().SB2HoldCombatAnchor, 3)
-	end
-	local lastHold = 0
 	local gen = Hive._followGen
+	local lastDestAt = 0
+	local cachedDest = nil
 	Hive._followConn = RunService.Heartbeat:Connect(function()
 		if gen ~= Hive._followGen or not Hive._alive or Hive.role == 'idle' then
 			return
@@ -583,27 +618,39 @@ local function startFollow(mode, order)
 			return
 		end
 		local now = os.clock()
-		if now - lastHold > 2 and type(getgenv().SB2HoldCombatAnchor) == 'function' then
-			lastHold = now
-			pcall(getgenv().SB2HoldCombatAnchor, 2.5)
+		if now - lastDestAt > 0.35 or cachedDest == nil then
+			cachedDest = commanderDestCFrame(order, mode)
+			lastDestAt = now
 		end
-		local cmd = commanderPlayer(order)
-		if not cmd then
-			Hive.status = 'waiting_commander'
-			return
-		end
+		local dest = cachedDest
 		local myRoot = getRoot(LocalPlayer)
-		local theirRoot = getRoot(cmd)
-		if not (myRoot and theirRoot) then
+		if not dest then
+			if not commanderPlayer(order) then
+				Hive.status = 'waiting_commander'
+			end
 			return
 		end
-		local offset = followOffset(mode, order)
-		local dest = theirRoot.CFrame * CFrame.new(offset)
-		if (myRoot.Position - dest.Position).Magnitude < 2.5 then
+		if not myRoot then
 			return
 		end
-		if now - (tonumber(Hive._lastFollowWarp) or 0) < 0.4 then
+		local dx = myRoot.Position.X - dest.Position.X
+		local dz = myRoot.Position.Z - dest.Position.Z
+		local xz = math.sqrt(dx * dx + dz * dz)
+		if xz < 3 then
+			if type(getgenv().SB2SetAnchorLockCF) == 'function' then
+				pcall(getgenv().SB2SetAnchorLockCF, dest)
+			else
+				getgenv().SB2AnchorLockCF = dest
+			end
 			return
+		end
+		if now - (tonumber(Hive._lastFollowWarp) or 0) < 0.75 then
+			return
+		end
+		if getgenv().SB2TpPinActive == true and typeof(getgenv().SB2TpPinCFrame) == 'CFrame' then
+			if (getgenv().SB2TpPinCFrame.Position - dest.Position).Magnitude < 8 then
+				return
+			end
 		end
 		Hive._lastFollowWarp = now
 		warpToCFrame(dest)
@@ -612,30 +659,8 @@ end
 
 local function snapOnceToCommander(order)
 	stopFollow()
-	if type(getgenv().SB2HoldCombatAnchor) == 'function' then
-		pcall(getgenv().SB2HoldCombatAnchor, 0.9)
-	end
-	local cmdId = order and tonumber(order.commanderId)
-	local cmd = commanderPlayer(order)
-	local myRoot = getRoot(LocalPlayer)
-	local dest
-	local theirRoot = cmd and getRoot(cmd)
-	if theirRoot then
-		dest = theirRoot.CFrame * CFrame.new(followOffset('follow', order))
-	else
-		local cmdPeer
-		for _, p in ipairs(listPeers()) do
-			if p.userId == cmdId and p.pos then
-				cmdPeer = p
-				break
-			end
-		end
-		if cmdPeer and cmdPeer.pos then
-			local offset = followOffset('follow', order)
-			dest = CFrame.new(cmdPeer.pos.x, cmdPeer.pos.y, cmdPeer.pos.z) + offset
-		end
-	end
-	if myRoot and dest then
+	local dest = commanderDestCFrame(order, 'follow')
+	if dest then
 		warpToCFrame(dest)
 	end
 	Hive.status = 'idle'

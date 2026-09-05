@@ -537,6 +537,7 @@ local SOLO_RESUME_PATH = joinPath(CONFIG.ConfigFolder, 'solo_resume')
 local COMBAT_SKILLS_PATH = joinPath(CONFIG.ConfigFolder, 'combat_skills.json')
 local COMBAT_PREFS_PATH = joinPath(CONFIG.ConfigFolder, 'combat_prefs.json')
 local WEAPON_MOD_PATH = joinPath(CONFIG.ConfigFolder, 'weapon_mod.json')
+local WEAPON_MODELS_DIR = joinPath(CONFIG.ConfigFolder, 'weapon_models')
 -- Profile-independent: dive height / flee depth / combat+dive skills.
 local COMBAT_PREFS_INDEXES = {
 	DiveFarmHeight = true,
@@ -2367,6 +2368,15 @@ local ok, err = pcall(function()
 		if getgenv().SB2TpPinActive == true then
 			return
 		end
+		-- Hive follow/stack owns the lock CFrame. Rewriting it to "wherever I am
+		-- right now" yanks alts back to a previous pad after the next snap.
+		local hive = getgenv().SB2Hive
+		if type(hive) == 'table' and (hive.status == 'follow' or hive.status == 'stack') then
+			return
+		end
+		if getgenv().SB2BossRouteWanted == true then
+			return
+		end
 		seconds = tonumber(seconds) or 3.5
 		if seconds < 0 then
 			seconds = 0
@@ -2434,6 +2444,15 @@ local ok, err = pcall(function()
 			return
 		end
 		getgenv().SB2AnchorHoldUntil = 0
+		-- Already holding near this dest: do not start a second pin (that rewinds/jumps).
+		if getgenv().SB2TpPinActive == true and typeof(getgenv().SB2TpPinCFrame) == 'CFrame' then
+			local pinDelta = getgenv().SB2TpPinCFrame.Position - cf.Position
+			if pinDelta.Magnitude < 5 then
+				setAnchorLockCF(cf)
+				getgenv().SB2TpPinCFrame = cf
+				return
+			end
+		end
 		getgenv().SB2TpPinActive = true
 		getgenv().SB2TpPinCFrame = cf
 		setAnchorLockCF(cf)
@@ -2481,20 +2500,12 @@ local ok, err = pcall(function()
 					root.Anchored = false
 					root.AssemblyLinearVelocity = Vector3.zero
 					root.AssemblyAngularVelocity = Vector3.zero
-					if (root.Position - cf.Position).Magnitude > 1.5 then
+					local holdDelta = root.Position - cf.Position
+					if holdDelta.Magnitude > 0.4 then
 						if m.PivotTo then
 							m:PivotTo(cf)
 						else
 							root.CFrame = cf
-						end
-					else
-						-- Keep Y locked even if XZ drifted slightly from physics.
-						local p = root.Position
-						local locked = CFrame.new(p.X, cf.Position.Y, p.Z) * (cf - cf.Position)
-						if m.PivotTo then
-							m:PivotTo(locked)
-						else
-							root.CFrame = locked
 						end
 					end
 				end)
@@ -2525,9 +2536,47 @@ local ok, err = pcall(function()
 			-- #endregion
 		end)
 	end
+	local function moveCharacter(cf, seconds)
+		if typeof(cf) ~= 'CFrame' then
+			return
+		end
+		if cf.Position.Y < -20 then
+			return
+		end
+		local model = getMyCharacterModel() or LocalPlayer.Character
+		local hrp = model and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
+		if not hrp or not hrp:IsA('BasePart') then
+			return
+		end
+		-- Retarget snap-back BEFORE moving so Combat Anchor cannot yank to the old pad.
+		setAnchorLockCF(cf)
+		local dist = (hrp.Position - cf.Position).Magnitude
+		if getgenv().SB2TpPinActive == true and typeof(getgenv().SB2TpPinCFrame) == 'CFrame' then
+			local pinDelta = getgenv().SB2TpPinCFrame.Position - cf.Position
+			if pinDelta.Magnitude < 5 then
+				return
+			end
+		end
+		if dist < 6 then
+			pcall(function()
+				hrp.Anchored = false
+				hrp.AssemblyLinearVelocity = Vector3.zero
+				hrp.AssemblyAngularVelocity = Vector3.zero
+				if model.PivotTo then
+					model:PivotTo(cf)
+				else
+					hrp.CFrame = cf
+				end
+			end)
+			beginAnchorReplicate(0.35)
+			return
+		end
+		pinTeleportCFrame(cf, tonumber(seconds) or 0.55)
+	end
 	getgenv().SB2HoldCombatAnchor = holdCombatAnchor
 	getgenv().SB2CombatAnchorHolding = combatAnchorHolding
 	getgenv().SB2PinTeleportCFrame = pinTeleportCFrame
+	getgenv().SB2MoveCharacter = moveCharacter
 	getgenv().SB2SoftLockRoot = softLockRoot
 	getgenv().SB2BeginAnchorReplicate = beginAnchorReplicate
 	getgenv().SB2SetAnchorLockCF = setAnchorLockCF
@@ -8936,16 +8985,12 @@ local ok, err = pcall(function()
 				return
 			end
 
-			-- Hive stack / raw CFrame TP leaves the server at the old pad → 0 weapon damage.
+			-- Hive follow/stack already warps. Pinning in place here froze alts
+			-- at a half-moved pad and Combat Anchor snapped them backward.
 			pcall(function()
 				if isPoorAuraTagSkill(getgenv().SB2SkillActiveName) then
 					getgenv().SB2SkillActiveName = nil
 					getgenv().SB2SkillActiveUntil = 0
-				end
-				local model = getMyCharacterModel() or LocalPlayer.Character
-				local hrp = model and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
-				if hrp and hrp:IsA('BasePart') and type(pinTeleportCFrame) == 'function' then
-					pinTeleportCFrame(hrp.CFrame, 0.9)
 				end
 			end)
 
@@ -14073,7 +14118,8 @@ local ok, err = pcall(function()
 					end
 					if hit then
 						local p = Vector3.new(tonumber(rec.x) or 0, tonumber(rec.y) or 0, tonumber(rec.z) or 0)
-						if (pos - p).Magnitude <= 22 then
+						local gap = pos - p
+						if gap.Magnitude <= 22 then
 							return true
 						end
 					end
@@ -14112,7 +14158,6 @@ local ok, err = pcall(function()
 					return false, 'boss route off'
 				end
 			end
-			-- Never open an unanchor window here — gravity + unstreamed floor = into the ground.
 			getgenv().SB2AnchorHoldUntil = 0
 			local model = getMyCharacterModel() or LocalPlayer.Character
 			if not model then
@@ -14122,45 +14167,32 @@ local ok, err = pcall(function()
 			if not hrp or not hrp:IsA('BasePart') then
 				return false, 'no root'
 			end
-			pcall(function()
-				hrp.Anchored = false
-				if model.PivotTo then
-					model:PivotTo(cf)
-				else
-					hrp.CFrame = cf
-				end
-				hrp.AssemblyLinearVelocity = Vector3.zero
-				hrp.AssemblyAngularVelocity = Vector3.zero
-				-- Stay unanchored — pinTeleportCFrame soft-holds so server gets the TP.
-				if type(getgenv().SB2SetAnchorLockCF) == 'function' then
-					getgenv().SB2SetAnchorLockCF(cf)
-				else
-					getgenv().SB2AnchorLockCF = cf
-				end
-			end)
-			-- Hold destination for ~1s so Combat Anchor / Heartbeat cannot lag behind gravity.
-			if type(pinTeleportCFrame) == 'function' then
-				pinTeleportCFrame(cf, 1.0)
+			-- One mover only. PivotTo + pinTeleport + a 8-frame loop stacked pins
+			-- and Combat Anchor yanked alts to the previous / next WP.
+			if type(moveCharacter) == 'function' then
+				moveCharacter(cf, 0.7)
+			elseif type(getgenv().SB2MoveCharacter) == 'function' then
+				getgenv().SB2MoveCharacter(cf, 0.7)
+			elseif type(pinTeleportCFrame) == 'function' then
+				pinTeleportCFrame(cf, 0.7)
 			elseif type(getgenv().SB2PinTeleportCFrame) == 'function' then
-				getgenv().SB2PinTeleportCFrame(cf, 1.0)
-			end
-			for _ = 1, 8 do
-				RunService.Heartbeat:Wait()
+				getgenv().SB2PinTeleportCFrame(cf, 0.7)
+			else
 				pcall(function()
 					hrp.Anchored = false
-					if (hrp.Position - cf.Position).Magnitude > 4 then
-						if model.PivotTo then
-							model:PivotTo(cf)
-						else
-							hrp.CFrame = cf
-						end
+					if model.PivotTo then
+						model:PivotTo(cf)
+					else
+						hrp.CFrame = cf
 					end
 					hrp.AssemblyLinearVelocity = Vector3.zero
 					hrp.AssemblyAngularVelocity = Vector3.zero
+					if type(getgenv().SB2SetAnchorLockCF) == 'function' then
+						getgenv().SB2SetAnchorLockCF(cf)
+					else
+						getgenv().SB2AnchorLockCF = cf
+					end
 				end)
-				if (hrp.Position - cf.Position).Magnitude <= 8 then
-					break
-				end
 			end
 			lockReplicationFocus(model)
 			pcall(function()
@@ -14170,7 +14202,7 @@ local ok, err = pcall(function()
 				pcall(getgenv().SB2FixCamera, model)
 			end
 			local dist = (hrp.Position - cf.Position).Magnitude
-			if dist > 25 then
+			if dist > 40 then
 				return false, 'still not at waypoint'
 			end
 			return true
@@ -16499,6 +16531,9 @@ local ok, err = pcall(function()
 				Transparency = 0,
 				AnimEnabled = false,
 				AnimPack = '(default)',
+				CustomEnabled = false,
+				HideOriginal = true,
+				DesignName = 'My Weapon',
 			}
 			local state = getgenv().SB2WeaponModState
 			if type(state) ~= 'table' then
@@ -16843,9 +16878,15 @@ local ok, err = pcall(function()
 				-- Stop heartbeat/queue from painting slider values back on.
 				state.SuppressUntil = os.clock() + 12
 				state.Enabled = false
+				state.CustomEnabled = false
 				pcall(function()
 					if Toggles.WeaponModEnabled and type(Toggles.WeaponModEnabled.SetValue) == 'function' then
 						Toggles.WeaponModEnabled:SetValue(false)
+					end
+				end)
+				pcall(function()
+					if Toggles.WeaponModelEnabled and type(Toggles.WeaponModelEnabled.SetValue) == 'function' then
+						Toggles.WeaponModelEnabled:SetValue(false)
 					end
 				end)
 				resetWeaponModSliders()
@@ -17112,6 +17153,802 @@ local ok, err = pcall(function()
 				end
 			end
 
+			local CUSTOM_PART_PREFIX = 'WeaponMod_Custom_'
+			local MODEL_MATERIALS = {
+				'Metal',
+				'Neon',
+				'SmoothPlastic',
+				'Plastic',
+				'Glass',
+				'ForceField',
+				'Ice',
+				'Foil',
+				'DiamondPlate',
+				'Granite',
+				'Marble',
+				'Wood',
+				'Fabric',
+				'CorrodedMetal',
+			}
+			local MODEL_SHAPES = { 'Block', 'Cylinder', 'Ball', 'Wedge', 'CornerWedge', 'Mesh' }
+
+			local function assetUri(s)
+				if type(s) ~= 'string' or s == '' then
+					return ''
+				end
+				if string.find(s, 'rbxasset', 1, true) then
+					return s
+				end
+				local n = string.match(s, '%d+')
+				if n then
+					return 'rbxassetid://' .. n
+				end
+				return s
+			end
+
+			local function safeMaterial(name)
+				if type(name) ~= 'string' or name == '' then
+					return Enum.Material.Metal
+				end
+				local ok, mat = pcall(function()
+					return Enum.Material[name]
+				end)
+				if ok and typeof(mat) == 'EnumItem' then
+					return mat
+				end
+				return Enum.Material.Metal
+			end
+
+			local function newPartSpec(shape, name, extra)
+				local spec = {
+					id = string.sub(HttpService:GenerateGUID(false), 1, 8),
+					name = name or (shape or 'Part'),
+					shape = shape or 'Block',
+					size = { 0.28, 2.2, 0.08 },
+					offset = { 0, 1.4, 0 },
+					rot = { 0, 0, 0 },
+					color = { 228, 232, 240 },
+					material = 'Metal',
+					transparency = 0,
+					meshId = '',
+					textureId = '',
+				}
+				if type(extra) == 'table' then
+					for k, v in pairs(extra) do
+						spec[k] = v
+					end
+				end
+				return spec
+			end
+
+			local function makeDesign(name, parts)
+				return {
+					name = name or 'My Weapon',
+					hideOriginal = true,
+					parts = parts or {},
+				}
+			end
+
+			local function starterTemplates()
+				return {
+					['Starter Longsword'] = makeDesign('Starter Longsword', {
+						newPartSpec('Cylinder', 'Grip', {
+							size = { 0.95, 0.22, 0.22 },
+							offset = { 0, 0.35, 0 },
+							rot = { 0, 0, 90 },
+							color = { 42, 32, 28 },
+							material = 'Wood',
+						}),
+						newPartSpec('Ball', 'Pommel', {
+							size = { 0.32, 0.32, 0.32 },
+							offset = { 0, -0.18, 0 },
+							color = { 180, 160, 90 },
+							material = 'Metal',
+						}),
+						newPartSpec('Block', 'Guard', {
+							size = { 1.05, 0.12, 0.28 },
+							offset = { 0, 0.88, 0 },
+							color = { 190, 175, 110 },
+							material = 'Metal',
+						}),
+						newPartSpec('Block', 'Blade', {
+							size = { 0.14, 3.35, 0.045 },
+							offset = { 0, 2.62, 0 },
+							color = { 230, 236, 245 },
+							material = 'Metal',
+						}),
+						newPartSpec('Wedge', 'Tip', {
+							size = { 0.14, 0.38, 0.045 },
+							offset = { 0, 4.48, 0 },
+							color = { 230, 236, 245 },
+							material = 'Metal',
+						}),
+					}),
+					['Katana'] = makeDesign('Katana', {
+						newPartSpec('Cylinder', 'Tsuka', {
+							size = { 1.15, 0.2, 0.2 },
+							offset = { 0, 0.4, 0 },
+							rot = { 0, 0, 90 },
+							color = { 28, 28, 34 },
+							material = 'Fabric',
+						}),
+						newPartSpec('Cylinder', 'Tsuba', {
+							size = { 0.08, 0.85, 0.85 },
+							offset = { 0, 1.02, 0 },
+							rot = { 0, 0, 90 },
+							color = { 36, 36, 40 },
+							material = 'Metal',
+						}),
+						newPartSpec('Block', 'Blade', {
+							size = { 0.08, 3.7, 0.03 },
+							offset = { 0, 2.92, 0 },
+							color = { 245, 248, 255 },
+							material = 'Metal',
+						}),
+						newPartSpec('Wedge', 'Kissaki', {
+							size = { 0.08, 0.42, 0.03 },
+							offset = { 0, 4.96, 0 },
+							color = { 245, 248, 255 },
+							material = 'Metal',
+						}),
+					}),
+					['Greatsword'] = makeDesign('Greatsword', {
+						newPartSpec('Cylinder', 'Grip', {
+							size = { 1.2, 0.28, 0.28 },
+							offset = { 0, 0.4, 0 },
+							rot = { 0, 0, 90 },
+							color = { 50, 36, 28 },
+							material = 'Wood',
+						}),
+						newPartSpec('Block', 'Guard', {
+							size = { 1.7, 0.18, 0.4 },
+							offset = { 0, 1.08, 0 },
+							color = { 120, 120, 128 },
+							material = 'Metal',
+						}),
+						newPartSpec('Block', 'Blade', {
+							size = { 0.42, 4.4, 0.08 },
+							offset = { 0, 3.35, 0 },
+							color = { 200, 205, 215 },
+							material = 'Metal',
+						}),
+						newPartSpec('Wedge', 'Tip', {
+							size = { 0.42, 0.55, 0.08 },
+							offset = { 0, 5.82, 0 },
+							color = { 200, 205, 215 },
+							material = 'Metal',
+						}),
+					}),
+					['Dagger'] = makeDesign('Dagger', {
+						newPartSpec('Cylinder', 'Grip', {
+							size = { 0.7, 0.18, 0.18 },
+							offset = { 0, 0.22, 0 },
+							rot = { 0, 0, 90 },
+							color = { 40, 28, 24 },
+							material = 'Wood',
+						}),
+						newPartSpec('Block', 'Guard', {
+							size = { 0.7, 0.08, 0.2 },
+							offset = { 0, 0.6, 0 },
+							color = { 170, 155, 90 },
+							material = 'Metal',
+						}),
+						newPartSpec('Block', 'Blade', {
+							size = { 0.12, 1.35, 0.04 },
+							offset = { 0, 1.32, 0 },
+							color = { 235, 238, 245 },
+							material = 'Metal',
+						}),
+						newPartSpec('Wedge', 'Tip', {
+							size = { 0.12, 0.28, 0.04 },
+							offset = { 0, 2.12, 0 },
+							color = { 235, 238, 245 },
+							material = 'Metal',
+						}),
+					}),
+					['Neon Scythe'] = makeDesign('Neon Scythe', {
+						newPartSpec('Cylinder', 'Pole', {
+							size = { 4.4, 0.16, 0.16 },
+							offset = { 0, 1.9, 0 },
+							rot = { 0, 0, 90 },
+							color = { 24, 24, 28 },
+							material = 'SmoothPlastic',
+						}),
+						newPartSpec('Block', 'Spine', {
+							size = { 1.8, 0.12, 0.08 },
+							offset = { 0.7, 4.15, 0 },
+							rot = { 0, 0, -18 },
+							color = { 90, 255, 210 },
+							material = 'Neon',
+						}),
+						newPartSpec('Wedge', 'Hook', {
+							size = { 0.9, 0.14, 0.08 },
+							offset = { 1.55, 3.55, 0 },
+							rot = { 0, 0, -70 },
+							color = { 90, 255, 210 },
+							material = 'Neon',
+						}),
+					}),
+					['Blank'] = makeDesign('Blank', {
+						newPartSpec('Cylinder', 'Grip', {
+							size = { 0.8, 0.2, 0.2 },
+							offset = { 0, 0.3, 0 },
+							rot = { 0, 0, 90 },
+							color = { 80, 80, 88 },
+							material = 'SmoothPlastic',
+						}),
+					}),
+				}
+			end
+
+			local function getCustomDesign()
+				local d = getgenv().SB2CustomWeapon
+				if type(d) ~= 'table' or type(d.parts) ~= 'table' then
+					local src = starterTemplates()['Starter Longsword']
+					local copy = src
+					local ok, encoded = pcall(function()
+						return HttpService:JSONEncode(src)
+					end)
+					if ok then
+						local ok2, decoded = pcall(function()
+							return HttpService:JSONDecode(encoded)
+						end)
+						if ok2 then
+							copy = decoded
+						end
+					end
+					d = copy
+					getgenv().SB2CustomWeapon = d
+				end
+				return d
+			end
+
+			local function setCustomDesign(design)
+				if type(design) ~= 'table' then
+					return getCustomDesign()
+				end
+				if type(design.parts) ~= 'table' then
+					design.parts = {}
+				end
+				if type(design.name) ~= 'string' or design.name == '' then
+					design.name = 'My Weapon'
+				end
+				getgenv().SB2CustomWeapon = design
+				state.DesignName = design.name
+				if design.hideOriginal ~= nil then
+					state.HideOriginal = design.hideOriginal == true
+				end
+				return design
+			end
+
+			setCustomDesign(getCustomDesign())
+
+			local function findPartSpec(id)
+				local design = getCustomDesign()
+				for _, spec in ipairs(design.parts) do
+					if spec.id == id then
+						return spec
+					end
+				end
+				return design.parts[1]
+			end
+
+			local function selectedPartSpec()
+				return findPartSpec(state.CustomPartId)
+			end
+
+			local function jsonCopy(value)
+				local ok, encoded = pcall(function()
+					return HttpService:JSONEncode(value)
+				end)
+				if not ok then
+					return value
+				end
+				local ok2, decoded = pcall(function()
+					return HttpService:JSONDecode(encoded)
+				end)
+				if ok2 then
+					return decoded
+				end
+				return value
+			end
+
+			local function partLabelAt(index, spec)
+				return string.format('%d. %s', index, tostring(spec.name or spec.shape or 'Part'))
+			end
+
+			local function partDropdownValues()
+				local values = {}
+				local design = getCustomDesign()
+				for i, spec in ipairs(design.parts) do
+					values[#values + 1] = partLabelAt(i, spec)
+				end
+				if #values == 0 then
+					values[1] = '(none)'
+				end
+				return values
+			end
+
+			local function partIdFromDropdown(v)
+				v = flattenOpt(v) or ''
+				if v == '' or v == '(none)' then
+					return nil
+				end
+				local idx = tonumber(string.match(v, '^(%d+)'))
+				local design = getCustomDesign()
+				if idx and design.parts[idx] then
+					return design.parts[idx].id
+				end
+				return string.match(v, '^(%S+)')
+			end
+
+			local function partHalfAlong(spec)
+				local sz = spec.size or { 0.3, 1, 0.1 }
+				local rot = spec.rot or { 0, 0, 0 }
+				local rz = math.abs(tonumber(rot[3]) or 0)
+				if spec.shape == 'Cylinder' and math.abs(rz - 90) < 25 then
+					return (tonumber(sz[1]) or 1) * 0.5
+				end
+				if spec.shape == 'Ball' then
+					return (tonumber(sz[2]) or tonumber(sz[1]) or 0.3) * 0.5
+				end
+				return (tonumber(sz[2]) or 1) * 0.5
+			end
+
+			local function partTipY(spec)
+				local off = spec.offset or { 0, 0, 0 }
+				return (tonumber(off[2]) or 0) + partHalfAlong(spec)
+			end
+
+			local function highestTipY(design)
+				design = design or getCustomDesign()
+				local tip = 0
+				for _, spec in ipairs(design.parts) do
+					local y = partTipY(spec)
+					if y > tip then
+						tip = y
+					end
+				end
+				return tip
+			end
+
+			local function placeAfterTip(spec)
+				local half = partHalfAlong(spec)
+				spec.offset = spec.offset or { 0, 0, 0 }
+				spec.offset[1] = 0
+				spec.offset[2] = highestTipY() + half + 0.05
+				spec.offset[3] = 0
+			end
+
+			local function readLogicalSize(spec)
+				local sz = spec.size or { 0.3, 1, 0.1 }
+				if spec.shape == 'Cylinder' then
+					return tonumber(sz[1]) or 1, tonumber(sz[2]) or 0.2, tonumber(sz[3]) or 0.2
+				end
+				if spec.shape == 'Ball' then
+					local d = tonumber(sz[1]) or tonumber(sz[2]) or 0.3
+					return d, d, d
+				end
+				return tonumber(sz[2]) or 1, tonumber(sz[1]) or 0.28, tonumber(sz[3]) or 0.08
+			end
+
+			local function writeLogicalSize(spec, which, value)
+				if type(spec.size) ~= 'table' then
+					spec.size = { 0.28, 2.2, 0.08 }
+				end
+				value = tonumber(value) or 0.1
+				if spec.shape == 'Cylinder' then
+					if which == 'length' then
+						spec.size[1] = value
+					elseif which == 'width' then
+						spec.size[2] = value
+						spec.size[3] = value
+					else
+						spec.size[3] = value
+					end
+				elseif spec.shape == 'Ball' then
+					spec.size[1] = value
+					spec.size[2] = value
+					spec.size[3] = value
+				else
+					if which == 'length' then
+						spec.size[2] = value
+					elseif which == 'width' then
+						spec.size[1] = value
+					else
+						spec.size[3] = value
+					end
+				end
+			end
+
+			local COLOR_LOOKS = {
+				Steel = { 200, 205, 215 },
+				Silver = { 230, 236, 245 },
+				Gold = { 210, 175, 80 },
+				Bronze = { 160, 110, 60 },
+				Wood = { 72, 48, 32 },
+				Black = { 24, 24, 28 },
+				White = { 245, 248, 255 },
+				Blood = { 160, 32, 40 },
+				Neon = { 90, 255, 210 },
+				Ice = { 160, 210, 255 },
+				Purple = { 140, 90, 220 },
+			}
+			local COLOR_LOOK_NAMES = { 'Steel', 'Silver', 'Gold', 'Bronze', 'Wood', 'Black', 'White', 'Blood', 'Neon', 'Ice', 'Purple' }
+
+			local function piecePreset(kind)
+				kind = tostring(kind or 'Blade')
+				if kind == 'Grip' then
+					return newPartSpec('Cylinder', 'Grip', {
+						size = { 0.95, 0.22, 0.22 },
+						offset = { 0, 0.35, 0 },
+						rot = { 0, 0, 90 },
+						color = { 42, 32, 28 },
+						material = 'Wood',
+					})
+				end
+				if kind == 'Pommel' then
+					return newPartSpec('Ball', 'Pommel', {
+						size = { 0.3, 0.3, 0.3 },
+						offset = { 0, -0.18, 0 },
+						color = { 180, 160, 90 },
+						material = 'Metal',
+					})
+				end
+				if kind == 'Guard' then
+					return newPartSpec('Block', 'Guard', {
+						size = { 1.05, 0.12, 0.28 },
+						offset = { 0, 0.88, 0 },
+						color = { 190, 175, 110 },
+						material = 'Metal',
+					})
+				end
+				if kind == 'Tsuba' then
+					return newPartSpec('Cylinder', 'Tsuba', {
+						size = { 0.08, 0.85, 0.85 },
+						offset = { 0, 1.02, 0 },
+						rot = { 0, 0, 90 },
+						color = { 36, 36, 40 },
+						material = 'Metal',
+					})
+				end
+				if kind == 'Blade' then
+					return newPartSpec('Block', 'Blade', {
+						size = { 0.14, 3.2, 0.045 },
+						offset = { 0, 2.5, 0 },
+						color = { 230, 236, 245 },
+						material = 'Metal',
+					})
+				end
+				if kind == 'Tip' then
+					return newPartSpec('Wedge', 'Tip', {
+						size = { 0.14, 0.38, 0.045 },
+						offset = { 0, 4.4, 0 },
+						color = { 230, 236, 245 },
+						material = 'Metal',
+					})
+				end
+				if kind == 'Glow' then
+					return newPartSpec('Block', 'Glow', {
+						size = { 0.06, 2.8, 0.02 },
+						offset = { 0, 2.4, 0 },
+						color = { 90, 255, 210 },
+						material = 'Neon',
+					})
+				end
+				if kind == 'Cylinder' then
+					return newPartSpec('Cylinder', 'Cylinder', {
+						size = { 1.2, 0.22, 0.22 },
+						offset = { 0, 0.6, 0 },
+						rot = { 0, 0, 90 },
+						color = { 80, 80, 88 },
+						material = 'SmoothPlastic',
+					})
+				end
+				if kind == 'Ball' then
+					return newPartSpec('Ball', 'Ball', {
+						size = { 0.28, 0.28, 0.28 },
+						offset = { 0, 0.2, 0 },
+						color = { 200, 200, 210 },
+						material = 'Metal',
+					})
+				end
+				if kind == 'Wedge' then
+					return newPartSpec('Wedge', 'Wedge', {
+						size = { 0.16, 0.4, 0.05 },
+						offset = { 0, 1.6, 0 },
+						color = { 230, 236, 245 },
+						material = 'Metal',
+					})
+				end
+				if kind == 'Mesh' then
+					return newPartSpec('Mesh', 'Mesh', {
+						size = { 1, 1, 1 },
+						offset = { 0, 1.2, 0 },
+						color = { 255, 255, 255 },
+						material = 'Metal',
+					})
+				end
+				return newPartSpec('Block', 'Block', {
+					size = { 0.2, 1.2, 0.08 },
+					offset = { 0, 1.4, 0 },
+					color = { 220, 224, 232 },
+					material = 'Metal',
+				})
+			end
+
+			local function sanitizeFileName(name)
+				name = tostring(name or 'weapon')
+				name = string.gsub(name, '[^%w%-%._ ]', '')
+				name = string.gsub(name, '^%s+', '')
+				name = string.gsub(name, '%s+$', '')
+				if name == '' then
+					name = 'weapon'
+				end
+				return name
+			end
+
+			local function ensureModelsDir()
+				if type(makefolder) ~= 'function' then
+					return
+				end
+				pcall(function()
+					if type(isfolder) ~= 'function' or not isfolder(CONFIG.ConfigFolder) then
+						makefolder(CONFIG.ConfigFolder)
+					end
+					if type(isfolder) ~= 'function' or not isfolder(WEAPON_MODELS_DIR) then
+						makefolder(WEAPON_MODELS_DIR)
+					end
+				end)
+			end
+
+			local function listSavedDesigns()
+				local names = { '(none)' }
+				ensureModelsDir()
+				if type(listfiles) ~= 'function' then
+					return names
+				end
+				local ok, files = pcall(listfiles, WEAPON_MODELS_DIR)
+				if not ok or type(files) ~= 'table' then
+					return names
+				end
+				for _, path in ipairs(files) do
+					local base = string.match(tostring(path), '([^/\\]+)%.json$')
+					if base and base ~= '' then
+						names[#names + 1] = base
+					end
+				end
+				table.sort(names)
+				return names
+			end
+
+			local function saveCurrentDesign(name)
+				name = sanitizeFileName(name or state.DesignName)
+				local design = getCustomDesign()
+				design.name = name
+				state.DesignName = name
+				ensureModelsDir()
+				if type(writefile) ~= 'function' then
+					return false
+				end
+				local path = joinPath(WEAPON_MODELS_DIR, name .. '.json')
+				local ok, encoded = pcall(function()
+					return HttpService:JSONEncode(design)
+				end)
+				if not ok or type(encoded) ~= 'string' then
+					return false
+				end
+				return pcall(writefile, path, encoded)
+			end
+
+			local function loadSavedDesign(name)
+				name = sanitizeFileName(name)
+				if name == '' or name == '(none)' then
+					return nil
+				end
+				if type(readfile) ~= 'function' then
+					return nil
+				end
+				local path = joinPath(WEAPON_MODELS_DIR, name .. '.json')
+				local ok, body = pcall(readfile, path)
+				if not ok or type(body) ~= 'string' or body == '' then
+					return nil
+				end
+				local okDecode, decoded = pcall(function()
+					return HttpService:JSONDecode(body)
+				end)
+				if not okDecode or type(decoded) ~= 'table' then
+					return nil
+				end
+				return setCustomDesign(decoded)
+			end
+
+			local function deleteSavedDesign(name)
+				name = sanitizeFileName(name)
+				if type(delfile) ~= 'function' then
+					return false
+				end
+				local path = joinPath(WEAPON_MODELS_DIR, name .. '.json')
+				return pcall(delfile, path)
+			end
+
+			local function hideNativeVisuals(tool)
+				for _, d in ipairs(tool:GetDescendants()) do
+					if d:IsA('BasePart') and not isOverlayJunk(d) then
+						rememberOrig(d)
+						d.Transparency = 1
+						d.LocalTransparencyModifier = 1
+					elseif (d:IsA('Decal') or d:IsA('Texture')) and not (d.Parent and isOverlayJunk(d.Parent)) then
+						pcall(function()
+							d.Transparency = 1
+						end)
+					end
+				end
+			end
+
+			local function makeShapeInstance(shape)
+				if shape == 'Wedge' then
+					return Instance.new('WedgePart')
+				end
+				if shape == 'CornerWedge' then
+					return Instance.new('CornerWedgePart')
+				end
+				local part = Instance.new('Part')
+				part.TopSurface = Enum.SurfaceType.Smooth
+				part.BottomSurface = Enum.SurfaceType.Smooth
+				if shape == 'Cylinder' then
+					part.Shape = Enum.PartType.Cylinder
+				elseif shape == 'Ball' then
+					part.Shape = Enum.PartType.Ball
+				else
+					part.Shape = Enum.PartType.Block
+				end
+				return part
+			end
+
+			local function applyCustomModel(tool, handle)
+				handle = handle or (tool and tool:FindFirstChild('Handle'))
+				if not tool or not handle then
+					return false
+				end
+				clearOverlay(tool)
+				local design = getCustomDesign()
+				if state.HideOriginal == true or design.hideOriginal == true then
+					hideNativeVisuals(tool)
+				end
+				for _, spec in ipairs(design.parts) do
+					if type(spec) ~= 'table' then
+						continue
+					end
+					local shape = tostring(spec.shape or 'Block')
+					local part = makeShapeInstance(shape)
+					part.Name = CUSTOM_PART_PREFIX .. tostring(spec.id or spec.name or 'part')
+					part:SetAttribute(WEAPON_MOD_ATTR, true)
+					part:SetAttribute('_SB2CustomPart', true)
+					part.Anchored = false
+					part.CanCollide = false
+					part.CanTouch = false
+					part.CanQuery = false
+					part.Massless = true
+					part.CastShadow = false
+					local sz = spec.size or { 0.3, 1, 0.1 }
+					part.Size = Vector3.new(tonumber(sz[1]) or 0.3, tonumber(sz[2]) or 1, tonumber(sz[3]) or 0.1)
+					local col = spec.color or { 255, 255, 255 }
+					part.Color = Color3.fromRGB(
+						math.clamp(math.floor(tonumber(col[1]) or 255), 0, 255),
+						math.clamp(math.floor(tonumber(col[2]) or 255), 0, 255),
+						math.clamp(math.floor(tonumber(col[3]) or 255), 0, 255)
+					)
+					part.Material = safeMaterial(spec.material)
+					part.Transparency = math.clamp(tonumber(spec.transparency) or 0, 0, 1)
+					part.LocalTransparencyModifier = 0
+					if shape == 'Mesh' then
+						local mesh = Instance.new('SpecialMesh')
+						mesh.MeshType = Enum.MeshType.FileMesh
+						mesh.MeshId = assetUri(spec.meshId)
+						mesh.TextureId = assetUri(spec.textureId)
+						mesh.Scale = part.Size
+						mesh.Parent = part
+					end
+					part.Parent = tool
+					local off = spec.offset or { 0, 0, 0 }
+					local rot = spec.rot or { 0, 0, 0 }
+					local c0 = CFrame.new(
+						tonumber(off[1]) or 0,
+						tonumber(off[2]) or 0,
+						tonumber(off[3]) or 0
+					) * CFrame.Angles(
+						math.rad(tonumber(rot[1]) or 0),
+						math.rad(tonumber(rot[2]) or 0),
+						math.rad(tonumber(rot[3]) or 0)
+					)
+					local w = Instance.new('Weld')
+					w.Name = 'WeaponModWeld'
+					w.Part0 = handle
+					w.Part1 = part
+					w.C0 = c0
+					w.C1 = CFrame.new()
+					w.Parent = part
+					if tostring(spec.id) == tostring(state.CustomPartId) then
+						local box = Instance.new('SelectionBox')
+						box.Name = 'WeaponModSelect'
+						box.Adornee = part
+						box.Color3 = Color3.fromRGB(80, 200, 255)
+						box.LineThickness = 0.03
+						box.SurfaceTransparency = 0.85
+						box.Parent = part
+					end
+				end
+				return true
+			end
+
+			local function importEquippedAsDesign()
+				local folder = getWeaponFolder('Right') or getWeaponFolder('Left')
+				if not folder then
+					return nil, 'No held weapon'
+				end
+				restoreWeapon(folder)
+				local tool = folder:FindFirstChild('Tool')
+				local handle = folder:FindFirstChild('Handle')
+				if not tool or not handle then
+					return nil, 'No Tool/Handle'
+				end
+				local parts = {}
+				for _, src in ipairs(tool:GetDescendants()) do
+					if not src:IsA('BasePart') or isOverlayJunk(src) then
+						continue
+					end
+					if src == handle or src.Name == 'Handle' then
+						continue
+					end
+					local rel = handle.CFrame:ToObjectSpace(src.CFrame)
+					local rx, ry, rz = rel:ToEulerAnglesXYZ()
+					local shape = 'Block'
+					local meshId, textureId = '', ''
+					if src:IsA('WedgePart') then
+						shape = 'Wedge'
+					elseif src:IsA('CornerWedgePart') then
+						shape = 'CornerWedge'
+					elseif src:IsA('MeshPart') then
+						shape = 'Mesh'
+						meshId = tostring(src.MeshId or '')
+						textureId = tostring(src.TextureID or '')
+					elseif src:IsA('Part') then
+						if src.Shape == Enum.PartType.Cylinder then
+							shape = 'Cylinder'
+						elseif src.Shape == Enum.PartType.Ball then
+							shape = 'Ball'
+						end
+						local sm = src:FindFirstChildOfClass('SpecialMesh')
+						if sm and sm.MeshType == Enum.MeshType.FileMesh and sm.MeshId ~= '' then
+							shape = 'Mesh'
+							meshId = sm.MeshId
+							textureId = sm.TextureId
+						end
+					end
+					parts[#parts + 1] = newPartSpec(shape, src.Name, {
+						size = { src.Size.X, src.Size.Y, src.Size.Z },
+						offset = { rel.Position.X, rel.Position.Y, rel.Position.Z },
+						rot = { math.deg(rx), math.deg(ry), math.deg(rz) },
+						color = {
+							math.floor(src.Color.R * 255 + 0.5),
+							math.floor(src.Color.G * 255 + 0.5),
+							math.floor(src.Color.B * 255 + 0.5),
+						},
+						material = src.Material.Name,
+						transparency = src.Transparency,
+						meshId = meshId,
+						textureId = textureId,
+					})
+				end
+				if #parts == 0 then
+					return nil, 'No visual parts on this weapon'
+				end
+				local design = makeDesign('Imported', parts)
+				design.hideOriginal = true
+				return setCustomDesign(design)
+			end
+
 			local function applyToFolder(folder)
 				if not folder then
 					return false
@@ -17120,6 +17957,9 @@ local ok, err = pcall(function()
 				local handle = folder:FindFirstChild('Handle')
 				if not tool then
 					return false
+				end
+				if state.CustomEnabled == true then
+					return applyCustomModel(tool, handle)
 				end
 				if state.Mode == 'Overlay look' then
 					local lookName = state.Look
@@ -17146,6 +17986,12 @@ local ok, err = pcall(function()
 					return
 				end
 				persistPrefs()
+				if state.CustomEnabled == true then
+					for _, hand in ipairs(targetHands()) do
+						applyToFolder(getWeaponFolder(hand))
+					end
+					return
+				end
 				if state.Enabled ~= true then
 					for _, hand in ipairs({ 'Right', 'Left' }) do
 						restoreWeapon(getWeaponFolder(hand))
@@ -17241,6 +18087,11 @@ local ok, err = pcall(function()
 					tostring(state.OffZ),
 					tostring(state.Transparency),
 					tostring(state.Target),
+					tostring(state.CustomEnabled),
+					tostring(state.HideOriginal),
+					tostring(state.DesignName),
+					tostring(state.CustomPartId),
+					tostring(state.CustomRev or 0),
 				}, '|')
 			end
 
@@ -17271,7 +18122,7 @@ local ok, err = pcall(function()
 					return
 				end
 				syncStateFromUi()
-				if state.Enabled ~= true then
+				if state.Enabled ~= true and state.CustomEnabled ~= true then
 					return
 				end
 				local gui = getgenv().SB2PlayerToolsGui
@@ -17291,7 +18142,7 @@ local ok, err = pcall(function()
 					if not tool then
 						continue
 					end
-					if state.Mode == 'Overlay look' then
+					if state.CustomEnabled == true or state.Mode == 'Overlay look' then
 						local has = false
 						for _, c in ipairs(tool:GetChildren()) do
 							if c:GetAttribute(WEAPON_MOD_ATTR) then
@@ -17320,6 +18171,7 @@ local ok, err = pcall(function()
 
 			getgenv().SB2WeaponModCleanup = function()
 				state.Enabled = false
+				state.CustomEnabled = false
 				state.AnimEnabled = false
 				local c = getgenv().SB2WeaponModConn
 				if c then
@@ -18452,7 +19304,7 @@ local ok, err = pcall(function()
 				end)
 			end
 
-			WeaponModBox:AddLabel('Client-only look for held swords (CharacterItems). Stats stay on the real equip. Overlay = capture a DIFFERENT sword first (Edit current = tint/scale this one).')
+			WeaponModBox:AddLabel('Tint / scale the real mesh. Custom swords are built in the Modeller tab.')
 			WeaponModBox:AddToggle('WeaponModEnabled', {
 				Text = 'Enable weapon modifier',
 				Default = state.Enabled == true,
@@ -18675,9 +19527,718 @@ local ok, err = pcall(function()
 				queueApply()
 			end)
 
+			-- ── Custom weapon modeller (client visuals welded to Handle) ──
+			local ModelTab = Window:AddTab('Modeller', 'swords')
+			local ModelLibBox = ModelTab:AddLeftGroupbox('Design')
+			local ModelKitBox = ModelTab:AddLeftGroupbox('Pieces')
+			local ModelPartBox = ModelTab:AddRightGroupbox('Selected part')
+			assert(ModelLibBox, 'Modeller library groupbox nil')
+			assert(ModelKitBox, 'Modeller pieces groupbox nil')
+			assert(ModelPartBox, 'Modeller part groupbox nil')
+
+			local modelUiLock = false
+			local modellerUiReady = false
+			local modelStatus = nil
+			local function bumpCustom()
+				state.CustomRev = (tonumber(state.CustomRev) or 0) + 1
+			end
+
+			local function currentPartLabel()
+				local design = getCustomDesign()
+				for i, spec in ipairs(design.parts) do
+					if spec.id == state.CustomPartId then
+						return partLabelAt(i, spec)
+					end
+				end
+				if design.parts[1] then
+					return partLabelAt(1, design.parts[1])
+				end
+				return '(none)'
+			end
+
+			local function refreshModelStatus()
+				if not modelStatus or type(modelStatus.SetText) ~= 'function' then
+					return
+				end
+				local design = getCustomDesign()
+				local spec = selectedPartSpec()
+				local n = #(design.parts or {})
+				local preview = state.CustomEnabled == true and 'ON' or 'off'
+				local editing = spec and tostring(spec.name or spec.shape) or 'nothing'
+				modelStatus:SetText(('Editing %s · %d pieces · preview %s'):format(editing, n, preview))
+			end
+
+			local function ensureCustomPreview()
+				if state.CustomEnabled == true then
+					queueApply()
+					refreshModelStatus()
+					return
+				end
+				state.CustomEnabled = true
+				pcall(function()
+					if Toggles.WeaponModelEnabled and type(Toggles.WeaponModelEnabled.SetValue) == 'function' then
+						Toggles.WeaponModelEnabled:SetValue(true)
+					end
+				end)
+				queueApply()
+				refreshModelStatus()
+			end
+
+			local function refreshPartDropdown(selectId)
+				if selectId then
+					state.CustomPartId = selectId
+				end
+				local spec = selectedPartSpec()
+				if spec then
+					state.CustomPartId = spec.id
+				end
+				local opt = Options.WeaponModelPart
+				if type(opt) == 'table' then
+					pcall(function()
+						if type(opt.SetValues) == 'function' then
+							opt:SetValues(partDropdownValues())
+						end
+						if type(opt.SetValue) == 'function' then
+							opt:SetValue(currentPartLabel())
+						end
+					end)
+				end
+				refreshModelStatus()
+				if state.CustomEnabled == true then
+					queueApply()
+				end
+			end
+
+			local function refreshSavedDropdown(selectName)
+				local opt = Options.WeaponModelSaved
+				if type(opt) ~= 'table' then
+					return
+				end
+				modelUiLock = true
+				pcall(function()
+					if type(opt.SetValues) == 'function' then
+						opt:SetValues(listSavedDesigns())
+					end
+					if selectName and type(opt.SetValue) == 'function' then
+						opt:SetValue(selectName)
+					end
+				end)
+				task.defer(function()
+					modelUiLock = false
+				end)
+			end
+
+			local function matchingColorLook(col)
+				col = col or { 255, 255, 255 }
+				for name, rgb in pairs(COLOR_LOOKS) do
+					if math.abs((rgb[1] or 0) - (tonumber(col[1]) or 0)) < 2
+						and math.abs((rgb[2] or 0) - (tonumber(col[2]) or 0)) < 2
+						and math.abs((rgb[3] or 0) - (tonumber(col[3]) or 0)) < 2
+					then
+						return name
+					end
+				end
+				return 'Custom'
+			end
+
+			local function pushPartToUi()
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				modelUiLock = true
+				local function setOpt(name, value)
+					local o = Options[name]
+					if type(o) == 'table' and type(o.SetValue) == 'function' then
+						pcall(function()
+							o:SetValue(value)
+						end)
+					end
+				end
+				setOpt('WeaponModelPartName', spec.name or '')
+				setOpt('WeaponModelShape', spec.shape or 'Block')
+				setOpt('WeaponModelMaterial', spec.material or 'Metal')
+				setOpt('WeaponModelMeshId', spec.meshId or '')
+				setOpt('WeaponModelTextureId', spec.textureId or '')
+				local length, width, thick = readLogicalSize(spec)
+				setOpt('WeaponModelSizeX', width)
+				setOpt('WeaponModelSizeY', length)
+				setOpt('WeaponModelSizeZ', thick)
+				local off = spec.offset or { 0, 0, 0 }
+				setOpt('WeaponModelOffX', tonumber(off[1]) or 0)
+				setOpt('WeaponModelOffY', tonumber(off[2]) or 0)
+				setOpt('WeaponModelOffZ', tonumber(off[3]) or 0)
+				local rot = spec.rot or { 0, 0, 0 }
+				setOpt('WeaponModelRotX', tonumber(rot[1]) or 0)
+				setOpt('WeaponModelRotY', tonumber(rot[2]) or 0)
+				setOpt('WeaponModelRotZ', tonumber(rot[3]) or 0)
+				local col = spec.color or { 255, 255, 255 }
+				setOpt('WeaponModelColorLook', matchingColorLook(col))
+				setOpt('WeaponModelColorR', tonumber(col[1]) or 255)
+				setOpt('WeaponModelColorG', tonumber(col[2]) or 255)
+				setOpt('WeaponModelColorB', tonumber(col[3]) or 255)
+				setOpt('WeaponModelPartTransparency', tonumber(spec.transparency) or 0)
+				refreshModelStatus()
+				task.defer(function()
+					modelUiLock = false
+				end)
+			end
+
+			local function writePartField(key, value, index)
+				if modelUiLock then
+					return
+				end
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				if index then
+					if type(spec[key]) ~= 'table' then
+						spec[key] = { 0, 0, 0 }
+					end
+					spec[key][index] = value
+				else
+					spec[key] = value
+				end
+				bumpCustom()
+				if state.CustomEnabled == true then
+					queueApply()
+				end
+			end
+
+			local function writeSizeWhich(which, value)
+				if modelUiLock then
+					return
+				end
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				writeLogicalSize(spec, which, value)
+				bumpCustom()
+				if spec.shape == 'Ball' or (spec.shape == 'Cylinder' and which == 'width') then
+					task.defer(function()
+						pushPartToUi()
+					end)
+				end
+				if state.CustomEnabled == true then
+					queueApply()
+				end
+			end
+
+			local function nudgeStepAmount()
+				local v = flattenOpt(Options.WeaponModelNudgeStep and Options.WeaponModelNudgeStep.Value)
+				return tonumber(v) or 0.1
+			end
+
+			local function nudgeOffset(axis, dir)
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				if type(spec.offset) ~= 'table' then
+					spec.offset = { 0, 0, 0 }
+				end
+				spec.offset[axis] = (tonumber(spec.offset[axis]) or 0) + dir * nudgeStepAmount()
+				bumpCustom()
+				ensureCustomPreview()
+				pushPartToUi()
+			end
+
+			local function nudgeLength(dir)
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				local length = select(1, readLogicalSize(spec))
+				writeLogicalSize(spec, 'length', math.max(0.04, length + dir * nudgeStepAmount()))
+				bumpCustom()
+				ensureCustomPreview()
+				pushPartToUi()
+			end
+
+			local function applyDesignToUi(design, notifyText, autoPreview)
+				if not design then
+					return
+				end
+				pcall(function()
+					if Options.WeaponModelName then
+						Options.WeaponModelName:SetValue(design.name)
+					end
+				end)
+				refreshPartDropdown(design.parts[1] and design.parts[1].id)
+				pushPartToUi()
+				bumpCustom()
+				if autoPreview ~= false then
+					ensureCustomPreview()
+				elseif state.CustomEnabled == true then
+					queueApply()
+				end
+				if notifyText then
+					Library:Notify(notifyText, 3)
+				end
+			end
+
+			local function loadTemplateByName(name)
+				name = flattenOpt(name) or 'Starter Longsword'
+				local pack = starterTemplates()
+				local design = pack[name]
+				if not design then
+					Library:Notify('Unknown template', 3)
+					return
+				end
+				local copy = jsonCopy(design)
+				setCustomDesign(copy)
+				state.DesignName = copy.name
+				applyDesignToUi(copy, 'Loaded ' .. tostring(copy.name), true)
+			end
+
+			local function addPresetPiece(kind)
+				kind = flattenOpt(kind) or 'Blade'
+				local spec = piecePreset(kind)
+				local design = getCustomDesign()
+				local stackKinds = {
+					Blade = true,
+					Tip = true,
+					Glow = true,
+					Block = true,
+					Wedge = true,
+					Cylinder = true,
+					Mesh = true,
+					Ball = true,
+				}
+				if stackKinds[kind] and #design.parts > 0 then
+					placeAfterTip(spec)
+				end
+				design.parts[#design.parts + 1] = spec
+				refreshPartDropdown(spec.id)
+				pushPartToUi()
+				bumpCustom()
+				ensureCustomPreview()
+				Library:Notify('Added ' .. tostring(spec.name or kind), 2)
+			end
+
+			modelStatus = ModelLibBox:AddLabel('Pick a template — it shows on your character right away.')
+			ModelLibBox:AddToggle('WeaponModelEnabled', {
+				Text = 'Show on character',
+				Default = state.CustomEnabled == true,
+				Tooltip = 'Replaces the held mesh with your modelled parts. Stats stay on the real weapon.',
+			}):OnChanged(function(on)
+				state.CustomEnabled = on == true
+				if on == true then
+					state.Enabled = false
+					pcall(function()
+						if Toggles.WeaponModEnabled and Toggles.WeaponModEnabled.SetValue then
+							Toggles.WeaponModEnabled:SetValue(false)
+						end
+					end)
+				end
+				queueApply()
+				refreshModelStatus()
+			end)
+			ModelLibBox:AddToggle('WeaponModelHideOriginal', {
+				Text = 'Hide original meshes',
+				Default = state.HideOriginal ~= false,
+			}):OnChanged(function(on)
+				state.HideOriginal = on == true
+				local d = getCustomDesign()
+				d.hideOriginal = on == true
+				bumpCustom()
+				if state.CustomEnabled == true then
+					queueApply()
+				end
+			end)
+			ModelLibBox:AddInput('WeaponModelName', {
+				Text = 'Design name',
+				Default = state.DesignName or 'My Weapon',
+				Placeholder = 'My Weapon',
+				Finished = true,
+				ClearTextOnFocus = false,
+				Callback = function(v)
+					state.DesignName = tostring(v or 'My Weapon')
+					getCustomDesign().name = state.DesignName
+				end,
+			})
+			local templateNames = { 'Starter Longsword', 'Katana', 'Greatsword', 'Dagger', 'Neon Scythe', 'Blank' }
+			ModelLibBox:AddDropdown('WeaponModelTemplate', {
+				Text = 'Start from template',
+				Values = templateNames,
+				Default = 'Starter Longsword',
+				Tooltip = 'Picking one loads it and shows it on your character.',
+			}):OnChanged(function(v)
+				if not modellerUiReady or modelUiLock then
+					return
+				end
+				loadTemplateByName(v)
+			end)
+			ModelLibBox:AddDropdown('WeaponModelSaved', {
+				Text = 'Saved designs',
+				Values = listSavedDesigns(),
+				Default = '(none)',
+				Tooltip = 'Picking a save loads it immediately.',
+			}):OnChanged(function(v)
+				if not modellerUiReady or modelUiLock then
+					return
+				end
+				local name = flattenOpt(v)
+				if not name or name == '(none)' then
+					return
+				end
+				local design = loadSavedDesign(name)
+				if not design then
+					Library:Notify('Could not load that design', 4)
+					return
+				end
+				applyDesignToUi(design, 'Loaded ' .. tostring(design.name), true)
+			end)
+			ModelLibBox:AddButton('Save design', function()
+				local name = state.DesignName
+				pcall(function()
+					name = Options.WeaponModelName and Options.WeaponModelName.Value or name
+				end)
+				if saveCurrentDesign(name) then
+					refreshSavedDropdown(sanitizeFileName(name))
+					Library:Notify('Saved ' .. sanitizeFileName(name), 3)
+				else
+					Library:Notify('Save failed (writefile?)', 4)
+				end
+			end)
+			ModelLibBox:AddButton('Delete saved', function()
+				local name = flattenOpt(Options.WeaponModelSaved and Options.WeaponModelSaved.Value)
+				if not name or name == '(none)' then
+					return
+				end
+				deleteSavedDesign(name)
+				refreshSavedDropdown('(none)')
+				Library:Notify('Deleted ' .. tostring(name), 3)
+			end)
+			ModelLibBox:AddButton('Import equipped weapon', function()
+				local design, err = importEquippedAsDesign()
+				if not design then
+					Library:Notify(tostring(err or 'Import failed'), 5)
+					return
+				end
+				applyDesignToUi(design, ('Imported %d pieces'):format(#design.parts), true)
+			end)
+			ModelLibBox:AddButton('Reset to real weapon', function()
+				hardResetHeldVisuals()
+				refreshModelStatus()
+			end)
+
+			local pieceKinds = { 'Blade', 'Grip', 'Guard', 'Pommel', 'Tip', 'Tsuba', 'Glow', 'Block', 'Cylinder', 'Ball', 'Wedge', 'Mesh' }
+			ModelKitBox:AddLabel('Add Grip / Blade / Guard. New pieces snap onto the tip.')
+			ModelKitBox:AddDropdown('WeaponModelAddPiece', {
+				Text = 'Add piece',
+				Values = pieceKinds,
+				Default = 'Blade',
+			})
+			ModelKitBox:AddButton('Add piece', function()
+				addPresetPiece(Options.WeaponModelAddPiece and Options.WeaponModelAddPiece.Value)
+			end)
+			ModelKitBox:AddDropdown('WeaponModelPart', {
+				Text = 'Selected piece',
+				Values = partDropdownValues(),
+				Default = currentPartLabel(),
+			}):OnChanged(function(v)
+				if modelUiLock then
+					return
+				end
+				local id = partIdFromDropdown(v)
+				if id and id ~= '(none)' then
+					state.CustomPartId = id
+					pushPartToUi()
+					if state.CustomEnabled == true then
+						queueApply()
+					end
+				end
+			end)
+			ModelKitBox:AddInput('WeaponModelPartName', {
+				Text = 'Rename',
+				Default = (selectedPartSpec() and selectedPartSpec().name) or 'Blade',
+				Finished = true,
+				ClearTextOnFocus = false,
+				Callback = function(v)
+					writePartField('name', tostring(v or 'Part'))
+					refreshPartDropdown(state.CustomPartId)
+				end,
+			})
+			ModelKitBox:AddButton('Duplicate piece', function()
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				local copy = jsonCopy(spec)
+				if type(copy) ~= 'table' then
+					return
+				end
+				copy.id = string.sub(HttpService:GenerateGUID(false), 1, 8)
+				copy.name = tostring(copy.name or 'Part') .. ' copy'
+				local off = copy.offset or { 0, 0, 0 }
+				off[1] = (tonumber(off[1]) or 0) + 0.12
+				copy.offset = off
+				local design = getCustomDesign()
+				design.parts[#design.parts + 1] = copy
+				refreshPartDropdown(copy.id)
+				pushPartToUi()
+				bumpCustom()
+				ensureCustomPreview()
+			end)
+			ModelKitBox:AddButton('Remove piece', function()
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				local design = getCustomDesign()
+				local nextParts = {}
+				for _, p in ipairs(design.parts) do
+					if p.id ~= spec.id then
+						nextParts[#nextParts + 1] = p
+					end
+				end
+				design.parts = nextParts
+				refreshPartDropdown(nextParts[1] and nextParts[1].id)
+				pushPartToUi()
+				bumpCustom()
+				ensureCustomPreview()
+			end)
+
+			ModelPartBox:AddDropdown('WeaponModelShape', {
+				Text = 'Shape',
+				Values = MODEL_SHAPES,
+				Default = (selectedPartSpec() and selectedPartSpec().shape) or 'Block',
+				Tooltip = 'Grips use Cylinder (already laid along the blade). Length / Width / Thickness match the sword, not raw XYZ.',
+			}):OnChanged(function(v)
+				writePartField('shape', flattenOpt(v) or 'Block')
+				task.defer(function()
+					pushPartToUi()
+				end)
+			end)
+			ModelPartBox:AddDropdown('WeaponModelMaterial', {
+				Text = 'Material',
+				Values = MODEL_MATERIALS,
+				Default = (selectedPartSpec() and selectedPartSpec().material) or 'Metal',
+			}):OnChanged(function(v)
+				writePartField('material', flattenOpt(v) or 'Metal')
+			end)
+			local colorLookValues = { 'Custom' }
+			for _, name in ipairs(COLOR_LOOK_NAMES) do
+				colorLookValues[#colorLookValues + 1] = name
+			end
+			ModelPartBox:AddDropdown('WeaponModelColorLook', {
+				Text = 'Color look',
+				Values = colorLookValues,
+				Default = 'Silver',
+			}):OnChanged(function(v)
+				if modelUiLock then
+					return
+				end
+				local name = flattenOpt(v)
+				local rgb = name and COLOR_LOOKS[name]
+				if not rgb then
+					return
+				end
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				spec.color = { rgb[1], rgb[2], rgb[3] }
+				bumpCustom()
+				ensureCustomPreview()
+				pushPartToUi()
+			end)
+			ModelPartBox:AddSlider('WeaponModelColorR', {
+				Text = 'Red',
+				Default = 228,
+				Min = 0,
+				Max = 255,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				writePartField('color', v, 1)
+			end)
+			ModelPartBox:AddSlider('WeaponModelColorG', {
+				Text = 'Green',
+				Default = 232,
+				Min = 0,
+				Max = 255,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				writePartField('color', v, 2)
+			end)
+			ModelPartBox:AddSlider('WeaponModelColorB', {
+				Text = 'Blue',
+				Default = 240,
+				Min = 0,
+				Max = 255,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				writePartField('color', v, 3)
+			end)
+			ModelPartBox:AddSlider('WeaponModelPartTransparency', {
+				Text = 'Transparency',
+				Default = 0,
+				Min = 0,
+				Max = 1,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				writePartField('transparency', v)
+			end)
+			ModelPartBox:AddSlider('WeaponModelSizeY', {
+				Text = 'Length (along blade)',
+				Default = 2.2,
+				Min = 0.04,
+				Max = 12,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				writeSizeWhich('length', v)
+			end)
+			ModelPartBox:AddSlider('WeaponModelSizeX', {
+				Text = 'Width',
+				Default = 0.28,
+				Min = 0.02,
+				Max = 6,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				writeSizeWhich('width', v)
+			end)
+			ModelPartBox:AddSlider('WeaponModelSizeZ', {
+				Text = 'Thickness',
+				Default = 0.08,
+				Min = 0.02,
+				Max = 3,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				writeSizeWhich('thick', v)
+			end)
+			ModelPartBox:AddSlider('WeaponModelOffY', {
+				Text = 'Along blade',
+				Default = 1.4,
+				Min = -3,
+				Max = 10,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				writePartField('offset', v, 2)
+			end)
+			ModelPartBox:AddSlider('WeaponModelOffX', {
+				Text = 'Left / right',
+				Default = 0,
+				Min = -3,
+				Max = 3,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				writePartField('offset', v, 1)
+			end)
+			ModelPartBox:AddSlider('WeaponModelOffZ', {
+				Text = 'Forward / back',
+				Default = 0,
+				Min = -3,
+				Max = 3,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				writePartField('offset', v, 3)
+			end)
+			ModelPartBox:AddDropdown('WeaponModelNudgeStep', {
+				Text = 'Nudge step',
+				Values = { '0.05', '0.1', '0.25', '0.5', '1' },
+				Default = '0.1',
+			})
+			ModelPartBox:AddButton('Nudge toward grip', function()
+				nudgeOffset(2, -1)
+			end)
+			ModelPartBox:AddButton('Nudge toward tip', function()
+				nudgeOffset(2, 1)
+			end)
+			ModelPartBox:AddButton('Shorter', function()
+				nudgeLength(-1)
+			end)
+			ModelPartBox:AddButton('Longer', function()
+				nudgeLength(1)
+			end)
+			ModelPartBox:AddButton('Center on handle', function()
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				if type(spec.offset) ~= 'table' then
+					spec.offset = { 0, 0, 0 }
+				end
+				spec.offset[1] = 0
+				spec.offset[3] = 0
+				bumpCustom()
+				ensureCustomPreview()
+				pushPartToUi()
+			end)
+			ModelPartBox:AddButton('Lay along blade (cylinders)', function()
+				local spec = selectedPartSpec()
+				if not spec then
+					return
+				end
+				if type(spec.rot) ~= 'table' then
+					spec.rot = { 0, 0, 0 }
+				end
+				spec.rot[1] = 0
+				spec.rot[2] = 0
+				spec.rot[3] = 90
+				bumpCustom()
+				ensureCustomPreview()
+				pushPartToUi()
+			end)
+			ModelPartBox:AddSlider('WeaponModelRotX', {
+				Text = 'Tilt',
+				Default = 0,
+				Min = -180,
+				Max = 180,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				writePartField('rot', v, 1)
+			end)
+			ModelPartBox:AddSlider('WeaponModelRotY', {
+				Text = 'Twist',
+				Default = 0,
+				Min = -180,
+				Max = 180,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				writePartField('rot', v, 2)
+			end)
+			ModelPartBox:AddSlider('WeaponModelRotZ', {
+				Text = 'Roll',
+				Default = 0,
+				Min = -180,
+				Max = 180,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				writePartField('rot', v, 3)
+			end)
+			ModelPartBox:AddInput('WeaponModelMeshId', {
+				Text = 'Mesh id (only if shape = Mesh)',
+				Default = '',
+				Placeholder = 'rbxassetid:// or numbers',
+				Finished = true,
+				ClearTextOnFocus = false,
+				Callback = function(v)
+					writePartField('meshId', tostring(v or ''))
+				end,
+			})
+			ModelPartBox:AddInput('WeaponModelTextureId', {
+				Text = 'Texture id',
+				Default = '',
+				Placeholder = 'optional',
+				Finished = true,
+				ClearTextOnFocus = false,
+				Callback = function(v)
+					writePartField('textureId', tostring(v or ''))
+				end,
+			})
+
+			task.defer(function()
+				pushPartToUi()
+				refreshModelStatus()
+				modellerUiReady = true
+			end)
+
 			-- Re-apply after UI defaults settle if it was left enabled.
 			task.defer(function()
-				if state.Enabled == true then
+				if state.Enabled == true or state.CustomEnabled == true then
 					applyAll()
 				end
 			end)
@@ -20130,10 +21691,16 @@ local ok, err = pcall(function()
 			local classVal = tostring(valueOf(folder, 'Class') or '')
 			local statsClass = tostring(stats and stats.Class or '')
 			if classVal == '1HSword' then
-				return statsClass ~= '' and ('1H ' .. statsClass) or '1H Sword'
+				if statsClass ~= '' then
+					return '1H ' .. statsClass
+				end
+				return '1H Sword'
 			end
 			if classVal == '2HSword' then
-				return statsClass ~= '' and ('2H ' .. statsClass) or '2H Sword'
+				if statsClass ~= '' then
+					return '2H ' .. statsClass
+				end
+				return '2H Sword'
 			end
 			if statsClass ~= '' then
 				return statsClass
