@@ -1,5 +1,5 @@
 --[[
-    PlayerTools_Obsidian.lua — Swordburst 2 (Obsidian UI backup; do not execute directly)
+    PlayerTools_Obsidian.lua — Swordburst 2 feature app (Ataraxia chrome)
     Spectate + stream-spectate + view other players' inventories.
     Remote upgrade / remote dismantle (no NPC / no dismantle GUI).
     Items / Wiki tab: snapshot Database.Items, wiki dumps (stats/buffs/icon/flags), aura chests, titling.
@@ -10,8 +10,7 @@
     Farm / vacuum / skills live in AutoFarm/AutoFarm.lua now
     (combat toggles are also on PlayerTools → Combat).
 
-    Potassium: open the PlayerTools folder and run this file (or init.lua).
-    With AutoFarm: from scripts/ root run combo.lua (loads both).
+    Prefer PlayerTools/PlayerTools.lua or launch.lua (sets Ataraxia chrome).
     Toggle UI: Home (AutoFarm uses End).
     Refresh: run launch.lua / PlayerTools.lua again.
 
@@ -30,30 +29,187 @@
     Inventory / Items / HiveMind already use own function scopes; new tabs too.
 ]]
 
--- Direct execution of this file loads Obsidian's Library.lua (or AtaraxiaLibrary).
--- When backend is Starlight, PlayerTools_Starlight.lua must patch in StarlightAdapter first — use launch.lua.
+-- Ataraxia-only chrome. Direct runs still force AtaraxiaLibrary.
 do
 	local g = getgenv()
-	if not g.SB2AllowObsidianFallback and not g.SB2StarlightAdapterSource and not g.SB2UseAtaraxiaLib then
-		local backendPath = 'PlayerTools/backend'
-		if type(isfile) == 'function' and isfile(backendPath) and type(readfile) == 'function' then
-			local ok, body = pcall(readfile, backendPath)
-			local v = ok and tostring(body):lower():gsub('%s', '') or 'obsidian'
-			if v ~= 'obsidian' and v ~= 'ataraxia' then
-				error(
-					'[PlayerTools] backend is Starlight — run PlayerTools/launch.lua (not PlayerTools_Obsidian.lua directly)',
-					0
-				)
-			end
-		end
-	end
+	g.SB2UseAtaraxiaLib = true
 	g.SB2AllowObsidianFallback = nil
+	g.SB2StarlightAdapterSource = nil
 end
 
 -- One Tool window. HttpGet used to yield here so autoexec could start
 -- PlayerTools.lua + init.lua + event_dive at once (stacked UIs).
 do
 	local g = getgenv()
+	-- #region agent log
+	local function dbgFling(hyp, loc, msg, data)
+		pcall(function()
+			local Hs = game:GetService('HttpService')
+			local payload = Hs:JSONEncode({
+				sessionId = '7e9135',
+				runId = tostring(g.SB2FlingDebugRun or 'boot'),
+				hypothesisId = hyp,
+				location = loc,
+				message = msg,
+				data = data or {},
+				timestamp = math.floor(os.clock() * 1000),
+			})
+			if type(appendfile) == 'function' then
+				appendfile('debug-7e9135.log', payload .. '\n')
+			elseif type(writefile) == 'function' then
+				writefile('debug-7e9135.log', payload .. '\n')
+			end
+		end)
+	end
+	g.SB2DbgFling = dbgFling
+	g.SB2FlingDebugRun = 'boot-' .. tostring(math.floor(os.clock()))
+	local function dbgHrpSnapshot(tag)
+		local snap = { tag = tag }
+		pcall(function()
+			local lp = game:GetService('Players').LocalPlayer
+			local folder = workspace:FindFirstChild('Characters')
+			local live = (lp and folder and folder:FindFirstChild(lp.Name)) or (lp and lp.Character)
+			local hrp = live and (live:FindFirstChild('HumanoidRootPart') or live.PrimaryPart)
+			local hum = live and live:FindFirstChildOfClass('Humanoid')
+			snap.y = hrp and math.floor(hrp.Position.Y + 0.5) or nil
+			snap.anchored = hrp and hrp.Anchored or nil
+			snap.vel = hrp and math.floor(hrp.AssemblyLinearVelocity.Magnitude + 0.5) or nil
+			snap.state = hum and hum:GetState().Name or nil
+			snap.platform = hum and hum.PlatformStand or nil
+			snap.anchorOn = g.SB2CombatAnchorOn == true
+			snap.boss = g.SB2BossRouteWanted == true
+			snap.softFlag = g.SB2SoftPlayerToolsReload == true
+			snap.preserve = g.SB2SoftReloadPreserveFlight == true
+			snap.skipHold = g.SB2SkipHoldAnchorOnBoot == true
+			snap.animOn = type(g.SB2WeaponModState) == 'table' and g.SB2WeaponModState.AnimEnabled == true
+			snap.ghost = type(g._SB2AnimGhost) == 'table'
+			local cam = workspace.CurrentCamera
+			local orphans = 0
+			local cross = 0
+			if cam then
+				for _, d in ipairs(cam:GetDescendants()) do
+					if d.Name == '_SB2AnimGhostChar'
+						or d.Name == '_SB2AnimGhostWorld'
+						or d.Name == '_SB2AnimGhostWeapons'
+					then
+						orphans += 1
+					end
+					if d:IsA('Motor6D') or d:IsA('Weld') then
+						local items = workspace:FindFirstChild('CharacterItems')
+						local uid = lp and tostring(lp.UserId)
+						local mine = items and uid and items:FindFirstChild(uid)
+						for _, side in ipairs({ d.Part0, d.Part1 }) do
+							if side and live and side:IsDescendantOf(live) then
+								cross += 1
+							elseif side and mine and side:IsDescendantOf(mine) then
+								cross += 1
+							end
+						end
+					end
+				end
+			end
+			snap.orphans = orphans
+			snap.crossWelds = cross
+		end)
+		return snap
+	end
+	dbgFling('A,B,C,D,E', 'boot:start', 'script boot enter', dbgHrpSnapshot('enter'))
+	-- Sample HRP for 3s after boot to catch fling moment.
+	-- NOTE: do NOT mass-disconnect RunService hooks here — soft-refresh early-returns
+	-- below and would leave the live GUI with all Heartbeats dead ("script not loading").
+	-- Orphan hook purge lives in soft-reload teardown + full-rebuild path only.
+	task.spawn(function()
+		local run = g.SB2FlingDebugRun
+		for i = 1, 15 do
+			task.wait(0.2)
+			if g.SB2FlingDebugRun ~= run then
+				break
+			end
+			local snap = dbgHrpSnapshot('t' .. tostring(i * 0.2))
+			if (snap.vel and snap.vel > 60)
+				or snap.state == 'Ragdoll'
+				or snap.state == 'FallingDown'
+				or snap.state == 'Physics'
+				or (snap.crossWelds and snap.crossWelds > 0)
+				or (snap.y and snap.y < -20)
+			then
+				dbgFling('A,B,D,E', 'boot:sample', 'anomaly during boot window', snap)
+			elseif i == 1 or i == 5 or i == 10 or i == 15 then
+				dbgFling('B,C,E', 'boot:sample', 'boot sample', snap)
+			end
+		end
+	end)
+	-- #endregion
+	-- FIRST: tear down client anim ghosts. Clone keeps Motor6D → live CharacterItems.Handle;
+	-- leaving that weld up for even one frame on reload ragdolls you.
+	pcall(function()
+		if type(g.SB2AnimSwapStop) == 'function' then
+			g.SB2AnimSwapStop()
+		end
+	end)
+	pcall(function()
+		local ghost = g._SB2AnimGhost
+		if type(ghost) == 'table' then
+			pcall(function()
+				if ghost.hb then
+					ghost.hb:Disconnect()
+				end
+			end)
+			pcall(function()
+				if ghost.played then
+					ghost.played:Disconnect()
+				end
+			end)
+			pcall(function()
+				if ghost.weaponFolder then
+					ghost.weaponFolder:Destroy()
+				end
+			end)
+			pcall(function()
+				if ghost.clone then
+					ghost.clone:Destroy()
+				end
+			end)
+			pcall(function()
+				if ghost.world then
+					ghost.world:Destroy()
+				end
+			end)
+			g._SB2AnimGhost = nil
+		end
+		local cam = workspace.CurrentCamera
+		if cam then
+			for _, name in ipairs({
+				'_SB2AnimGhostWorld',
+				'_SB2AnimGhostChar',
+				'_SB2AnimGhostWeapons',
+			}) do
+				local orphan = cam:FindFirstChild(name)
+				if orphan then
+					orphan:Destroy()
+				end
+			end
+			for _, d in ipairs(cam:GetDescendants()) do
+				if d.Name == '_SB2AnimGhostWorld'
+					or d.Name == '_SB2AnimGhostChar'
+					or d.Name == '_SB2AnimGhostWeapons'
+				then
+					pcall(function()
+						d:Destroy()
+					end)
+				end
+			end
+		end
+		if type(g.SB2WeaponModState) == 'table' then
+			-- Don't auto-reapply anim on this boot — user re-enables or hits Re-apply.
+			g.SB2WeaponModState._AnimSkipAutoApply = true
+			g.SB2WeaponModState.AnimEnabled = false
+		end
+		g._SB2AnimGhostWant = nil
+	end)
+	-- #region agent log
+	dbgFling('A,D', 'boot:afterGhostKill', 'after anim ghost kill', dbgHrpSnapshot('afterGhostKill'))
+	-- #endregion
 	-- Stuck mid-load from a prior crash must not soft-lock relaunches.
 	if g.SB2PlayerToolsLoading == true then
 		local since = tonumber(g.SB2PlayerToolsLoadingSince) or 0
@@ -65,6 +221,63 @@ do
 	local keep = g.SB2PlayerToolsGui
 	local softReload = g.SB2SoftPlayerToolsReload == true
 	local hopGrace = os.clock() < (tonumber(g.SB2MenuHopGraceUntil) or 0)
+	-- Soft reload while floating (boss route / Anchor): remember pose so we do NOT
+	-- unanchor into the void during teardown + holdCombatAnchor(4) boot.
+	if softReload then
+		g.SB2SoftReloadPreserveFlight = true
+		g.SB2SoftReloadHadAnchor = g.SB2CombatAnchorOn == true
+		g.SB2SoftReloadHadBoss = g.SB2BossRouteWanted == true
+		g.SB2SoftReloadHadAutoAttack = g.SB2AutoAttackOn == true
+		-- AutoSkill has no durable genv bool; connection presence is the live signal.
+		g.SB2SoftReloadHadAutoSkill = false
+		pcall(function()
+			local c = g.SB2AutoSkillOnlyConn
+			if c and (typeof(c) ~= 'RBXScriptConnection' or c.Connected ~= false) then
+				g.SB2SoftReloadHadAutoSkill = true
+			end
+		end)
+		pcall(function()
+			local lp = game:GetService('Players').LocalPlayer
+			local folder = workspace:FindFirstChild('Characters')
+			local live = (lp and folder and folder:FindFirstChild(lp.Name))
+				or (lp and lp.Character)
+			local hrp = live and (live:FindFirstChild('HumanoidRootPart') or live.PrimaryPart)
+			if hrp and hrp:IsA('BasePart') then
+				-- Never snapshot a void pose — that would pin you under the map.
+				if hrp.Position.Y > -20 then
+					g.SB2SoftReloadPinCF = hrp.CFrame
+				else
+					g.SB2SoftReloadPinCF = nil
+					-- Also drop active TP pins that point into the void.
+					if typeof(g.SB2TpPinCFrame) == 'CFrame' and g.SB2TpPinCFrame.Position.Y < -20 then
+						g.SB2TpPinCFrame = nil
+						g.SB2TpPinActive = false
+						g.SB2TpPinGen = (tonumber(g.SB2TpPinGen) or 0) + 1
+						g.SB2TpPinUntil = 0
+					end
+				end
+				g.SB2SoftReloadWasAnchored = hrp.Anchored == true
+				-- Keep locked through the reload gap.
+				if hrp.Anchored or g.SB2SoftReloadHadAnchor or g.SB2SoftReloadHadBoss or hrp.Position.Y > 40 then
+					hrp.Anchored = true
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+				end
+			end
+		end)
+		g.SB2SkipHoldAnchorOnBoot = true
+	end
+	-- #region agent log
+	dbgFling('B,C', 'boot:softReloadGate', 'soft reload preserve decision', {
+		softReload = softReload,
+		preserve = g.SB2SoftReloadPreserveFlight == true,
+		hadAnchor = g.SB2SoftReloadHadAnchor == true,
+		hadBoss = g.SB2SoftReloadHadBoss == true,
+		skipHold = g.SB2SkipHoldAnchorOnBoot == true,
+		pinY = typeof(g.SB2SoftReloadPinCF) == 'CFrame' and math.floor(g.SB2SoftReloadPinCF.Position.Y + 0.5) or nil,
+		hrp = dbgHrpSnapshot('softGate'),
+	})
+	-- #endregion
 	local function tryReparent(gui)
 		if typeof(gui) ~= 'Instance' or gui.Parent then
 			return typeof(gui) == 'Instance' and gui.Parent ~= nil
@@ -159,7 +372,7 @@ do
 			end
 		end)
 	end
-	if parentOk and type(g.SB2RefreshPlayerTools) == 'function' then
+	if parentOk and type(g.SB2RefreshPlayerTools) == 'function' and g.SB2ForceFullReload ~= true then
 		-- Soft refresh only — never full rebuild. Quiet keeper so it won't relaunch mid-refresh.
 		g.SB2UiKeeperQuietUntil = os.clock() + 20
 		g.SB2MenuHopGraceUntil = os.clock() + 20
@@ -172,7 +385,7 @@ do
 		g.SB2SoftPlayerToolsReload = nil
 		return
 	end
-	if parentOk and (softReload or hopGrace or live) then
+	if parentOk and (softReload or hopGrace or live) and g.SB2ForceFullReload ~= true then
 		g.SB2UiKeeperQuietUntil = os.clock() + 20
 		g.SB2MenuHopGraceUntil = os.clock() + 20
 		g.SB2MenuWantOpen = true
@@ -186,6 +399,55 @@ do
 		g.SB2SoftPlayerToolsReload = nil
 		return
 	end
+	-- Full rebuild path: drop any existing GUI so CreateWindow is not soft-skipped.
+	if typeof(keep) == 'Instance' then
+		pcall(function()
+			keep:Destroy()
+		end)
+		g.SB2PlayerToolsGui = nil
+		keep = nil
+		parentOk = false
+		live = false
+	end
+	g.SB2ForceFullReload = nil
+	-- Full rebuild: purge orphan RunService hooks from prior soft-reloads (FPS death spiral).
+	-- Must run AFTER soft-refresh early-returns above, never before.
+	pcall(function()
+		if type(getconnections) ~= 'function' then
+			return
+		end
+		local RS = game:GetService('RunService')
+		for pass = 1, 8 do
+			local n = 0
+			for _, sig in ipairs({ 'Heartbeat', 'RenderStepped', 'Stepped' }) do
+				local ok, cons = pcall(getconnections, RS[sig])
+				if ok and type(cons) == 'table' then
+					for _, cn in ipairs(cons) do
+						local src = ''
+						pcall(function()
+							src = debug.info(cn.Function, 's') or ''
+						end)
+						if string.find(src, 'PlayerTools_Obsidian', 1, true)
+							or string.find(src, 'PlayerTools_Starlight', 1, true)
+							or src == '[string "Starlight"]'
+						then
+							pcall(function()
+								cn:Disconnect()
+							end)
+							n += 1
+						end
+					end
+				end
+			end
+			if n == 0 then
+				break
+			end
+		end
+		pcall(function()
+			RS:UnbindFromRenderStep('SB2CamLock')
+			RS:UnbindFromRenderStep('SB2CamLockLast')
+		end)
+	end)
 	if live then
 		-- Older instance without refresh: fall through so unloadExisting replaces this one window.
 		g.SB2PlayerTools = false
@@ -274,6 +536,7 @@ local FRESH_FINDER_PATH = joinPath(CONFIG.ConfigFolder, 'fresh_server_finder.jso
 local SOLO_RESUME_PATH = joinPath(CONFIG.ConfigFolder, 'solo_resume')
 local COMBAT_SKILLS_PATH = joinPath(CONFIG.ConfigFolder, 'combat_skills.json')
 local COMBAT_PREFS_PATH = joinPath(CONFIG.ConfigFolder, 'combat_prefs.json')
+local WEAPON_MOD_PATH = joinPath(CONFIG.ConfigFolder, 'weapon_mod.json')
 -- Profile-independent: dive height / flee depth / combat+dive skills.
 local COMBAT_PREFS_INDEXES = {
 	DiveFarmHeight = true,
@@ -304,41 +567,35 @@ local AUTOEXEC_PATHS = {
 }
 
 -- Solo resume / auto-block treat these as you (combat stays on, no block hop).
-local OWN_ALT_NAMES = {
-	nickb928 = true,
-	nickb925 = true,
-	nickb926 = true,
-	nickb910 = true,
-	nickb929 = true,
-	dyildolover = true,
-	pyrixl = true,
-	formauglejuregiant = true,
-	['4maug'] = true,
-	isweatbadges = true,
-	marriel_lee = true,
-	tworztheancienttree = true,
-	tworzleancienttree = true,
-	simplypeek = true,
-	simpiyleek = true,
-	sfltst = true,
-	xkilluaxx124 = true,
-	xxbluepok = true,
-	da_thedemeanor = true,
-	ra_theenlightener = true,
-	ka_themischief = true,
-	z4_theeldest = true,
-	wa_thecurious = true,
-	sb2butonlytrading = true,
-	['62qx'] = true,
-}
+-- Whitelist by UserId only — usernames can change / become roblox_user_<id>.
 local OWN_ALT_USERIDS = {
 	[105008790] = true, -- NickB926
-	[5629930206] = true, -- NickB910
 	[58534583] = true, -- NickB925
+	[5629930206] = true, -- NickB910
 	[2948744565] = true, -- NickB929
-	[1781632332] = true, -- dyildolover (Roblox renamed → roblox_user_*)
+	[2567665744] = true, -- NickB928
+	[1781632332] = true, -- dyildolover (often roblox_user_1781632332)
+	[475975042] = true, -- Pyrixl
+	[5512085079] = true, -- 4maug (was Formauglejuregiant)
+	[3851863758] = true, -- iSweatBadges
+	[4212822041] = true, -- marriel_lee
+	[7519173184] = true, -- TworzTheAncientTree
+	[5667361490] = true, -- TworzLeAncientTree
+	[8026129747] = true, -- SimplyPeek
+	[9461039114] = true, -- SimpIyLeek
+	[9665540384] = true, -- SFlTST
+	[9687273225] = true, -- xKilluaXx124
+	[571865792] = true, -- XxBluepok
+	[11416094898] = true, -- Da_TheDemeanor
+	[11416160497] = true, -- Ra_TheEnlightener
+	[11416154884] = true, -- Ka_TheMischief
+	[11416179129] = true, -- Z4_TheEldest
+	[11416183253] = true, -- Wa_TheCurious
+	[11025682106] = true, -- SB2ButOnlyTrading
+	[285463210] = true, -- 62qx
 }
 local function normalizeAltKey(raw)
+	-- Only for per-account profile filenames — whitelist itself is UserId-based.
 	local s = string.lower(tostring(raw or ''))
 	s = s:gsub('%s+', ''):gsub('[^%w_%-]', '')
 	return s
@@ -351,35 +608,41 @@ local function accountFileKey()
 	end
 	return name
 end
+local function isOwnAltId(uid)
+	uid = tonumber(uid)
+	if not uid then
+		return false
+	end
+	if OWN_ALT_USERIDS[uid] then
+		return true
+	end
+	local extras = rawget(getgenv(), 'SB2OwnAltUserIds')
+	return type(extras) == 'table' and extras[uid] == true
+end
 local function isOwnAlt(plr)
 	if not plr then
 		return false
 	end
 	local uid = tonumber(plr.UserId)
-	if uid and OWN_ALT_USERIDS[uid] then
+	if isOwnAltId(uid) then
 		return true
 	end
-	local extras = rawget(getgenv(), 'SB2OwnAltNames')
-	local name = normalizeAltKey(plr.Name)
-	local display = normalizeAltKey(plr.DisplayName)
+	-- Banned/renamed placeholder: roblox_user_<userid>
+	local name = string.lower(tostring(plr.Name or ''))
 	local stubId = name:match('^roblox_user_(%d+)$')
-	if stubId and OWN_ALT_USERIDS[tonumber(stubId)] then
+	if stubId and isOwnAltId(tonumber(stubId)) then
 		return true
 	end
-	local hit = OWN_ALT_NAMES[name] == true
-		or OWN_ALT_NAMES[display] == true
-		or (type(extras) == 'table' and (extras[name] == true or extras[display] == true))
-	if hit and uid then
-		OWN_ALT_USERIDS[uid] = true
-	end
-	return hit
+	return false
 end
 getgenv().SB2IsOwnAlt = isOwnAlt
-getgenv().SB2OwnAltNames = getgenv().SB2OwnAltNames or OWN_ALT_NAMES
--- Keep the canonical list merged into genv so reloads / other scripts see the same alts.
-for k, v in pairs(OWN_ALT_NAMES) do
-	getgenv().SB2OwnAltNames[k] = v
+getgenv().SB2IsOwnAltId = isOwnAltId
+getgenv().SB2OwnAltUserIds = getgenv().SB2OwnAltUserIds or {}
+for id, v in pairs(OWN_ALT_USERIDS) do
+	getgenv().SB2OwnAltUserIds[id] = v
 end
+-- Legacy name map kept empty for older plugins that still read SB2OwnAltNames.
+getgenv().SB2OwnAltNames = getgenv().SB2OwnAltNames or {}
 
 local notify = function(title, text)
 	local now = os.clock()
@@ -484,9 +747,55 @@ local unloadExisting = function()
 			getgenv().SB2SetAnchorPlayerNoclip(false)
 		end
 	end)
+	-- Soft-reload path: kill anim ghosts again after GUI teardown (boot kill may race).
 	pcall(function()
-		getgenv().SB2AutoAttackOn = false
-		getgenv().SB2CombatAnchorOn = false
+		if type(getgenv().SB2AnimSwapStop) == 'function' then
+			getgenv().SB2AnimSwapStop()
+		end
+		if type(getgenv().SB2WeaponModCleanup) == 'function' then
+			getgenv().SB2WeaponModCleanup()
+		end
+		local cam = workspace.CurrentCamera
+		if cam then
+			for _, name in ipairs({
+				'_SB2AnimGhostWorld',
+				'_SB2AnimGhostChar',
+				'_SB2AnimGhostWeapons',
+			}) do
+				local orphan = cam:FindFirstChild(name)
+				if orphan then
+					orphan:Destroy()
+				end
+			end
+		end
+		getgenv()._SB2AnimGhost = nil
+	end)
+	pcall(function()
+		-- Soft reload mid-air: do NOT clear Anchor — that drops you through the floor.
+		if getgenv().SB2SoftReloadPreserveFlight == true then
+			pcall(function()
+				local lp = game:GetService('Players').LocalPlayer
+				local folder = workspace:FindFirstChild('Characters')
+				local live = (lp and folder and folder:FindFirstChild(lp.Name))
+					or (lp and lp.Character)
+				local hrp = live and (live:FindFirstChild('HumanoidRootPart') or live.PrimaryPart)
+				local pin = getgenv().SB2SoftReloadPinCF
+				if hrp and hrp:IsA('BasePart') then
+					if typeof(pin) == 'CFrame' then
+						hrp.CFrame = pin
+					end
+					hrp.Anchored = true
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+				end
+			end)
+			if getgenv().SB2SoftReloadHadAnchor == true then
+				getgenv().SB2CombatAnchorOn = true
+			end
+		else
+			getgenv().SB2AutoAttackOn = false
+			getgenv().SB2CombatAnchorOn = false
+		end
 		local function dropConn(key)
 			local c = getgenv()[key]
 			if c then
@@ -513,9 +822,51 @@ local unloadExisting = function()
 			'SB2FarmFpsLightConn',
 			'SB2WsDeleteLogConn',
 			'SB2VoidProbeHbConn',
+			'SB2DiveFarmConn',
+			'SB2WeaponModConn',
+			'SB2AnchorDescConn',
 		}) do
 			dropConn(key)
 		end
+		-- Soft-reloads used to leave orphan Heartbeats (genv pointer lost → 5x Obsidian HB).
+		-- Kill every RunService hook from our scripts before the new load installs fresh ones.
+		pcall(function()
+			if type(getconnections) ~= 'function' then
+				return
+			end
+			local RS = game:GetService('RunService')
+			for pass = 1, 8 do
+				local n = 0
+				for _, sig in ipairs({ 'Heartbeat', 'RenderStepped', 'Stepped' }) do
+					local ok, cons = pcall(getconnections, RS[sig])
+					if ok and type(cons) == 'table' then
+						for _, cn in ipairs(cons) do
+							local src = ''
+							pcall(function()
+								src = debug.info(cn.Function, 's') or ''
+							end)
+							if string.find(src, 'PlayerTools_Obsidian', 1, true)
+								or string.find(src, 'PlayerTools_Starlight', 1, true)
+								or src == '[string "Starlight"]'
+							then
+								pcall(function()
+									cn:Disconnect()
+								end)
+								n += 1
+							end
+						end
+					end
+				end
+				if n == 0 then
+					break
+				end
+			end
+		end)
+		pcall(function()
+			local RS = game:GetService('RunService')
+			RS:UnbindFromRenderStep('SB2CamLock')
+			RS:UnbindFromRenderStep('SB2CamLockLast')
+		end)
 		getgenv().SB2LogVoidProbe = nil
 		getgenv().SB2LastVoidProbe = nil
 		local camLock = getgenv().SB2CameraLockConn
@@ -532,7 +883,46 @@ local unloadExisting = function()
 	end)
 	pcall(function()
 		if type(getgenv().SB2StopCombatRuntime) == 'function' then
-			getgenv().SB2StopCombatRuntime()
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				getgenv().SB2DbgFling(
+					'B,C',
+					'teardown:stopCombat',
+					'about to StopCombatRuntime',
+					{
+						preserve = getgenv().SB2SoftReloadPreserveFlight == true,
+						willUnanchor = getgenv().SB2SoftReloadPreserveFlight ~= true,
+					}
+				)
+			end
+			-- #endregion
+			if getgenv().SB2SoftReloadPreserveFlight == true then
+				-- false = stop loops but keep HRP anchored (no void drop).
+				pcall(getgenv().SB2StopCombatRuntime, false)
+				if getgenv().SB2SoftReloadHadAnchor == true then
+					getgenv().SB2CombatAnchorOn = true
+				end
+			else
+				getgenv().SB2StopCombatRuntime()
+			end
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				local snap = {}
+				pcall(function()
+					local lp = game:GetService('Players').LocalPlayer
+					local folder = workspace:FindFirstChild('Characters')
+					local live = (lp and folder and folder:FindFirstChild(lp.Name)) or (lp and lp.Character)
+					local hrp = live and live:FindFirstChild('HumanoidRootPart')
+					local hum = live and live:FindFirstChildOfClass('Humanoid')
+					snap.y = hrp and math.floor(hrp.Position.Y + 0.5)
+					snap.anchored = hrp and hrp.Anchored
+					snap.vel = hrp and math.floor(hrp.AssemblyLinearVelocity.Magnitude + 0.5)
+					snap.state = hum and hum:GetState().Name
+					snap.anchorOn = getgenv().SB2CombatAnchorOn == true
+				end)
+				getgenv().SB2DbgFling('B,C,E', 'teardown:afterStopCombat', 'after StopCombatRuntime', snap)
+			end
+			-- #endregion
 		end
 	end)
 	pcall(function()
@@ -760,14 +1150,19 @@ local ok, err = pcall(function()
 		end
 		if type(src) == 'string' and src ~= '' and src:find('SB2_PLAYERTOOLS_EOF', 1, true) then
 			getgenv().SB2PlayerToolsCode = src
-			if type(writefile) == 'function' then
+			-- Never mirror-overwrite disk from a stale in-memory/other-path body.
+			-- That previously clobbered fixed Obsidian.lua and left fling ghosts.
+			if type(writefile) == 'function'
+				and src:find('SB2DbgFling', 1, true)
+				and src:find('_SB2AnimGhostWorld', 1, true)
+			then
 				if type(makefolder) == 'function' and type(isfolder) == 'function' then
 					if not isfolder('PlayerTools') then
 						pcall(makefolder, 'PlayerTools')
 					end
 				end
 				pcall(writefile, WORKSPACE_SCRIPT, src)
-				-- PlayerTools.lua is the Starlight entry shim; never mirror over it.
+				-- PlayerTools.lua is the entry shim; never mirror over it.
 			end
 		end
 		return src
@@ -803,7 +1198,7 @@ local ok, err = pcall(function()
 						if getgenv().SB2HideGameplayPaused ~= false then
 							hideGameplayPausedUi()
 						end
-						task.wait(4)
+						task.wait(15)
 					end
 					getgenv().SB2GameplayPausedUiWatch = nil
 				end)
@@ -1560,17 +1955,21 @@ local ok, err = pcall(function()
 				enqueue(ch)
 			end)
 		end)
-		getgenv().SB2SkillFxJanitorHbConn = RunService.Heartbeat:Connect(function()
-			if not getgenv()[CONFIG.GenvKey] then
-				return
-			end
-			flushBatch()
-			local now = os.clock()
-			if now - lastSweep >= 1.5 then
-				lastSweep = now
-				scanWorkspace()
-			end
-		end)
+			getgenv().SB2SkillFxJanitorHbConn = RunService.Heartbeat:Connect(function()
+				if not getgenv()[CONFIG.GenvKey] then
+					return
+				end
+				local now = os.clock()
+				-- Flush at most ~4Hz; full workspace scan every 8s (was every Heartbeat + 4s scan).
+				if now - (getgenv().SB2SkillFxFlushAt or 0) >= 0.25 then
+					getgenv().SB2SkillFxFlushAt = now
+					flushBatch()
+				end
+				if now - lastSweep >= 8 then
+					lastSweep = now
+					scanWorkspace()
+				end
+			end)
 		getgenv().SB2SweepSkillFx = function()
 			scanWorkspace()
 			for i = 1, #pending do
@@ -1603,17 +2002,28 @@ local ok, err = pcall(function()
 		end
 
 		local function pinQuality()
+			-- Only touch settings when drifted — rewriting QualityLevel every N seconds
+			-- forces a render hitch (felt like a stutter every ~5–10s on the main).
 			pcall(function()
-				settings().Rendering.QualityLevel = 1
+				local rend = settings().Rendering
+				if rend.QualityLevel ~= Enum.QualityLevel.Level01 and rend.QualityLevel ~= 1 then
+					rend.QualityLevel = 1
+				end
 			end)
 			pcall(function()
 				local gs = UserSettings():GetService('UserGameSettings')
-				gs.SavedQualityLevel = Enum.SavedQualityLevel.QualityLevel1
+				if gs.SavedQualityLevel ~= Enum.SavedQualityLevel.QualityLevel1 then
+					gs.SavedQualityLevel = Enum.SavedQualityLevel.QualityLevel1
+				end
 			end)
 			pcall(function()
-				Lighting.GlobalShadows = false
-				Lighting.FogEnd = 400
-				Lighting.FogStart = 0
+				if Lighting.GlobalShadows ~= false then
+					Lighting.GlobalShadows = false
+				end
+				if Lighting.FogEnd ~= 400 then
+					Lighting.FogEnd = 400
+					Lighting.FogStart = 0
+				end
 			end)
 			pcall(function()
 				local kids = Lighting:GetChildren()
@@ -1622,7 +2032,9 @@ local ok, err = pcall(function()
 					if ch:IsA('BlurEffect') or ch:IsA('BloomEffect') or ch:IsA('SunRaysEffect')
 						or ch:IsA('DepthOfFieldEffect')
 					then
-						ch.Enabled = false
+						if ch.Enabled then
+							ch.Enabled = false
+						end
 					end
 				end
 			end)
@@ -1652,7 +2064,7 @@ local ok, err = pcall(function()
 					return
 				end
 				local now = os.clock()
-				if now - lastPin < 5 then
+				if now - lastPin < 30 then
 					return
 				end
 				lastPin = now
@@ -1709,43 +2121,117 @@ local ok, err = pcall(function()
 
 	local PhysicsService = game:GetService('PhysicsService')
 	local ANCHOR_NOCLIP_ATTR = 'SB2AnchorCol'
+	local ANCHOR_COLGROUP_ATTR = 'SB2PrevColGroup'
+	-- SB2 already has HelperMob: collides with Default (floor), NOT Players/Mobs/MobHitbox.
+	-- Client cannot edit the collision matrix (server-only), but CAN assign parts to this group.
+	local ANCHOR_GHOST_GROUP = 'HelperMob'
+	local function ghostPartForAnchor(part, enabled)
+		if not part or not part:IsA('BasePart') then
+			return
+		end
+		if enabled then
+			if part:GetAttribute(ANCHOR_COLGROUP_ATTR) == nil then
+				part:SetAttribute(ANCHOR_COLGROUP_ATTR, part.CollisionGroup)
+			end
+			if part.CollisionGroup ~= ANCHOR_GHOST_GROUP then
+				pcall(function()
+					part.CollisionGroup = ANCHOR_GHOST_GROUP
+				end)
+			end
+			-- Keep CanCollide so floor (Default) still works via HelperMob matrix.
+			if part:GetAttribute(ANCHOR_NOCLIP_ATTR) == nil then
+				part:SetAttribute(ANCHOR_NOCLIP_ATTR, part.CanCollide == true)
+			end
+			if not part.CanCollide then
+				part.CanCollide = true
+			end
+		else
+			local prevG = part:GetAttribute(ANCHOR_COLGROUP_ATTR)
+			if prevG ~= nil then
+				pcall(function()
+					part.CollisionGroup = tostring(prevG)
+				end)
+				part:SetAttribute(ANCHOR_COLGROUP_ATTR, nil)
+			elseif part.CollisionGroup == ANCHOR_GHOST_GROUP
+				or part.CollisionGroup == 'NoCollision'
+				or part.CollisionGroup == 'MobsNoCollision'
+			then
+				pcall(function()
+					part.CollisionGroup = 'Players'
+				end)
+			end
+			local was = part:GetAttribute(ANCHOR_NOCLIP_ATTR)
+			if was ~= nil then
+				part.CanCollide = was == true
+				part:SetAttribute(ANCHOR_NOCLIP_ATTR, nil)
+			end
+		end
+	end
 	local function setAnchorPlayerNoclip(enabled)
-		-- Player↔player only. World / mob collision stays. Restore on disable / unload.
-		pcall(function()
-			PhysicsService:CollisionGroupSetCollidable('Players', 'Players', not enabled)
-		end)
-		pcall(function()
-			PhysicsService:CollisionGroupSetCollidable('MobsNoCollision', 'Players', not enabled)
-		end)
-		local charsFolder = workspace:FindFirstChild('Characters')
-		for _, plr in ipairs(Players:GetPlayers()) do
-			if plr ~= LocalPlayer then
-				local model = plr.Character
-				if not (model and model.Parent) then
-					model = charsFolder and charsFolder:FindFirstChild(plr.Name)
-				end
-				if model then
-					for _, part in ipairs(model:GetDescendants()) do
-						if part:IsA('BasePart') then
-							if enabled then
-								if part:GetAttribute(ANCHOR_NOCLIP_ATTR) == nil then
-									part:SetAttribute(ANCHOR_NOCLIP_ATTR, part.CanCollide)
-								end
-								part.CanCollide = false
-							else
-								local was = part:GetAttribute(ANCHOR_NOCLIP_ATTR)
-								if was ~= nil then
-									part.CanCollide = was == true
-									part:SetAttribute(ANCHOR_NOCLIP_ATTR, nil)
-								end
+		-- Body only → HelperMob (walk-through players/mobs, floor OK).
+		-- NEVER touch CharacterItems / weapon Handles — putting them on HelperMob
+		-- (or mixing HelperMob grip + Default blade) shoves the sword sideways.
+		local model = getMyCharacterModel() or LocalPlayer.Character
+		if model then
+			for _, part in ipairs(model:GetDescendants()) do
+				if part:IsA('BasePart') then
+					-- Grip anchors are tiny weld hosts — keep them non-colliding so they
+					-- cannot push the Default-group Handle when the body is HelperMob.
+					if part.Name == 'RightGrip' or part.Name == 'LeftGrip' then
+						if enabled then
+							if part:GetAttribute(ANCHOR_NOCLIP_ATTR) == nil then
+								part:SetAttribute(ANCHOR_NOCLIP_ATTR, part.CanCollide == true)
+							end
+							part.CanCollide = false
+						else
+							local was = part:GetAttribute(ANCHOR_NOCLIP_ATTR)
+							if was ~= nil then
+								part.CanCollide = was == true
+								part:SetAttribute(ANCHOR_NOCLIP_ATTR, nil)
 							end
 						end
+					else
+						ghostPartForAnchor(part, enabled)
 					end
 				end
 			end
 		end
+		-- If a prior build left weapons on HelperMob, restore them to Default/prev.
+		pcall(function()
+			local items = workspace:FindFirstChild('CharacterItems')
+			local mine = items and items:FindFirstChild(tostring(LocalPlayer.UserId))
+			if not mine then
+				return
+			end
+			for _, part in ipairs(mine:GetDescendants()) do
+				if part:IsA('BasePart') then
+					local prevG = part:GetAttribute(ANCHOR_COLGROUP_ATTR)
+					if prevG ~= nil then
+						pcall(function()
+							part.CollisionGroup = tostring(prevG)
+						end)
+						part:SetAttribute(ANCHOR_COLGROUP_ATTR, nil)
+					elseif part.CollisionGroup == ANCHOR_GHOST_GROUP then
+						pcall(function()
+							part.CollisionGroup = 'Default'
+						end)
+					end
+					part:SetAttribute(ANCHOR_NOCLIP_ATTR, nil)
+				end
+			end
+		end)
+		getgenv().SB2AnchorNoclipOn = enabled == true
+		-- #region agent log
+		if type(getgenv().SB2DbgFling) == 'function' then
+			pcall(getgenv().SB2DbgFling, 'I', 'setAnchorPlayerNoclip', 'anchor_body_only_ghost', {
+				enabled = enabled == true,
+				group = ANCHOR_GHOST_GROUP,
+			})
+		end
+		-- #endregion
 	end
 	getgenv().SB2SetAnchorPlayerNoclip = setAnchorPlayerNoclip
+	getgenv().SB2GhostPartForAnchor = ghostPartForAnchor
 
 	local function cameraSubjectFrom(model)
 		if not model or not model.Parent then
@@ -1779,12 +2265,108 @@ local ok, err = pcall(function()
 		end)
 	end
 
+	-- Soft Combat Anchor: NEVER hard-Anchored while farming.
+	-- Hard Anchored + local PivotTo desyncs server position → 0 damage.
+	-- Soft lock: Anchored=false so TPs replicate; zero velocity + snap-back
+	-- kills mob pushes / CTF yeets without freezing replication.
+	local ANCHOR_PUSH_SNAP = 2.5 -- studs off lock before snap-back (not every frame)
+	local ANCHOR_REPLICATE_SEC = 0.65 -- unanchored settle after TP so server gets CFrame
+	local ANCHOR_GHOST_REFRESH = 1.25 -- seconds between full HelperMob rescans
+
+	local function anchorReplicating()
+		return os.clock() < (tonumber(getgenv().SB2AnchorReplicateUntil) or 0)
+	end
+
+	local function setAnchorLockCF(cf)
+		if typeof(cf) == 'CFrame' then
+			getgenv().SB2AnchorLockCF = cf
+		end
+	end
+
+	local function beginAnchorReplicate(seconds)
+		seconds = tonumber(seconds) or ANCHOR_REPLICATE_SEC
+		local untilT = os.clock() + math.max(0.2, seconds)
+		local prev = tonumber(getgenv().SB2AnchorReplicateUntil) or 0
+		if untilT > prev then
+			getgenv().SB2AnchorReplicateUntil = untilT
+		end
+		-- Hold window must not force-unanchor over the replicate settle incorrectly;
+		-- replicate itself keeps Anchored=false.
+		getgenv().SB2AnchorHoldUntil = 0
+	end
+
+	local function maintainAnchorGhost(model, hrp, force)
+		-- Cheap: only full-scan when HRP left HelperMob or refresh interval elapsed.
+		if getgenv().SB2CombatAnchorOn ~= true and getgenv().SB2AnchorNoclipOn ~= true then
+			return
+		end
+		local now = os.clock()
+		local last = tonumber(getgenv().SB2AnchorGhostAt) or 0
+		local groupOk = hrp and hrp.CollisionGroup == ANCHOR_GHOST_GROUP
+		if not force and groupOk and (now - last) < ANCHOR_GHOST_REFRESH then
+			return
+		end
+		getgenv().SB2AnchorGhostAt = now
+		pcall(setAnchorPlayerNoclip, true)
+	end
+
+	local function softLockRoot(model, hrp, opts)
+		opts = opts or {}
+		if not hrp or not hrp:IsA('BasePart') then
+			return
+		end
+		-- Lightweight: used by TP pin end / rare callers. No descendant scans.
+		hrp.Anchored = false
+		local vel = hrp.AssemblyLinearVelocity
+		if vel.Magnitude > 1 then
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end
+		local lock = getgenv().SB2AnchorLockCF
+		if typeof(lock) ~= 'CFrame' then
+			setAnchorLockCF(hrp.CFrame)
+			return
+		end
+		local dist = (hrp.Position - lock.Position).Magnitude
+		if anchorReplicating() or getgenv().SB2TpPinActive == true then
+			if dist > 1.0 then
+				if model and model.PivotTo then
+					model:PivotTo(lock)
+				else
+					hrp.CFrame = lock
+				end
+			end
+			return
+		end
+		if opts.skipSnap then
+			return
+		end
+		if dist > ANCHOR_PUSH_SNAP then
+			if model and model.PivotTo then
+				model:PivotTo(lock)
+			else
+				hrp.CFrame = lock
+			end
+		end
+	end
+
 	-- Anchoring HRP before the server has our CFrame freezes us at spawn:
 	-- mobs never stream, other clients never see us. Hold unanchored after spawn/TP.
+	-- Soft pin (pinTeleportCFrame) keeps Anchored=false while holding destination.
 	local function combatAnchorHolding()
+		if getgenv().SB2TpPinActive == true then
+			return false
+		end
+		if anchorReplicating() then
+			return true -- treat as "don't hard-lock yet"
+		end
 		return os.clock() < (tonumber(getgenv().SB2AnchorHoldUntil) or 0)
 	end
 	local function holdCombatAnchor(seconds)
+		-- During an active TP pin, never schedule an extra hold that fights the pin.
+		if getgenv().SB2TpPinActive == true then
+			return
+		end
 		seconds = tonumber(seconds) or 3.5
 		if seconds < 0 then
 			seconds = 0
@@ -1794,6 +2376,7 @@ local ok, err = pcall(function()
 		if untilT > prev then
 			getgenv().SB2AnchorHoldUntil = untilT
 		end
+		beginAnchorReplicate(math.min(seconds, ANCHOR_REPLICATE_SEC + 0.15))
 		local model = getMyCharacterModel() or LocalPlayer.Character
 		if not model then
 			return
@@ -1817,16 +2400,215 @@ local ok, err = pcall(function()
 		local hrp = model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso')
 		if hrp then
 			pcall(function()
+				setAnchorLockCF(hrp.CFrame)
 				LocalPlayer:RequestStreamAroundAsync(hrp.Position, 40)
 			end)
 		end
 	end
+	-- Soft-pin HRP at cf: stay UNanchored so server learns the new CFrame, hold
+	-- with PivotTo + zero velocity (anti-gravity / anti-push) for a short settle.
+	local function pinTeleportCFrame(cf, seconds)
+		seconds = tonumber(seconds) or 0.9
+		if typeof(cf) ~= 'CFrame' then
+			return
+		end
+		-- Never pin into the void (boss WP saved under the map → 0 damage AA).
+		if cf.Position.Y < -20 then
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				pcall(getgenv().SB2DbgFling, 'A', 'pinTeleportCFrame', 'pin_void_reject', {
+					y = cf.Position.Y,
+					x = cf.Position.X,
+					z = cf.Position.Z,
+				})
+			end
+			-- #endregion
+			return
+		end
+		local model = getMyCharacterModel() or LocalPlayer.Character
+		if not model then
+			return
+		end
+		local hrp = model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso')
+		if not hrp or not hrp:IsA('BasePart') then
+			return
+		end
+		getgenv().SB2AnchorHoldUntil = 0
+		getgenv().SB2TpPinActive = true
+		getgenv().SB2TpPinCFrame = cf
+		setAnchorLockCF(cf)
+		beginAnchorReplicate(math.max(seconds, ANCHOR_REPLICATE_SEC))
+		local gen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
+		getgenv().SB2TpPinGen = gen
+		local untilT = os.clock() + math.max(0.25, seconds)
+		getgenv().SB2TpPinUntil = untilT
+		pcall(function()
+			hrp.Anchored = false
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+			-- PivotTo keeps CharacterItems Handle welded; bare hrp.CFrame desyncs the grip
+			-- and DealDamage lands 0 (sword left at the old pad).
+			if model.PivotTo then
+				model:PivotTo(cf)
+			else
+				hrp.CFrame = cf
+			end
+			-- CRITICAL: do NOT Anchored=true here — that freezes client pose while the
+			-- server still has the pre-TP position (desync → 0 damage).
+		end)
+		-- #region agent log
+		if type(getgenv().SB2DbgFling) == 'function' then
+			pcall(getgenv().SB2DbgFling, 'H', 'pinTeleportCFrame', 'soft_pin_start', {
+				y = cf.Position.Y,
+				sec = seconds,
+				anchored = hrp.Anchored,
+			})
+		end
+		-- #endregion
+		lockReplicationFocus(model)
+		pcall(function()
+			LocalPlayer:RequestStreamAroundAsync(cf.Position, 48)
+		end)
+		task.spawn(function()
+			while getgenv().SB2TpPinGen == gen and os.clock() < untilT do
+				RunService.Heartbeat:Wait()
+				local m = getMyCharacterModel() or LocalPlayer.Character
+				local root = m and (m:FindFirstChild('HumanoidRootPart') or m:FindFirstChild('UpperTorso'))
+				if not root or not root:IsA('BasePart') then
+					continue
+				end
+				pcall(function()
+					root.Anchored = false
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
+					if (root.Position - cf.Position).Magnitude > 1.5 then
+						if m.PivotTo then
+							m:PivotTo(cf)
+						else
+							root.CFrame = cf
+						end
+					else
+						-- Keep Y locked even if XZ drifted slightly from physics.
+						local p = root.Position
+						local locked = CFrame.new(p.X, cf.Position.Y, p.Z) * (cf - cf.Position)
+						if m.PivotTo then
+							m:PivotTo(locked)
+						else
+							root.CFrame = locked
+						end
+					end
+				end)
+			end
+			if getgenv().SB2TpPinGen ~= gen then
+				return
+			end
+			getgenv().SB2TpPinActive = false
+			getgenv().SB2TpPinCFrame = nil
+			-- Soft Combat Anchor: stay unanchored, lock CF for push snap-back.
+			setAnchorLockCF(cf)
+			beginAnchorReplicate(0.35)
+			if getgenv().SB2CombatAnchorOn == true or isToggleOn('CombatAnchor') then
+				pcall(function()
+					local m = getMyCharacterModel() or LocalPlayer.Character
+					local root = m and (m:FindFirstChild('HumanoidRootPart') or m:FindFirstChild('UpperTorso'))
+					if root and root:IsA('BasePart') then
+						softLockRoot(m, root, { skipSnap = true })
+					end
+				end)
+			end
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				pcall(getgenv().SB2DbgFling, 'H', 'pinTeleportCFrame', 'soft_pin_end', {
+					y = cf.Position.Y,
+				})
+			end
+			-- #endregion
+		end)
+	end
 	getgenv().SB2HoldCombatAnchor = holdCombatAnchor
 	getgenv().SB2CombatAnchorHolding = combatAnchorHolding
+	getgenv().SB2PinTeleportCFrame = pinTeleportCFrame
+	getgenv().SB2SoftLockRoot = softLockRoot
+	getgenv().SB2BeginAnchorReplicate = beginAnchorReplicate
+	getgenv().SB2SetAnchorLockCF = setAnchorLockCF
 	task.defer(function()
-		if LocalPlayer.Character then
-			holdCombatAnchor(4)
+		if not LocalPlayer.Character then
+			return
 		end
+		-- Soft reload / boss air: never open the unanchor window (void drop).
+		if getgenv().SB2SkipHoldAnchorOnBoot == true then
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				getgenv().SB2DbgFling('B', 'boot:holdAnchor', 'SKIP holdCombatAnchor (soft preserve)', {
+					skip = true,
+					hadAnchor = getgenv().SB2SoftReloadHadAnchor == true,
+				})
+			end
+			-- #endregion
+			getgenv().SB2SkipHoldAnchorOnBoot = nil
+			local pin = getgenv().SB2SoftReloadPinCF
+			local model = getMyCharacterModel() or LocalPlayer.Character
+			local hrp = model and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
+			if hrp and hrp:IsA('BasePart') then
+				if typeof(pin) == 'CFrame' then
+					if model.PivotTo then
+						pcall(function()
+							model:PivotTo(pin)
+						end)
+					else
+						hrp.CFrame = pin
+					end
+					if type(getgenv().SB2SetAnchorLockCF) == 'function' then
+						getgenv().SB2SetAnchorLockCF(pin)
+					else
+						getgenv().SB2AnchorLockCF = pin
+					end
+				end
+				hrp.AssemblyLinearVelocity = Vector3.zero
+				hrp.AssemblyAngularVelocity = Vector3.zero
+				-- Soft anchor only — hard Anchored here caused TP desync after reload.
+				hrp.Anchored = false
+				if type(getgenv().SB2BeginAnchorReplicate) == 'function' then
+					getgenv().SB2BeginAnchorReplicate(0.5)
+				end
+			end
+			return
+		end
+		if getgenv().SB2BossRouteWanted == true or getgenv().SB2CombatAnchorOn == true then
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				getgenv().SB2DbgFling('B', 'boot:holdAnchor', 'SKIP hold (boss/anchor on)', {
+					boss = getgenv().SB2BossRouteWanted == true,
+					anchorOn = getgenv().SB2CombatAnchorOn == true,
+				})
+			end
+			-- #endregion
+			return
+		end
+		local model = getMyCharacterModel() or LocalPlayer.Character
+		local hrp = model and model:FindFirstChild('HumanoidRootPart')
+		if hrp and hrp:IsA('BasePart') and hrp.Position.Y > 40 then
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				getgenv().SB2DbgFling('B', 'boot:holdAnchor', 'SKIP hold (high Y) — do not hard-anchor', {
+					y = math.floor(hrp.Position.Y + 0.5),
+					anchored = hrp.Anchored,
+				})
+			end
+			-- #endregion
+			-- Do NOT force Anchored=true here — that stuck players mid-air unable to walk.
+			-- Only skip the unanchor window.
+			return
+		end
+		-- #region agent log
+		if type(getgenv().SB2DbgFling) == 'function' then
+			getgenv().SB2DbgFling('B', 'boot:holdAnchor', 'CALL holdCombatAnchor(4)', {
+				y = hrp and math.floor(hrp.Position.Y + 0.5),
+				anchored = hrp and hrp.Anchored,
+			})
+		end
+		-- #endregion
+		holdCombatAnchor(4)
 	end)
 
 	local lastStreamRequestAt = 0
@@ -1881,7 +2663,10 @@ local ok, err = pcall(function()
 		return true
 	end
 
-	-- Log Workspace root removals so we can tell Destroy vs stream-out next time.
+	-- Workspace delete log is DEBUG-only — ChildRemoved + writefile storms crush FPS.
+	if getgenv().SB2WsDeleteLog ~= true then
+		-- skip installer
+	else
 	task.spawn(function()
 		if getgenv().SB2WsDeleteLogConn then
 			pcall(function()
@@ -1956,6 +2741,7 @@ local ok, err = pcall(function()
 			end
 		end)
 	end)
+	end
 
 	-- Pull map chunks back when StreamingEnabled drops everything around you
 	-- (visual void: sky + a few mobs, cam/char still "fine").
@@ -2325,120 +3111,37 @@ local ok, err = pcall(function()
 	end
 
 	local compile = loadstring or load
-	local LIB_CACHE = 'PlayerTools/ObsidianLibrary.lua'
-	local function readLibCache()
-		if type(readfile) ~= 'function' then
-			return nil
-		end
-		local ok, body = pcall(readfile, LIB_CACHE)
-		if ok and type(body) == 'string' and #body > 500 and body:find('CreateWindow', 1, true) then
-			return body
-		end
-		return nil
-	end
-	local function writeLibCache(src)
-		if type(writefile) ~= 'function' or type(src) ~= 'string' or src == '' then
-			return
-		end
-		if type(makefolder) == 'function' and type(isfolder) == 'function' then
-			if not isfolder('PlayerTools') then
-				pcall(makefolder, 'PlayerTools')
-			end
-		end
-		pcall(writefile, LIB_CACHE, src)
-	end
 
-	local okLib, librarySource = pcall(httpGet, CONFIG.UIRepo .. 'Library.lua')
-	-- Ataraxia chrome: default unless backend explicitly pins obsidian/starlight.
+	-- Ataraxia chrome only — no Obsidian Library.lua download / cache fallback.
+	getgenv().SB2UseAtaraxiaLib = true
+	local librarySource
 	do
-		local wantAtaraxia = getgenv().SB2UseAtaraxiaLib == true
-		if not wantAtaraxia and type(isfile) == 'function' and type(readfile) == 'function' then
-			local okB, body = pcall(readfile, 'PlayerTools/backend')
-			local v = okB and tostring(body):lower():gsub('%s', '') or ''
-			-- Match launch.lua: missing / empty / ataraxia → Ataraxia. Only obsidian/starlight opt out.
-			if v == '' or v == 'ataraxia' then
-				wantAtaraxia = true
-			end
-		elseif not wantAtaraxia then
-			wantAtaraxia = true
-		end
-		if wantAtaraxia then
-			local ataPath = 'PlayerTools/AtaraxiaLibrary.lua'
-			if type(isfile) == 'function' and isfile(ataPath) then
-				local okA, ataSrc = pcall(readfile, ataPath)
-				if okA and type(ataSrc) == 'string' and #ataSrc > 500 and ataSrc:find('CreateWindow', 1, true) then
-					librarySource = ataSrc
-					okLib = true
-					warn('[PlayerTools] using AtaraxiaLibrary (custom chrome)')
-				else
-					warn('[PlayerTools] AtaraxiaLibrary missing/invalid — falling back to Obsidian')
-				end
-			else
-				warn('[PlayerTools] AtaraxiaLibrary.lua not found — falling back to Obsidian')
+		local ataPath = nil
+		for _, path in ipairs({ 'PlayerTools/AtaraxiaLibrary.lua', 'AtaraxiaLibrary.lua' }) do
+			if type(isfile) == 'function' and isfile(path) then
+				ataPath = path
+				break
 			end
 		end
-	end
-	if not okLib or type(librarySource) ~= 'string' or librarySource == '' then
-		local cached = readLibCache()
-		if not cached then
-			error('Obsidian Library.lua download failed: ' .. tostring(librarySource))
+		if not ataPath then
+			error('[PlayerTools] AtaraxiaLibrary.lua missing — required for UI chrome', 0)
 		end
-		librarySource = cached
-		warn('[PlayerTools] Obsidian HttpGet failed — using cached Library.lua')
-	else
-		-- Don't overwrite Obsidian cache with Ataraxia source
-		if not tostring(librarySource):find('AtaraxiaLibrary', 1, true)
-			and not tostring(librarySource):find("Backend = 'Ataraxia'", 1, true)
-		then
-			writeLibCache(librarySource)
+		local okA, ataSrc = pcall(readfile, ataPath)
+		if not okA or type(ataSrc) ~= 'string' or #ataSrc < 500 or not ataSrc:find('CreateWindow', 1, true) then
+			error('[PlayerTools] AtaraxiaLibrary.lua invalid or unreadable: ' .. tostring(ataSrc), 0)
 		end
+		librarySource = ataSrc
+		warn('[PlayerTools] using AtaraxiaLibrary (custom chrome)')
 	end
-
-	local deadLucide =
-		'https://raw.githubusercontent.com/deividcomsono/lucide-roblox-direct/refs/heads/main/source.lua'
-	local liveLucide = 'https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua'
-	if librarySource:find(deadLucide, 1, true) then
-		librarySource = librarySource:gsub(deadLucide:gsub('(%W)', '%%%1'), liveLucide)
-	end
-	librarySource = librarySource:gsub(
-		'pcall%(Icons%.GetAsset, IconName%)',
-		'pcall(type(Icons) == "table" and Icons.GetAsset or function() end, IconName)'
-	)
-	-- GetTextBoundsAsync on cloneref(TextService) can throw "X is not a valid member of TextService".
-	librarySource = librarySource:gsub(
-		'local Bounds = TextService:GetTextBoundsAsync%(Params%)%s+return Bounds%.X, Bounds%.Y',
-		[[local okB, Bounds = pcall(function()
- return TextService:GetTextBoundsAsync(Params)
- end)
- if not okB or typeof(Bounds) ~= "Vector2" then
- return math.max(8, #(Text or "") * (Size or 14) * 0.52), (Size or 14) + 4
- end
- return Bounds.X, Bounds.Y]]
-	)
-	librarySource = librarySource:gsub(
-		'local PlayerList = Players:GetPlayers%(%)%s*\n%s*if ExcludeLocalPlayer',
-		[[local PlayerList = Players:GetPlayers()
-    if type(PlayerList) ~= "table" then
-        return {}
-    end
-    if ExcludeLocalPlayer]]
-	)
-	librarySource = librarySource:gsub(
-		'local TeamList = Teams:GetTeams%(%)%s*\n%s*table%.sort%(TeamList',
-		[[local TeamList = Teams:GetTeams()
-    if type(TeamList) ~= "table" then
-        return {}
-    end
-    table.sort(TeamList]]
-	)
 
 	local libraryFunc = compile(librarySource)
-	assert(libraryFunc, 'Obsidian Library.lua failed to compile')
+	assert(libraryFunc, 'AtaraxiaLibrary.lua failed to compile')
 
-	-- Force a fresh Obsidian instance so AutoFarm can run beside us.
+	-- Force a fresh library instance so AutoFarm can run beside us.
 	getgenv().Library = nil
 	local Library = libraryFunc()
-	assert(Library and Library.CreateWindow, 'Obsidian library failed to initialize')
+	assert(Library and Library.CreateWindow, 'Ataraxia library failed to initialize')
+	assert(Library.Backend == 'Ataraxia', 'Expected Ataraxia Backend, got ' .. tostring(Library.Backend))
 	do
 		local origGetTextBounds = Library.GetTextBounds
 		if type(origGetTextBounds) == 'function' then
@@ -2462,16 +3165,142 @@ local ok, err = pcall(function()
 		Library.Animations = type(Library.Animations) == 'table' and Library.Animations or {}
 		Library.Animations.TabSwitch = false
 	end
-	if getgenv().SB2StarlightAdapterSource and Library.Backend ~= 'Starlight' then
-		error(
-			'[PlayerTools/Starlight] library patch failed — still loaded Obsidian (Backend='
-				.. tostring(Library.Backend)
-				.. '). Re-run PlayerTools/launch.lua',
-			0
-		)
-	end
-	-- Rate-limit Obsidian toasts the same way as notify() — join storms were lagging.
+	-- Rate-limit toasts the same way as notify() — join storms were lagging.
 	-- User-driven info (View stats / Mob kills, duration>=8) always bypasses the cap.
+	-- Draw on a dedicated ScreenGui. Ataraxia's in-window toast is 40px and clips.
+	local function showBigToast(text, duration)
+		duration = tonumber(duration) or 5
+		local lp = game:GetService('Players').LocalPlayer
+		local pg = lp and lp:FindFirstChildOfClass('PlayerGui')
+		if not pg then
+			warn('[Ataraxia] ' .. tostring(text))
+			return
+		end
+		local tween = game:GetService('TweenService')
+		local gui = pg:FindFirstChild('SB2Toasts')
+		if not (typeof(gui) == 'Instance' and gui:IsA('ScreenGui')) then
+			gui = Instance.new('ScreenGui')
+			gui.Name = 'SB2Toasts'
+			gui.ResetOnSpawn = false
+			gui.IgnoreGuiInset = true
+			gui.DisplayOrder = 100000
+			gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+			if type(protectgui) == 'function' then
+				pcall(protectgui, gui)
+			end
+			gui.Parent = pg
+			local holder = Instance.new('Frame')
+			holder.Name = 'Holder'
+			holder.BackgroundTransparency = 1
+			holder.ClipsDescendants = false
+			holder.Size = UDim2.fromOffset(380, 700)
+			holder.Position = UDim2.new(1, -396, 0, 16)
+			holder.Parent = gui
+		end
+		local holder = gui:FindFirstChild('Holder')
+		if not holder then
+			warn('[Ataraxia] ' .. tostring(text))
+			return
+		end
+		holder.Position = UDim2.new(1, -396, 0, 16)
+		for _, ch in ipairs(holder:GetChildren()) do
+			if ch:IsA('GuiObject') then
+				ch:Destroy()
+			end
+		end
+		local body = tostring(text):gsub('\r\n', '\n'):gsub('\r', '\n')
+		local rows = {}
+		local start = 1
+		while true do
+			local nl = string.find(body, '\n', start, true)
+			rows[#rows + 1] = string.sub(body, start, nl and (nl - 1) or #body)
+			if not nl then
+				break
+			end
+			start = nl + 1
+		end
+		if #rows == 0 then
+			rows[1] = body
+		end
+		local fontSize = 14
+		local lineH = 20
+		local barH = 4
+		local t = Instance.new('Frame')
+		t.Name = 'Toast'
+		t.Size = UDim2.new(1, 0, 0, 22 + #rows * lineH + barH)
+		t.BackgroundColor3 = Color3.fromRGB(26, 26, 26)
+		t.BorderSizePixel = 0
+		t.ClipsDescendants = true
+		t.Parent = holder
+		local cr = Instance.new('UICorner')
+		cr.CornerRadius = UDim.new(0, 6)
+		cr.Parent = t
+		local outline = Instance.new('UIStroke')
+		outline.Color = Color3.fromRGB(255, 255, 255)
+		outline.Thickness = 1
+		outline.Transparency = 0
+		outline.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		outline.Parent = t
+		for i, row in ipairs(rows) do
+			local l = Instance.new('TextLabel')
+			l.BackgroundTransparency = 1
+			l.Font = Enum.Font.SourceSans
+			l.TextSize = fontSize
+			l.TextColor3 = Color3.fromRGB(242, 242, 242)
+			l.TextXAlignment = Enum.TextXAlignment.Left
+			l.TextYAlignment = Enum.TextYAlignment.Center
+			l.Text = row
+			l.Size = UDim2.new(1, -24, 0, lineH)
+			l.Position = UDim2.fromOffset(12, 10 + (i - 1) * lineH)
+			l.TextWrapped = false
+			l.TextTruncate = Enum.TextTruncate.None
+			l.Parent = t
+		end
+		local track = Instance.new('Frame')
+		track.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+		track.BorderSizePixel = 0
+		track.Size = UDim2.new(1, -16, 0, barH)
+		track.Position = UDim2.new(0, 8, 1, -(barH + 6))
+		track.Parent = t
+		local trackC = Instance.new('UICorner')
+		trackC.CornerRadius = UDim.new(0, 2)
+		trackC.Parent = track
+		local fill = Instance.new('Frame')
+		fill.BackgroundColor3 = Color3.new(1, 1, 1)
+		fill.BorderSizePixel = 0
+		fill.Size = UDim2.new(1, 0, 1, 0)
+		fill.Parent = track
+		local fillC = Instance.new('UICorner')
+		fillC.CornerRadius = UDim.new(0, 2)
+		fillC.Parent = fill
+		tween:Create(fill, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+			Size = UDim2.new(0, 0, 1, 0),
+		}):Play()
+		local flash = Instance.new('Frame')
+		flash.BackgroundColor3 = Color3.new(1, 1, 1)
+		flash.BackgroundTransparency = 0.45
+		flash.BorderSizePixel = 0
+		flash.Size = UDim2.new(1, 0, 1, 0)
+		flash.ZIndex = (t.ZIndex or 1) + 8
+		flash.Parent = t
+		local flashC = Instance.new('UICorner')
+		flashC.CornerRadius = UDim.new(0, 6)
+		flashC.Parent = flash
+		tween:Create(flash, TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			BackgroundTransparency = 1,
+		}):Play()
+		task.delay(0.3, function()
+			if flash.Parent then
+				flash:Destroy()
+			end
+		end)
+		task.delay(duration, function()
+			if t.Parent then
+				t:Destroy()
+			end
+		end)
+	end
+	getgenv().SB2ShowBigToast = showBigToast
 	do
 		local rawNotify = Library.Notify
 		if type(rawNotify) == 'function' then
@@ -2480,11 +3309,10 @@ local ok, err = pcall(function()
 				local dur = tonumber(duration) or 5
 				local important = force == true or dur >= 8
 				local function fire()
-					-- Obsidian Notify → New/FillInstance can throw
-					-- "lacking capability Plugin" from some executor/callback threads.
-					local ok, err = pcall(rawNotify, self, text, duration)
+					local ok, err = pcall(showBigToast, text, duration)
 					if not ok then
 						warn('[PlayerTools] Notify failed: ', err, ' | ', tostring(text):sub(1, 80))
+						pcall(rawNotify, self, text, duration)
 					end
 				end
 				if important then
@@ -3070,9 +3898,6 @@ local ok, err = pcall(function()
 			main.Size = UDim2.fromOffset(w, h)
 			Library.MinSize = Vector2.new(880, 560)
 			Library.OriginalMinSize = Library.MinSize
-			return
-		end
-		if Library.Backend == 'Starlight' then
 			return
 		end
 		main.Size = windowSize
@@ -4144,13 +4969,8 @@ local ok, err = pcall(function()
 				lines[#lines + 1] = ('… +%d more'):format(#rankings - limit)
 			end
 			local text = table.concat(lines, '\n')
-			local copied = copyTextToClipboard(text)
+			copyTextToClipboard(text)
 			Library:Notify(text, 16, true)
-			if copied then
-				task.defer(function()
-					Library:Notify('Copied kill rankings to clipboard', 4)
-				end)
-			end
 		end)
 	end
 
@@ -5360,12 +6180,12 @@ local ok, err = pcall(function()
 		local cachedMapGone = false
 		local cachedWorldUnloaded = false
 
-		-- Combat Anchor only — never snap CFrame on freefall (that rubberbanded falls).
+		-- Combat Anchor only — soft lock lives on the Anchor Heartbeat (throttled).
+		-- Do NOT soft-lock from the 20Hz camera step (that was PivotTo / scan spam → low FPS).
 		local function pinHighAir(char)
 			if not isToggleOn('CombatAnchor') then
 				return
 			end
-			-- Event dive must fly — pinHighAir was re-Anchoring every frame over dive.
 			if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
 				local hrpDive = char and char:FindFirstChild('HumanoidRootPart')
 				if hrpDive then
@@ -5375,24 +6195,14 @@ local ok, err = pcall(function()
 				end
 				return
 			end
-			if combatAnchorHolding() then
-				local hrpHold = char and char:FindFirstChild('HumanoidRootPart')
-				if hrpHold then
-					pcall(function()
-						hrpHold.Anchored = false
-					end)
-				end
-				return
-			end
 			local hrp = char and char:FindFirstChild('HumanoidRootPart')
 			if not hrp then
 				return
 			end
-			pcall(function()
-				hrp.AssemblyLinearVelocity = Vector3.zero
-				hrp.AssemblyAngularVelocity = Vector3.zero
-				hrp.Anchored = true
-			end)
+			-- Cheap: never re-anchor from camera. Soft-lock / ghost is elsewhere.
+			if hrp.Anchored then
+				hrp.Anchored = false
+			end
 		end
 
 		local function hardenCamera()
@@ -5481,11 +6291,11 @@ local ok, err = pcall(function()
 		end)
 
 		-- Last wins against SB2 scripts that set Fixed after default Camera priority.
-		-- 20Hz is enough; property-changed still calls hardenCamera immediately.
+		-- 4Hz is enough; 20Hz hardenCamera was a major FPS sink (~15fps).
 		local lastHardenAt = 0
 		local function hardenCameraStepped()
 			local now = os.clock()
-			if (now - lastHardenAt) < 0.05 then
+			if (now - lastHardenAt) < 0.25 then
 				return
 			end
 			lastHardenAt = now
@@ -5523,12 +6333,20 @@ local ok, err = pcall(function()
 		local AUTO_ATTACK_RANGE = 200
 		-- Wide skill tagging range, but we still cap how many mobs we hit per tick.
 		local SKILL_HIT_RANGE = 10000
-		local AUTO_ATTACK_INTERVAL = 0.12
-		local AUTO_ATTACK_DELAY = 0.08
+		-- Server rejects aura damage past ~melee/skill reach on elites/bosses even when
+		-- the instance is streamed. Prefer real/attack CF within these XZ radii.
+		local AURA_DAMAGE_RANGE = 260
+		local BOSS_DAMAGE_RANGE = 420
+		local AUTO_ATTACK_INTERVAL = 0.08
+		local AUTO_ATTACK_DELAY = 0.04
 		local HIT_LIVES_ATTACK_INTERVAL = 0.05
 		local HIT_LIVES_ATTACK_DELAY = 0.05
 		local HIT_LIVES_MIN_DELAY = 0.05
-		local MAX_ATTACKS_PER_TICK = 14
+		-- Killaura: hit many streamed mobs per tick (14 left most of a pack untouched).
+		local MAX_ATTACKS_PER_TICK = 48
+		-- Dump extra swings into bosses/elites per tick (1/tick felt like "not hitting").
+		local BOSS_HITS_PER_TICK = 10
+		local BOSS_ATTACK_DELAY = 0.02
 		-- Gap between any UseSkill casts (weapon + support).
 		local SKILL_CAST_GAP = 0.5
 		local lastAnySkillCastAt = 0
@@ -5616,39 +6434,36 @@ local ok, err = pcall(function()
 		end
 
 		local installCombatSniffer = function()
-			if type(hookmetamethod) ~= 'function' or type(getnamecallmethod) ~= 'function' then
+			-- DISABLED: hookmetamethod(__namecall) was silently zeroing all combat
+			-- damage. Runtime proof (session 7e9135): with sniffer on → 1000+ client
+			-- "hits" and Warlord HP delta 0; after restoring old namecall → 517500
+			-- HP in ~1s with the same DealDamage/UseSkill path.
+			-- rpcKey already comes from refreshRpcKey / prior sniff; do not re-hook.
+			if getgenv()._SB2CombatSnifferDisabled == true then
 				return
 			end
-			if getgenv().SB2CombatSnifferDispatch then
-				return
+			getgenv()._SB2CombatSnifferDisabled = true
+			-- If a prior load left the hook installed, unwrap it now.
+			if type(getgenv().SB2CombatSnifferOld) == 'function'
+				and getgenv().SB2CombatSnifferInstalled
+				and type(getrawmetatable) == 'function'
+			then
+				pcall(function()
+					local mt = getrawmetatable(game)
+					setreadonly(mt, false)
+					mt.__namecall = getgenv().SB2CombatSnifferOld
+					setreadonly(mt, true)
+					getgenv().SB2CombatSnifferDispatch = nil
+					getgenv().SB2CombatSnifferInstalled = false
+				end)
 			end
-			local old
-			local dispatch
-			dispatch = function(self, ...)
-				local method = getnamecallmethod()
-				if (method == 'FireServer' or method == 'fireServer')
-					and typeof(self) == 'Instance'
-					and self.Name == 'Event'
-				then
-					local args = { ... }
-					if args[1] == 'Combat' and type(args[2]) == 'table' then
-						local cb = getgenv().SB2CombatSnifferOnCombat
-						if type(cb) == 'function' then
-							pcall(cb, args[2], args[3])
-						end
-					end
-				end
-				return old(self, ...)
+			-- #region agent log
+			if type(getgenv().SB2DbgFling) == 'function' then
+				pcall(getgenv().SB2DbgFling, 'G', 'installCombatSniffer', 'sniffer_disabled', {
+					hadOld = type(getgenv().SB2CombatSnifferOld) == 'function',
+				})
 			end
-			if type(newcclosure) == 'function' then
-				dispatch = newcclosure(dispatch)
-			end
-			old = hookmetamethod(game, '__namecall', dispatch)
-			if type(old) == 'function' then
-				getgenv().SB2CombatSnifferOld = old
-				getgenv().SB2CombatSnifferDispatch = true
-				getgenv().SB2CombatSnifferInstalled = true
-			end
+			-- #endregion
 		end
 		pcall(installCombatSniffer)
 
@@ -5706,8 +6521,14 @@ local ok, err = pcall(function()
 			local root = mob:FindFirstChild('HumanoidRootPart')
 				or mob:FindFirstChild('Torso')
 				or mob:FindFirstChild('UpperTorso')
+				or mob.PrimaryPart
 			if root and root:IsA('BasePart') then
 				return root
+			end
+			for _, d in ipairs(mob:GetChildren()) do
+				if d:IsA('BasePart') then
+					return d
+				end
 			end
 			return nil
 		end
@@ -5716,8 +6537,16 @@ local ok, err = pcall(function()
 			if not mob or not mob.Parent then
 				return true
 			end
+			-- Corpses stay in workspace.Mobs briefly with Died=true; Health can
+			-- still look valid, so killaura wasted the whole tick on them.
+			if mob:GetAttribute('Died') == true then
+				return true
+			end
 			local entity = mob:FindFirstChild('Entity')
 			if not entity then
+				return true
+			end
+			if entity:GetAttribute('Died') == true then
 				return true
 			end
 			local health = entity:FindFirstChild('Health')
@@ -6157,6 +6986,20 @@ local ok, err = pcall(function()
 			['Summon Pistol'] = true,
 			['Pistol Summon'] = true,
 		}
+		-- Dash / pistol names do not open a DealDamage tag window. CTF / smash do.
+		-- Alts saved on Leaping Slash look like they are hitting and deal 0.
+		local POOR_AURA_TAG_SKILLS = {
+			['Leaping Slash'] = true,
+			['Summon Pistol'] = true,
+			['Pistol Summon'] = true,
+		}
+		local AURA_SKILL_PRIORITY = {
+			'Cursed Three Fold Slash',
+			'Downward Smash',
+			'Sweeping Strike',
+			'Everfrost Strike',
+			'Water Blast',
+		}
 
 		local getPlayerLevel = function()
 			local level = 1
@@ -6269,6 +7112,55 @@ local ok, err = pcall(function()
 			table.insert(names, 1, '(none)')
 			return names
 		end
+
+		local function isPoorAuraTagSkill(skillName)
+			if type(skillName) ~= 'string'
+				or skillName == ''
+				or skillName == '(none)'
+				or skillName == '(none for held weapon)'
+			then
+				return true
+			end
+			if FORCE_ATTACK_SKILLS[skillName] or POOR_AURA_TAG_SKILLS[skillName] then
+				return true
+			end
+			local lower = string.lower(skillName)
+			return string.find(lower, 'leap', 1, true) ~= nil
+				or string.find(lower, 'dash', 1, true) ~= nil
+				or string.find(lower, 'lunge', 1, true) ~= nil
+		end
+
+		local function pickBestAuraWeaponSkill()
+			local values = getAvailableSkills()
+			local have = {}
+			for _, name in ipairs(values) do
+				have[name] = true
+			end
+			for _, name in ipairs(AURA_SKILL_PRIORITY) do
+				if have[name] then
+					return name
+				end
+			end
+			for _, name in ipairs(values) do
+				if name ~= '(none)'
+					and name ~= '(none for held weapon)'
+					and not isPoorAuraTagSkill(name)
+				then
+					return name
+				end
+			end
+			-- Only Leaping Slash / pistol unlocked — nil so killaura uses the weapon.
+			return nil
+		end
+
+		local function resolveAuraWeaponSkill(skillName)
+			if not isPoorAuraTagSkill(skillName) then
+				return skillName
+			end
+			-- Dash/pistol: use smash/CTF if they own it. Otherwise nil = basic weapon hits.
+			return pickBestAuraWeaponSkill()
+		end
+		getgenv().SB2PickBestAuraWeaponSkill = pickBestAuraWeaponSkill
 
 		-- Anytime / support buffs (Cursed Enhancement, Realm Judgement, etc.).
 		local SUPPORT_FORCE_INCLUDE = {
@@ -6497,8 +7389,8 @@ local ok, err = pcall(function()
 				return nil
 			end
 			local cur = getSelectedSkillName()
-			-- Keep any valid held-weapon skill (never stomp user's CTF/smash pick on load).
-			if cur and not FORCE_ATTACK_SKILLS[cur] then
+			-- Keep smash/CTF. Do not keep dash/pistol — those tag 0 from killaura.
+			if cur and not isPoorAuraTagSkill(cur) then
 				local info = getSkillInfo(cur)
 				if info.class and not info.anytime then
 					local held = getEquippedWeaponClassesCached()
@@ -6797,28 +7689,26 @@ local ok, err = pcall(function()
 		local function getActiveWeaponSkillName()
 			local farm = getSelectedFarmSkillName()
 			local combat = getSelectedSkillName()
+			local picked
 			if usingEventFarmSkills() then
-				return farm or combat
-			end
-			if combat then
-				return combat
-			end
-			-- Skill dropdown often left on (none) while FarmSkill is set — that made
-			-- UseSkill only work during Event dive. Prefer a held-class match.
-			if farm then
-				local info = getSkillInfo(farm)
-				local held = getEquippedWeaponClassesCached()
-				if info.class and held[info.class] then
-					return farm
+				picked = farm or combat
+			elseif combat then
+				picked = combat
+			elseif farm then
+				-- Skill dropdown often left on (none) while FarmSkill is set — that made
+				-- UseSkill / killaura tags only work during Event dive.
+				picked = farm
+			else
+				local avail = getAvailableSkills()
+				for _, name in ipairs(avail) do
+					if name ~= '(none)' and name ~= '(none for held weapon)' then
+						picked = name
+						break
+					end
 				end
+				picked = picked or farm
 			end
-			local avail = getAvailableSkills()
-			for _, name in ipairs(avail) do
-				if name ~= '(none)' and name ~= '(none for held weapon)' then
-					return name
-				end
-			end
-			return farm
+			return resolveAuraWeaponSkill(picked)
 		end
 
 		local function getActiveSupportSkillName()
@@ -6985,7 +7875,11 @@ local ok, err = pcall(function()
 			if string.find(lower, 'chest', 1, true) or string.find(lower, 'drop', 1, true) then
 				return false
 			end
-			if string.find(lower, 'boss', 1, true) then
+			if string.find(lower, 'boss', 1, true)
+				or string.find(lower, 'warlord', 1, true)
+				or string.find(lower, 'miniboss', 1, true)
+				or string.find(lower, 'elite', 1, true)
+			then
 				return true
 			end
 			local key = normBossKey(name)
@@ -7005,6 +7899,49 @@ local ok, err = pcall(function()
 			end
 			local hitLives = entity and entity:FindFirstChild('HitLives')
 			if hitLives and typeof(hitLives.Value) == 'number' and hitLives.Value > 1 then
+				return true
+			end
+			-- Floor elites / multi-bar tanks (Warlord, Orange FE, etc.).
+			local bars = entity and entity:FindFirstChild('HealthbarCount')
+			if bars and typeof(bars.Value) == 'number' and bars.Value > 1 then
+				return true
+			end
+			local diff = entity and entity:FindFirstChild('Difficulty')
+			if diff and typeof(diff.Value) == 'string' then
+				local d = string.lower(diff.Value)
+				if string.find(d, 'boss', 1, true)
+					or string.find(d, 'mini', 1, true)
+					or d == 'hard'
+					or d == 'extreme'
+				then
+					return true
+				end
+			end
+			local health = entity and entity:FindFirstChild('Health')
+			if health and typeof(health.Value) == 'number' and health.Value >= 400000 then
+				return true
+			end
+			return false
+		end
+
+		local function isPriorityMob(mob)
+			if isBossMob(mob) then
+				return true
+			end
+			if not mob then
+				return false
+			end
+			local lower = string.lower(tostring(mob.Name))
+			-- Colored / named floor elites that aren't full wiki bosses.
+			if string.find(lower, 'orange', 1, true) and string.find(lower, 'experiment', 1, true) then
+				return true
+			end
+			if string.find(lower, 'lord', 1, true) or string.find(lower, 'king', 1, true) then
+				return true
+			end
+			local entity = mob:FindFirstChild('Entity')
+			local health = entity and entity:FindFirstChild('Health')
+			if health and typeof(health.Value) == 'number' and health.Value >= 200000 then
 				return true
 			end
 			return false
@@ -7528,6 +8465,7 @@ local ok, err = pcall(function()
 					or skillName == 'Realm Judgement'
 					or skillName == 'Realm Banishment'
 					or skillName == 'Meteor Shot'
+					or isPoorAuraTagSkill(skillName)
 				then
 					return nil
 				end
@@ -7555,6 +8493,7 @@ local ok, err = pcall(function()
 				or skillName == 'Realm Judgement'
 				or skillName == 'Realm Banishment'
 				or skillName == 'Meteor Shot'
+				or isPoorAuraTagSkill(skillName)
 			then
 				return nil
 			end
@@ -7610,18 +8549,20 @@ local ok, err = pcall(function()
 
 			getgenv().SB2SkillCastLock = true
 			local now = time()
+			-- Keep the skill name even if UseSkill is on CD / fails — AutoAttack
+			-- still needs it for DealDamage/Attack tags between casts.
 			getgenv().SB2SkillActiveName = skillName
-			getgenv().SB2SkillActiveUntil = now + 1.0
 
 			local ok = fireUseSkill(skillName, info, { muteFor = 1.35 })
 			task.defer(function()
 				task.wait(0.15)
 				getgenv().SB2SkillCastLock = false
 			end)
+			-- Keep the tag window open even when UseSkill fails (CD / range).
+			-- Bare DealDamage(nil) barely ticks; skill-tagged hits still work.
+			getgenv().SB2SkillActiveUntil = now + 2.25
 			if not ok then
-				getgenv().SB2SkillActiveUntil = 0
-				getgenv().SB2SkillActiveName = nil
-				return nil
+				return skillName
 			end
 			return skillName
 		end
@@ -7894,32 +8835,94 @@ local ok, err = pcall(function()
 			local model = getMyCharacterModel()
 			local hrp = model and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
 			if not hrp or not hrp:IsA('BasePart') then
+				-- Still toggle ghost if we can.
 				pcall(setAnchorPlayerNoclip, enabled == true)
 				return false
 			end
 			pcall(function()
-				if enabled and combatAnchorHolding() then
-					hrp.Anchored = false
-					return
+				hrp.Anchored = false
+				if enabled == true then
+					if typeof(getgenv().SB2AnchorLockCF) ~= 'CFrame' then
+						if type(getgenv().SB2SetAnchorLockCF) == 'function' then
+							getgenv().SB2SetAnchorLockCF(hrp.CFrame)
+						else
+							getgenv().SB2AnchorLockCF = hrp.CFrame
+						end
+					end
+				else
+					getgenv().SB2AnchorLockCF = nil
 				end
-				if enabled then
+			end)
+			-- ONE-SHOT ghost assign/restore. Do NOT call this from Heartbeat — full
+			-- descendant scans were the Anchor lag (HelperMob does not reset on its own).
+			pcall(setAnchorPlayerNoclip, enabled == true)
+			if enabled ~= true then
+				pcall(function()
 					hrp.AssemblyLinearVelocity = Vector3.zero
 					hrp.AssemblyAngularVelocity = Vector3.zero
-					if not hrp.Anchored then
-						hrp.CFrame = hrp.CFrame
-						lockReplicationFocus(model)
-						pcall(function()
-							LocalPlayer:RequestStreamAroundAsync(hrp.Position, 40)
-						end)
-					end
+				end)
+				if getgenv().SB2TpPinActive == true then
+					getgenv().SB2TpPinGen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
+					getgenv().SB2TpPinActive = false
+					getgenv().SB2TpPinCFrame = nil
+					getgenv().SB2TpPinUntil = 0
 				end
-				hrp.Anchored = enabled == true
-			end)
-			pcall(setAnchorPlayerNoclip, enabled == true)
+				local descConn = getgenv().SB2AnchorDescConn
+				if descConn then
+					pcall(function()
+						descConn:Disconnect()
+					end)
+					getgenv().SB2AnchorDescConn = nil
+				end
+				local g = getgenv()._SB2AnimGhost
+				if type(g) == 'table' then
+					pcall(function()
+						if g.clone then
+							for _, d in ipairs(g.clone:GetDescendants()) do
+								if d:IsA('BasePart') then
+									d.CanCollide = false
+									d.CanTouch = false
+									d.Massless = true
+								end
+							end
+						end
+						if g.weaponFolder then
+							for _, d in ipairs(g.weaponFolder:GetDescendants()) do
+								if d:IsA('BasePart') then
+									d.CanCollide = false
+									d.CanTouch = false
+									d.Massless = true
+								end
+							end
+						end
+					end)
+				end
+			else
+				-- New parts only (accessories / weapons) — no periodic full rescan.
+				local prevDesc = getgenv().SB2AnchorDescConn
+				if prevDesc then
+					pcall(function()
+						prevDesc:Disconnect()
+					end)
+				end
+				if model then
+					getgenv().SB2AnchorDescConn = model.DescendantAdded:Connect(function(inst)
+						if getgenv().SB2CombatAnchorOn ~= true then
+							return
+						end
+						if inst:IsA('BasePart') and type(getgenv().SB2GhostPartForAnchor) == 'function' then
+							pcall(getgenv().SB2GhostPartForAnchor, inst, true)
+						end
+					end)
+				end
+			end
 			return true
 		end
 
-		CombatBox:AddToggle('AutoAttack', { Text = 'Auto attack nearby mobs' }):OnChanged(function(value)
+		CombatBox:AddToggle('AutoAttack', {
+			Text = 'Killaura',
+			Tooltip = 'DealDamage/Attack nearby (and streamed) mobs. Pair with Auto skill for UseSkill + skill-tagged hits.',
+		}):OnChanged(function(value)
 			getgenv().SB2AutoAttackOn = value == true
 			local prev = getgenv().SB2AutoAttackConn
 			if prev then
@@ -7933,6 +8936,19 @@ local ok, err = pcall(function()
 				return
 			end
 
+			-- Hive stack / raw CFrame TP leaves the server at the old pad → 0 weapon damage.
+			pcall(function()
+				if isPoorAuraTagSkill(getgenv().SB2SkillActiveName) then
+					getgenv().SB2SkillActiveName = nil
+					getgenv().SB2SkillActiveUntil = 0
+				end
+				local model = getMyCharacterModel() or LocalPlayer.Character
+				local hrp = model and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
+				if hrp and hrp:IsA('BasePart') and type(pinTeleportCFrame) == 'function' then
+					pinTeleportCFrame(hrp.CFrame, 0.9)
+				end
+			end)
+
 			-- One safe RPCKey fetch if we don't have it yet — never RefillKeys / gc brute.
 			task.spawn(function()
 				pcall(refreshRpcKey)
@@ -7940,8 +8956,24 @@ local ok, err = pcall(function()
 			-- Clear stuck skill lock/CD from old laggy sessions.
 			getgenv().SB2SkillCastLock = false
 			getgenv().SB2SkillCdUntil = {}
-			getgenv().SB2SkillActiveUntil = 0
-			getgenv().SB2SkillActiveName = nil
+			-- Keep last skill tag name — wiping it made the first seconds of killaura do nothing.
+			if type(getgenv().SB2SkillActiveUntil) ~= 'number' or getgenv().SB2SkillActiveUntil < time() then
+				getgenv().SB2SkillActiveUntil = 0
+			end
+			-- Combat Skill often left on (none) while FarmSkill is set — fill it so tags work.
+			pcall(function()
+				local combat = flattenOptionValue(Options.SkillName and Options.SkillName.Value)
+				local farm = flattenOptionValue(Options.FarmSkillName and Options.FarmSkillName.Value)
+				if (not combat or combat == '' or combat == '(none)')
+					and type(farm) == 'string'
+					and farm ~= ''
+					and farm ~= '(none)'
+					and Options.SkillName
+					and type(Options.SkillName.SetValue) == 'function'
+				then
+					Options.SkillName:SetValue(farm)
+				end
+			end)
 			-- Kill live namecall UseSkill hooks (they blocked skills / added hitch).
 			pcall(function()
 				if getgenv()._SB2SupportBossOld and getrawmetatable then
@@ -7982,6 +9014,13 @@ local ok, err = pcall(function()
 				if (tonumber(getgenv().SB2CombatBootGraceUntil) or 0) > os.clock() then
 					return
 				end
+				-- Soft re-fetch RPC key if it never landed (boot race / hop).
+				if not combatState.rpcReady and (now - (combatState.lastRpcTry or 0)) > 2.5 then
+					combatState.lastRpcTry = now
+					task.spawn(function()
+						pcall(refreshRpcKey)
+					end)
+				end
 				local myPart = getMyBringPart()
 				local mobsRoot = workspace:FindFirstChild('Mobs')
 				if not myPart or not mobsRoot then
@@ -8006,26 +9045,62 @@ local ok, err = pcall(function()
 					and isToggleOn('AutoSkill')
 					and type(getgenv().SB2SkillActiveUntil) == 'number'
 					and getgenv().SB2SkillActiveUntil > time()
-				local wantSkillReach = not hitLivesRush
-					and isToggleOn('AutoSkill')
-					and (skillWindowOpen or (not pistolMode and skillRange >= aaRange))
-				local range = wantSkillReach and math.max(aaRange, skillRange) or aaRange
+				-- Prefer attack CFrame (handles client-stack). Unlimited stream wasted the
+				-- tick on far elites the server refuses to damage — bosses felt unhittable.
+				local range = AURA_DAMAGE_RANGE
+				local bossRange = BOSS_DAMAGE_RANGE
 				local rangeSq = range * range
-				local attackAllStreamed = range >= 10000
-
-				-- Pistol needs real CFrames even when AutoSkill is tagging all streamed mobs.
-				if pistolMode or not attackAllStreamed then
-					cacheMobRealPositions(origin)
+				local bossRangeSq = bossRange * bossRange
+				local attackAllStreamed = false
+				if pistolMode then
+					range = aaRange
+					rangeSq = range * range
 				end
+
+				-- Always refresh real-CF cache so stacked packs + far bosses range-check right.
+				cacheMobRealPositions(origin)
 
 				-- Hit-lives mobs die by hit count — CE buff + basic swings, no weapon UseSkill.
 				local attackName = nil
+				local function skillTagFallback()
+					if pistolMode then
+						return nil
+					end
+					local fallback = selectedSkill
+					if (not fallback or fallback == '' or fallback == '(none)' or FORCE_ATTACK_SKILLS[fallback])
+						and type(getgenv().SB2SkillActiveName) == 'string'
+					then
+						fallback = getgenv().SB2SkillActiveName
+					end
+					if type(fallback) ~= 'string'
+						or fallback == ''
+						or fallback == '(none)'
+						or fallback == '(none for held weapon)'
+						or FORCE_ATTACK_SKILLS[fallback]
+						or isPoorAuraTagSkill(fallback)
+						or fallback == 'Block'
+						or fallback == 'Roll'
+						or fallback == 'Sprint'
+					then
+						return nil
+					end
+					return fallback
+				end
 				if hitLivesRush then
 					if isToggleOn('AutoSkill') then
 						pcall(castSelectedSupportSkill)
 					end
 				elseif isToggleOn('AutoSkill') then
 					attackName = ensureSkillWindow()
+					-- Between UseSkill casts, bare DealDamage(nil) does almost nothing past
+					-- melee. Keep tagging the selected/last skill so ranged ticks still hurt.
+					if not attackName then
+						attackName = skillTagFallback()
+					end
+				else
+					-- Killaura alone: still tag the selected skill. Without a name,
+					-- DealDamage(nil) barely ticks at aura range.
+					attackName = skillTagFallback()
 				end
 
 				-- Pistol: UseSkill shot only. Tagging DealDamage with "Summon Pistol" does not
@@ -8046,34 +9121,40 @@ local ok, err = pcall(function()
 					if not root then
 						continue
 					end
-					if not attackAllStreamed then
-						local atkCF = getMobAttackCFrame(mob, root, origin)
-						local dx = atkCF.Position.X - origin.X
-						local dz = atkCF.Position.Z - origin.Z
-						local distSq = dx * dx + dz * dz
-						-- Event vacuum: also accept live-root XZ so hover stick always counts.
-						if isToggleOn('DiveFarm') then
-							local lx = root.Position.X - origin.X
-							local lz = root.Position.Z - origin.Z
-							local liveSq = lx * lx + lz * lz
-							if liveSq < distSq then
-								distSq = liveSq
-							end
-						end
-						if distSq > rangeSq then
-							continue
-						end
+					local priority = isPriorityMob(mob)
+					local atkCF = getMobAttackCFrame(mob, root, origin)
+					local dx = atkCF.Position.X - origin.X
+					local dz = atkCF.Position.Z - origin.Z
+					local distSq = dx * dx + dz * dz
+					-- Live root fallback (sometimes more accurate than stale cache).
+					local lx = root.Position.X - origin.X
+					local lz = root.Position.Z - origin.Z
+					local liveSq = lx * lx + lz * lz
+					if liveSq < distSq then
+						distSq = liveSq
+					end
+					local maxSq = priority and bossRangeSq or rangeSq
+					if pistolMode then
+						maxSq = rangeSq
+					end
+					if not attackAllStreamed and distSq > maxSq then
+						continue
 					end
 					mobList[#mobList + 1] = {
 						mob = mob,
 						hitLives = mobUsesHitLives(mob),
 						boss = isBossMob(mob),
+						priority = priority,
 						special = mobHasSpecialAttribute(mob),
+						distSq = distSq,
 					}
 				end
 				table.sort(mobList, function(a, b)
 					if a.hitLives ~= b.hitLives then
 						return a.hitLives
+					end
+					if a.priority ~= b.priority then
+						return a.priority
 					end
 					if a.boss ~= b.boss then
 						return a.boss
@@ -8081,7 +9162,7 @@ local ok, err = pcall(function()
 					if a.special ~= b.special then
 						return a.special
 					end
-					return false
+					return a.distSq < b.distSq
 				end)
 
 				local attacked = 0
@@ -8090,15 +9171,35 @@ local ok, err = pcall(function()
 					if attacked >= MAX_ATTACKS_PER_TICK then
 						break
 					end
-					if onCooldown[mob] then
-						continue
+					local strikes = 1
+					if entry.priority or entry.boss or entry.hitLives then
+						strikes = BOSS_HITS_PER_TICK
 					end
-					if fireMobAttack(mob, attackName) then
-						attacked += 1
-						onCooldown[mob] = true
-						task.delay(delay, function()
-							onCooldown[mob] = nil
-						end)
+					for _ = 1, strikes do
+						if attacked >= MAX_ATTACKS_PER_TICK then
+							break
+						end
+						if onCooldown[mob] and not (entry.priority or entry.boss) then
+							break
+						end
+						if fireMobAttack(mob, attackName) then
+							attacked += 1
+							if not (entry.priority or entry.boss or entry.hitLives) then
+								onCooldown[mob] = true
+								task.delay(delay, function()
+									onCooldown[mob] = nil
+								end)
+								break
+							else
+								-- Bosses: brief per-strike spacing only.
+								onCooldown[mob] = true
+								task.delay(BOSS_ATTACK_DELAY, function()
+									onCooldown[mob] = nil
+								end)
+							end
+						else
+							break
+						end
 					end
 				end
 			end)
@@ -8107,7 +9208,7 @@ local ok, err = pcall(function()
 		CombatBox:AddToggle('CombatAnchor', {
 			Text = 'Anchor',
 			Default = false,
-			Tooltip = 'Anchors your HumanoidRootPart so dash skills (CTF etc.) cannot yeet you into the void. Brief unanchor after spawn/TP so the server gets your position, then locks. Also turns off collision with other players until Anchor is off. Auto-off while Event dive is on.',
+			Tooltip = 'One-shot HelperMob ghost (mobs/players walk through) + rare push snap (~1s). No per-frame work. TPs stay unanchored so they replicate. Auto-off during Event dive.',
 		}):OnChanged(function(value)
 			-- Resume/profile setCombatTrio must not pin HRP during Event dive.
 			if value and (isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true) then
@@ -8138,51 +9239,111 @@ local ok, err = pcall(function()
 			end
 			if not value then
 				getgenv().SB2AnchorHoldUntil = 0
+				-- Cancel any active TP pin loop — it re-sets Anchored=true every Heartbeat
+				-- and leaves you floating after turning Anchor off.
+				getgenv().SB2TpPinGen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
+				getgenv().SB2TpPinActive = false
+				getgenv().SB2TpPinCFrame = nil
+				getgenv().SB2TpPinUntil = 0
 				applyCombatAnchor(false)
+				pcall(function()
+					local model = getMyCharacterModel() or LocalPlayer.Character
+					local root = model
+						and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
+					local hum = model and model:FindFirstChildOfClass('Humanoid')
+					if root and root:IsA('BasePart') then
+						root.Anchored = false
+						root.AssemblyLinearVelocity = Vector3.zero
+						root.AssemblyAngularVelocity = Vector3.zero
+					end
+					if hum then
+						hum.PlatformStand = false
+						pcall(function()
+							hum:ChangeState(Enum.HumanoidStateType.Freefall)
+						end)
+					end
+				end)
 				return
 			end
-			holdCombatAnchor(0.5)
+			-- Boss-route / TP pin: do NOT open an unanchor window — that drops you into the floor.
+			if getgenv().SB2TpPinActive == true or getgenv().SB2BossRouteWanted == true then
+				getgenv().SB2AnchorHoldUntil = 0
+			else
+				holdCombatAnchor(0.5)
+			end
 			applyCombatAnchor(true)
-			-- Re-apply — UseSkill / physics can clear Anchored.
-			getgenv().SB2CombatAnchorConn = RunService.Heartbeat:Connect(function()
-				local gui = getgenv().SB2PlayerToolsGui
-				if getgenv().SB2CombatAnchorOn ~= true or not (gui and gui.Parent) then
-					local conn = getgenv().SB2CombatAnchorConn
-					if conn then
-						pcall(function()
-							conn:Disconnect()
-						end)
-						getgenv().SB2CombatAnchorConn = nil
+			-- NO Heartbeat soft-lock. Probe: Anchor heartbeat/scans were ~16fps.
+			-- HelperMob is one-shot; DescendantAdded covers new parts; push snap is optional via TP pin only.
+			getgenv().SB2CombatAnchorConn = nil
+		end)
+
+		-- Soft reload: restore pose + combat toggles that teardown cleared.
+		task.defer(function()
+			if getgenv().SB2SoftReloadPreserveFlight ~= true then
+				return
+			end
+			local pin = getgenv().SB2SoftReloadPinCF
+			local wantAnchor = getgenv().SB2SoftReloadHadAnchor == true
+			local wantAA = getgenv().SB2SoftReloadHadAutoAttack == true
+			local wantSkill = getgenv().SB2SoftReloadHadAutoSkill == true
+			if typeof(pin) == 'CFrame' and pin.Position.Y > -20 then
+				pcall(function()
+					local model = getMyCharacterModel() or LocalPlayer.Character
+					local hrp = model
+						and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
+					if hrp and hrp:IsA('BasePart') then
+						hrp.CFrame = pin
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						hrp.AssemblyAngularVelocity = Vector3.zero
+						-- Soft Anchor only — hard Anchored from reload gap tanks nothing useful and fights soft-lock.
+						hrp.Anchored = false
 					end
-					getgenv().SB2CombatAnchorOn = false
-					applyCombatAnchor(false)
-					return
-				end
-				if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
-					getgenv().SB2CombatAnchorOn = false
-					local conn = getgenv().SB2CombatAnchorConn
-					if conn then
-						pcall(function()
-							conn:Disconnect()
-						end)
-						getgenv().SB2CombatAnchorConn = nil
+				end)
+				if wantAnchor then
+					if type(pinTeleportCFrame) == 'function' then
+						pcall(pinTeleportCFrame, pin, 0.75)
 					end
-					applyCombatAnchor(false)
-					pcall(function()
-						local t = Toggles.CombatAnchor
-						if type(t) == 'table' and type(t.SetValue) == 'function' and t.Value == true then
-							t:SetValue(false)
+					if Toggles.CombatAnchor and type(Toggles.CombatAnchor.SetValue) == 'function' then
+						pcall(function()
+							Toggles.CombatAnchor:SetValue(true)
+						end)
+					end
+				else
+					-- Landing / walk: release HRP after a short settle.
+					task.delay(0.35, function()
+						if getgenv().SB2CombatAnchorOn == true then
+							return
 						end
+						pcall(function()
+							local model = getMyCharacterModel() or LocalPlayer.Character
+							local hrp = model and model:FindFirstChild('HumanoidRootPart')
+							if hrp and hrp:IsA('BasePart') then
+								hrp.Anchored = false
+							end
+						end)
 					end)
-					return
 				end
-				local nowA = os.clock()
-				if nowA - (getgenv().SB2CombatAnchorTick or 0) < 0.1 then
-					return
+			end
+			-- Teardown clears AA/skill; put them back if they were on.
+			task.defer(function()
+				if wantAA and Toggles.AutoAttack and type(Toggles.AutoAttack.SetValue) == 'function' then
+					pcall(function()
+						Toggles.AutoAttack:SetValue(true)
+					end)
 				end
-				getgenv().SB2CombatAnchorTick = nowA
-				applyCombatAnchor(true)
+				if wantSkill and Toggles.AutoSkill and type(Toggles.AutoSkill.SetValue) == 'function' then
+					pcall(function()
+						Toggles.AutoSkill:SetValue(true)
+					end)
+				end
 			end)
+			getgenv().SB2SoftReloadPreserveFlight = nil
+			getgenv().SB2SoftReloadPinCF = nil
+			getgenv().SB2SoftReloadHadAnchor = nil
+			getgenv().SB2SoftReloadHadBoss = nil
+			getgenv().SB2SoftReloadWasAnchored = nil
+			getgenv().SB2SoftReloadHadAutoAttack = nil
+			getgenv().SB2SoftReloadHadAutoSkill = nil
 		end)
 
 		-- Event dive: Bluu XZ-follow on the mob's *real* CF, Y under the floor
@@ -12927,6 +14088,19 @@ local ok, err = pcall(function()
 			if type(gate) == 'table' and gate.block == true then
 				return false, 'tp blocked'
 			end
+			-- Never TP into the void — every alt ended up dealing 0 damage out of range.
+			if typeof(cf) == 'CFrame' and cf.Position.Y < -20 then
+				-- #region agent log
+				if type(getgenv().SB2DbgFling) == 'function' then
+					pcall(getgenv().SB2DbgFling, 'A', 'applyCharacterCFrame', 'tp_void_reject', {
+						y = cf.Position.Y,
+						x = cf.Position.X,
+						z = cf.Position.Z,
+					})
+				end
+				-- #endregion
+				return false, 'void destination'
+			end
 			-- Zombie boss-route loops ignore the new toggle. Never CFrame onto boss pads
 			-- unless the route is actually wanted (or Resume is using that pad).
 			if getgenv().SB2BossRouteWanted ~= true and not isToggleOn('SoloCombatResume') then
@@ -12938,7 +14112,8 @@ local ok, err = pcall(function()
 					return false, 'boss route off'
 				end
 			end
-			holdCombatAnchor(0.5)
+			-- Never open an unanchor window here — gravity + unstreamed floor = into the ground.
+			getgenv().SB2AnchorHoldUntil = 0
 			local model = getMyCharacterModel() or LocalPlayer.Character
 			if not model then
 				return false, 'no character'
@@ -12949,38 +14124,47 @@ local ok, err = pcall(function()
 			end
 			pcall(function()
 				hrp.Anchored = false
-			end)
-			for _ = 1, 5 do
-				RunService.Heartbeat:Wait()
-				pcall(function()
-					hrp.Anchored = false
-				end)
-			end
-			pcall(function()
 				if model.PivotTo then
 					model:PivotTo(cf)
+				else
+					hrp.CFrame = cf
 				end
-				hrp.Anchored = false
-				hrp.CFrame = cf
 				hrp.AssemblyLinearVelocity = Vector3.zero
 				hrp.AssemblyAngularVelocity = Vector3.zero
+				-- Stay unanchored — pinTeleportCFrame soft-holds so server gets the TP.
+				if type(getgenv().SB2SetAnchorLockCF) == 'function' then
+					getgenv().SB2SetAnchorLockCF(cf)
+				else
+					getgenv().SB2AnchorLockCF = cf
+				end
 			end)
-			for _ = 1, 10 do
+			-- Hold destination for ~1s so Combat Anchor / Heartbeat cannot lag behind gravity.
+			if type(pinTeleportCFrame) == 'function' then
+				pinTeleportCFrame(cf, 1.0)
+			elseif type(getgenv().SB2PinTeleportCFrame) == 'function' then
+				getgenv().SB2PinTeleportCFrame(cf, 1.0)
+			end
+			for _ = 1, 8 do
 				RunService.Heartbeat:Wait()
 				pcall(function()
 					hrp.Anchored = false
-					if (hrp.Position - cf.Position).Magnitude > 8 then
-						hrp.CFrame = cf
+					if (hrp.Position - cf.Position).Magnitude > 4 then
+						if model.PivotTo then
+							model:PivotTo(cf)
+						else
+							hrp.CFrame = cf
+						end
 					end
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
 				end)
 				if (hrp.Position - cf.Position).Magnitude <= 8 then
 					break
 				end
 			end
-			holdCombatAnchor(0.5)
 			lockReplicationFocus(model)
 			pcall(function()
-				LocalPlayer:RequestStreamAroundAsync(cf.Position, 40)
+				LocalPlayer:RequestStreamAroundAsync(cf.Position, 48)
 			end)
 			if type(getgenv().SB2FixCamera) == 'function' then
 				pcall(getgenv().SB2FixCamera, model)
@@ -13045,15 +14229,13 @@ local ok, err = pcall(function()
 					hive.stopMovement()
 				end
 			end)
-			-- 0.5s hold after TP — Anchor stays off until this expires.
-			holdCombatAnchor(0.5)
 			task.wait(0.05)
 			-- Re-check: Players list can be empty for a frame during load/hop.
 			if not allowBusyTp and serverHasStrangers() then
 				return
 			end
 			local okTp, errTp = teleportSoloWaypoint()
-			holdCombatAnchor(0.5)
+			-- applyCharacterCFrame already pins + anchors; do not holdCombatAnchor (unanchors).
 			setCombatTrio(true)
 			pcall(function()
 				if okTp then
@@ -13920,16 +15102,29 @@ local ok, err = pcall(function()
 				local found = {}
 				local names = listSoloWaypoints()
 				for _, wpName in ipairs(names) do
-					if wpName ~= WP_NONE and findSoloWaypointRec(wpName) then
-						for _, def in ipairs(BOSS_ROUTE_DEFS) do
-							if wpKeyHit(wpName, def.keys) and not found[def.order] then
-								found[def.order] = {
-									order = def.order,
-									wpName = wpName,
-									hints = def.hints,
-								}
-								break
+					if wpName ~= WP_NONE then
+						local rec = findSoloWaypointRec(wpName)
+						-- Skip under-map WPs (e.g. limor saved at Y=-337) — they zero damage.
+						if rec and (tonumber(rec.y) or 0) >= -20 then
+							for _, def in ipairs(BOSS_ROUTE_DEFS) do
+								if wpKeyHit(wpName, def.keys) and not found[def.order] then
+									found[def.order] = {
+										order = def.order,
+										wpName = wpName,
+										hints = def.hints,
+									}
+									break
+								end
 							end
+						elseif rec and (tonumber(rec.y) or 0) < -20 then
+							-- #region agent log
+							if type(getgenv().SB2DbgFling) == 'function' then
+								pcall(getgenv().SB2DbgFling, 'A', 'collectBossRouteStops', 'boss_wp_void_skip', {
+									name = wpName,
+									y = tonumber(rec.y),
+								})
+							end
+							-- #endregion
 						end
 					end
 				end
@@ -13989,6 +15184,18 @@ local ok, err = pcall(function()
 				if not wp then
 					return false, 'missing waypoint'
 				end
+				local wy = tonumber(wp.y) or 0
+				if wy < -20 then
+					-- #region agent log
+					if type(getgenv().SB2DbgFling) == 'function' then
+						pcall(getgenv().SB2DbgFling, 'A', 'teleportBossRouteWp', 'boss_tp_void_wp', {
+							name = wpName,
+							y = wy,
+						})
+					end
+					-- #endregion
+					return false, 'void waypoint — re-save ' .. tostring(wpName)
+				end
 				local setter = getgenv().SB2WaypointsSetSelected
 				if type(setter) == 'function' then
 					pcall(setter, wpName, true)
@@ -13998,7 +15205,7 @@ local ok, err = pcall(function()
 						Options.SoloResumeWaypoint:SetValue(wpName)
 					end)
 				end
-				local cf = CFrame.new(tonumber(wp.x) or 0, tonumber(wp.y) or 0, tonumber(wp.z) or 0)
+				local cf = CFrame.new(tonumber(wp.x) or 0, wy, tonumber(wp.z) or 0)
 				return applyCharacterCFrame(cf)
 			end
 
@@ -14152,8 +15359,8 @@ local ok, err = pcall(function()
 								task.wait(1)
 								continue
 							end
+							-- Pin already running from applyCharacterCFrame; trio turns Anchor on without unanchor hold.
 							setCombatTrio(true)
-							holdCombatAnchor(0.4)
 
 							-- Wait until this boss is alive (spawn / already up).
 							paintBossRoute(('Boss route [%d/%d] waiting %s…'):format(i, #stops, stop.wpName))
@@ -15209,6 +16416,2269 @@ local ok, err = pcall(function()
 					Library:Notify('Inventory list rebuilt', 3)
 				else
 					Library:Notify('Open your inventory once, then try again', 5)
+				end
+			end)
+		end
+
+		-- Weapon visual modifier (held CharacterItems tools — client view only).
+		local WeaponModBox = InvTab:AddRightGroupbox('Weapon modifier')
+		assert(WeaponModBox, 'Weapon modifier groupbox nil')
+		do
+			local HttpService = game:GetService('HttpService')
+			local RunService = game:GetService('RunService')
+			local ReplicatedStorage = game:GetService('ReplicatedStorage')
+			local PhysicsService = game:GetService('PhysicsService')
+			local function flattenOpt(value)
+				local fn = getgenv().SB2FlattenOptionValue
+				if type(fn) == 'function' then
+					local ok, out = pcall(fn, value)
+					if ok and out ~= nil then
+						return out
+					end
+				end
+				if type(value) == 'string' then
+					return value
+				end
+				if type(value) == 'table' then
+					if type(value[1]) == 'string' then
+						return value[1]
+					end
+					for k, on in pairs(value) do
+						if on == true and type(k) == 'string' then
+							return k
+						end
+					end
+				end
+				return tostring(value or '')
+			end
+			local WEAPON_MOD_ATTR = '_SB2WeaponModVis'
+			local WEAPON_MOD_ORIG = '_SB2WeaponModOrig'
+
+			if type(getgenv().SB2WeaponModCleanup) == 'function' then
+				pcall(getgenv().SB2WeaponModCleanup)
+			end
+			-- Drop older live Sakura overlay hook if still attached.
+			pcall(function()
+				local c = getgenv()._SB2VisualSwordConn
+				if c then
+					c:Disconnect()
+				end
+				getgenv()._SB2VisualSwordConn = nil
+			end)
+
+			local lookCache = getgenv().SB2WeaponLookCache
+			if type(lookCache) ~= 'table' then
+				lookCache = {}
+				getgenv().SB2WeaponLookCache = lookCache
+			end
+			-- Keep any prior Sakura clone as a named look.
+			if getgenv()._SB2SakuraToolClone and typeof(getgenv()._SB2SakuraToolClone) == 'Instance' then
+				lookCache['Sakura Dreams'] = getgenv()._SB2SakuraToolClone
+			end
+
+			local defaults = {
+				Enabled = false,
+				Target = 'Right',
+				Mode = 'Edit current',
+				Look = '(none)',
+				Anchor = 'Auto',
+				ColorOn = false,
+				ColorR = 255,
+				ColorG = 255,
+				ColorB = 255,
+				Scale = 1,
+				ScaleX = 1,
+				ScaleY = 1,
+				ScaleZ = 1,
+				RotX = 0,
+				RotY = 0,
+				RotZ = 0,
+				OffX = 0,
+				OffY = 0,
+				OffZ = 0,
+				Transparency = 0,
+				AnimEnabled = false,
+				AnimPack = '(default)',
+			}
+			local state = getgenv().SB2WeaponModState
+			if type(state) ~= 'table' then
+				state = {}
+				getgenv().SB2WeaponModState = state
+			end
+			for k, v in pairs(defaults) do
+				if state[k] == nil then
+					state[k] = v
+				end
+			end
+
+			local function readPrefsFile()
+				if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+					return nil
+				end
+				local ok, exists = pcall(isfile, WEAPON_MOD_PATH)
+				if not ok or not exists then
+					return nil
+				end
+				local okRead, body = pcall(readfile, WEAPON_MOD_PATH)
+				if not okRead or type(body) ~= 'string' or body == '' then
+					return nil
+				end
+				local okDecode, decoded = pcall(function()
+					return HttpService:JSONDecode(body)
+				end)
+				if okDecode and type(decoded) == 'table' then
+					return decoded
+				end
+				return nil
+			end
+
+			local function persistPrefs()
+				if type(writefile) ~= 'function' then
+					return
+				end
+				local payload = {}
+				for k in pairs(defaults) do
+					payload[k] = state[k]
+				end
+				pcall(function()
+					if type(makefolder) == 'function' and type(isfolder) == 'function' then
+						if not isfolder(CONFIG.ConfigFolder) then
+							makefolder(CONFIG.ConfigFolder)
+						end
+					end
+					writefile(WEAPON_MOD_PATH, HttpService:JSONEncode(payload))
+				end)
+			end
+
+			do
+				local saved = readPrefsFile()
+				if type(saved) == 'table' then
+					for k, v in pairs(saved) do
+						if defaults[k] ~= nil then
+							state[k] = v
+						end
+					end
+				end
+				-- Boot kill sets this so reload never auto-spawns a ghost (ragdoll risk).
+				if state._AnimSkipAutoApply == true then
+					state.AnimEnabled = false
+				end
+			end
+
+			local function localUid()
+				local lp = Players.LocalPlayer
+				return lp and tostring(lp.UserId) or nil
+			end
+
+			local function getWeaponFolder(hand)
+				local uid = localUid()
+				local root = workspace:FindFirstChild('CharacterItems')
+				root = root and uid and root:FindFirstChild(uid)
+				if not root then
+					return nil
+				end
+				if hand == 'Left' then
+					return root:FindFirstChild('LeftWeapon')
+				end
+				return root:FindFirstChild('RightWeapon')
+			end
+
+			local function targetHands()
+				local t = state.Target
+				if t == 'Left' then
+					return { 'Left' }
+				end
+				if t == 'Both' then
+					return { 'Right', 'Left' }
+				end
+				return { 'Right' }
+			end
+
+			local function isOverlayJunk(inst)
+				if not inst then
+					return true
+				end
+				if inst:GetAttribute(WEAPON_MOD_ATTR) or inst:GetAttribute('_SB2SakuraVis') then
+					return true
+				end
+				local n = tostring(inst.Name)
+				if string.find(n, 'WeaponMod_', 1, true) or string.find(n, 'SakuraVis', 1, true) then
+					return true
+				end
+				return false
+			end
+
+			local function clearOverlay(tool)
+				if not tool then
+					return
+				end
+				for _, c in ipairs(tool:GetChildren()) do
+					if isOverlayJunk(c) then
+						c:Destroy()
+					end
+				end
+			end
+
+			local function sanitizeLookTool(lookTool)
+				if typeof(lookTool) ~= 'Instance' then
+					return lookTool
+				end
+				for _, c in ipairs(lookTool:GetChildren()) do
+					if isOverlayJunk(c) then
+						c:Destroy()
+					end
+				end
+				for _, d in ipairs(lookTool:GetDescendants()) do
+					if d:IsA('BasePart') then
+						d:SetAttribute(WEAPON_MOD_ATTR, nil)
+						d:SetAttribute('_SB2SakuraVis', nil)
+						d:SetAttribute(WEAPON_MOD_ORIG, nil)
+						if d.Transparency >= 1 then
+							d.Transparency = 0
+						end
+						d.LocalTransparencyModifier = 0
+					end
+				end
+				return lookTool
+			end
+
+			-- Scrub polluted captures (overlay-of-overlay clones).
+			for name, look in pairs(lookCache) do
+				if typeof(look) == 'Instance' then
+					sanitizeLookTool(look)
+				elseif look == nil then
+					lookCache[name] = nil
+				end
+			end
+			getgenv().SB2WeaponLookCache = lookCache
+
+			local function syncStateFromUi()
+				local T = Toggles
+				local O = Options
+				if type(T) == 'table' and type(T.WeaponModEnabled) == 'table' then
+					state.Enabled = T.WeaponModEnabled.Value == true
+				end
+				if type(T) == 'table' and type(T.WeaponModColorOn) == 'table' then
+					state.ColorOn = T.WeaponModColorOn.Value == true
+				end
+				local function opt(name)
+					return type(O) == 'table' and O[name] or nil
+				end
+				local function setStr(key, optName, fallback)
+					local o = opt(optName)
+					if not o then
+						return
+					end
+					local v = flattenOpt(o.Value)
+					if type(v) == 'string' and v ~= '' then
+						state[key] = v
+					elseif fallback then
+						state[key] = fallback
+					end
+				end
+				local function setNum(key, optName)
+					local o = opt(optName)
+					if not o then
+						return
+					end
+					local n = tonumber(o.Value)
+					if n ~= nil then
+						state[key] = n
+					end
+				end
+				setStr('Target', 'WeaponModTarget', 'Right')
+				setStr('Mode', 'WeaponModMode', 'Edit current')
+				setStr('Look', 'WeaponModLook', '(none)')
+				setStr('Anchor', 'WeaponModAnchor', 'Auto')
+				setNum('ColorR', 'WeaponModColorR')
+				setNum('ColorG', 'WeaponModColorG')
+				setNum('ColorB', 'WeaponModColorB')
+				setNum('Scale', 'WeaponModScale')
+				setNum('ScaleX', 'WeaponModScaleX')
+				setNum('ScaleY', 'WeaponModScaleY')
+				setNum('ScaleZ', 'WeaponModScaleZ')
+				setNum('RotX', 'WeaponModRotX')
+				setNum('RotY', 'WeaponModRotY')
+				setNum('RotZ', 'WeaponModRotZ')
+				setNum('OffX', 'WeaponModOffX')
+				setNum('OffY', 'WeaponModOffY')
+				setNum('OffZ', 'WeaponModOffZ')
+				setNum('Transparency', 'WeaponModTransparency')
+			end
+
+			local function rememberOrig(part)
+				if part:GetAttribute(WEAPON_MOD_ORIG) then
+					return
+				end
+				local ok, payload = pcall(function()
+					return HttpService:JSONEncode({
+						Size = { part.Size.X, part.Size.Y, part.Size.Z },
+						Color = { part.Color.R, part.Color.G, part.Color.B },
+						Transparency = part.Transparency,
+						LocalTransparencyModifier = part.LocalTransparencyModifier,
+					})
+				end)
+				if ok and type(payload) == 'string' then
+					part:SetAttribute(WEAPON_MOD_ORIG, payload)
+				end
+			end
+
+			local function restoreOrig(part)
+				local raw = part:GetAttribute(WEAPON_MOD_ORIG)
+				if type(raw) ~= 'string' then
+					return
+				end
+				local ok, data = pcall(function()
+					return HttpService:JSONDecode(raw)
+				end)
+				if not ok or type(data) ~= 'table' then
+					return
+				end
+				if type(data.Size) == 'table' and #data.Size >= 3 then
+					part.Size = Vector3.new(data.Size[1], data.Size[2], data.Size[3])
+				end
+				if type(data.Color) == 'table' and #data.Color >= 3 then
+					part.Color = Color3.new(data.Color[1], data.Color[2], data.Color[3])
+				end
+				if type(data.Transparency) == 'number' then
+					part.Transparency = data.Transparency
+				end
+				if type(data.LocalTransparencyModifier) == 'number' then
+					part.LocalTransparencyModifier = data.LocalTransparencyModifier
+				end
+				part:SetAttribute(WEAPON_MOD_ORIG, nil)
+			end
+
+			local function restoreWelds(tool)
+				local map = getgenv().SB2WeaponModWeldBase
+				if type(map) ~= 'table' or not tool then
+					return
+				end
+				for _, d in ipairs(tool:GetDescendants()) do
+					if not d:IsA('BasePart') then
+						continue
+					end
+					for _, w in ipairs(d:GetChildren()) do
+						if w:IsA('Weld') and typeof(map[w]) == 'CFrame' then
+							w.C0 = map[w]
+							map[w] = nil
+							w:SetAttribute('_SB2ModBaseC0', nil)
+							w:SetAttribute('_SB2ModHasBase', nil)
+						end
+					end
+				end
+			end
+
+			local function restoreWeapon(folder)
+				if not folder then
+					return
+				end
+				local tool = folder:FindFirstChild('Tool')
+				if not tool then
+					return
+				end
+				-- Restore Size/Color from ORIG *before* clearing attrs. Clearing first
+				-- left scaled meshes stuck (ground-beam / flat sword).
+				for _, d in ipairs(tool:GetDescendants()) do
+					if d:IsA('BasePart') then
+						restoreOrig(d)
+					end
+				end
+				restoreWelds(tool)
+				clearOverlay(tool)
+				for _, d in ipairs(tool:GetDescendants()) do
+					if d:IsA('BasePart') then
+						d:SetAttribute(WEAPON_MOD_ORIG, nil)
+						d:SetAttribute(WEAPON_MOD_ATTR, nil)
+						d:SetAttribute('_SB2SakuraVis', nil)
+						if not isOverlayJunk(d) then
+							d.LocalTransparencyModifier = 0
+						end
+					end
+				end
+			end
+
+			local function resetWeaponModSliders()
+				state.Scale = 1
+				state.ScaleX = 1
+				state.ScaleY = 1
+				state.ScaleZ = 1
+				state.RotX = 0
+				state.RotY = 0
+				state.RotZ = 0
+				state.OffX = 0
+				state.OffY = 0
+				state.OffZ = 0
+				state.Transparency = 0
+				state.ColorOn = false
+				state.Mode = 'Edit current'
+				local function setOpt(name, value)
+					local o = Options[name]
+					if type(o) == 'table' and type(o.SetValue) == 'function' then
+						pcall(function()
+							o:SetValue(value)
+						end)
+					end
+				end
+				setOpt('WeaponModScale', 1)
+				setOpt('WeaponModScaleX', 1)
+				setOpt('WeaponModScaleY', 1)
+				setOpt('WeaponModScaleZ', 1)
+				setOpt('WeaponModRotX', 0)
+				setOpt('WeaponModRotY', 0)
+				setOpt('WeaponModRotZ', 0)
+				setOpt('WeaponModOffX', 0)
+				setOpt('WeaponModOffY', 0)
+				setOpt('WeaponModOffZ', 0)
+				setOpt('WeaponModTransparency', 0)
+				setOpt('WeaponModMode', 'Edit current')
+				pcall(function()
+					if Toggles.WeaponModColorOn and type(Toggles.WeaponModColorOn.SetValue) == 'function' then
+						Toggles.WeaponModColorOn:SetValue(false)
+					end
+				end)
+			end
+
+			local function hardResetHeldVisuals()
+				-- Stop heartbeat/queue from painting slider values back on.
+				state.SuppressUntil = os.clock() + 12
+				state.Enabled = false
+				pcall(function()
+					if Toggles.WeaponModEnabled and type(Toggles.WeaponModEnabled.SetValue) == 'function' then
+						Toggles.WeaponModEnabled:SetValue(false)
+					end
+				end)
+				resetWeaponModSliders()
+				getgenv()._SB2SakuraVisualWanted = false
+				pcall(function()
+					local c = getgenv()._SB2VisualSwordConn
+					if c then
+						c:Disconnect()
+					end
+					getgenv()._SB2VisualSwordConn = nil
+				end)
+				persistPrefs()
+
+				-- NEVER Destroy(Tool). Server will not recreate it while still
+				-- "equipped" — that left Handle-only grips and ground-beam meshes.
+				for _, hand in ipairs({ 'Right', 'Left' }) do
+					local folder = getWeaponFolder(hand)
+					if not folder then
+						continue
+					end
+					for _, ch in ipairs(folder:GetChildren()) do
+						if isOverlayJunk(ch) then
+							pcall(function()
+								ch:Destroy()
+							end)
+						end
+					end
+					restoreWeapon(folder)
+				end
+				-- Welds already restored; drop the base map so a later enable
+				-- re-captures clean C0 values.
+				getgenv().SB2WeaponModWeldBase = {}
+				Library:Notify('Held visuals reset (modifier off, sizes/welds restored — no Tool destroy)', 6)
+			end
+
+			local function weldC1Of(part)
+				for _, d in ipairs(part:GetChildren()) do
+					if d:IsA('Weld') then
+						return d.C1
+					end
+				end
+				return nil
+			end
+
+			local function handleSpaceCF(part)
+				local c1 = weldC1Of(part)
+				if not c1 then
+					return CFrame.new()
+				end
+				return c1:Inverse()
+			end
+
+			local function pickAnchor(tool, handle)
+				local mode = state.Anchor
+				if mode == 'Handle' and handle then
+					return handle
+				end
+				if mode == 'Blade' then
+					local b = tool:FindFirstChild('Blade')
+					if b and b:IsA('BasePart') then
+						return b
+					end
+				end
+				if mode == 'Plane' then
+					for _, n in ipairs({ 'Plane.001', 'Plane', 'Mesh' }) do
+						local p = tool:FindFirstChild(n)
+						if p and p:IsA('BasePart') then
+							return p
+						end
+					end
+				end
+				-- Auto: prefer Blade (hitbox), else first MeshPart, else Handle.
+				local blade = tool:FindFirstChild('Blade')
+				if blade and blade:IsA('BasePart') then
+					return blade
+				end
+				for _, d in ipairs(tool:GetDescendants()) do
+					if d:IsA('MeshPart') then
+						return d
+					end
+				end
+				return handle
+			end
+
+			local function transformCF()
+				local rx = math.rad(tonumber(state.RotX) or 0)
+				local ry = math.rad(tonumber(state.RotY) or 0)
+				local rz = math.rad(tonumber(state.RotZ) or 0)
+				local ox = tonumber(state.OffX) or 0
+				local oy = tonumber(state.OffY) or 0
+				local oz = tonumber(state.OffZ) or 0
+				return CFrame.new(ox, oy, oz) * CFrame.Angles(rx, ry, rz)
+			end
+
+			local function scaleVec()
+				local u = tonumber(state.Scale) or 1
+				return Vector3.new(
+					u * (tonumber(state.ScaleX) or 1),
+					u * (tonumber(state.ScaleY) or 1),
+					u * (tonumber(state.ScaleZ) or 1)
+				)
+			end
+
+			local function tintColor()
+				return Color3.fromRGB(
+					math.clamp(math.floor(tonumber(state.ColorR) or 255), 0, 255),
+					math.clamp(math.floor(tonumber(state.ColorG) or 255), 0, 255),
+					math.clamp(math.floor(tonumber(state.ColorB) or 255), 0, 255)
+				)
+			end
+
+			local function applyEditCurrent(tool)
+				local sc = scaleVec()
+				local tint = tintColor()
+				local tf = transformCF()
+				local tr = tonumber(state.Transparency) or 0
+				for _, d in ipairs(tool:GetDescendants()) do
+					if d:IsA('BasePart') and not d:GetAttribute(WEAPON_MOD_ATTR) then
+						rememberOrig(d)
+						local orig = d:GetAttribute(WEAPON_MOD_ORIG)
+						local baseSize = d.Size
+						if type(orig) == 'string' then
+							local ok, data = pcall(function()
+								return HttpService:JSONDecode(orig)
+							end)
+							if ok and type(data) == 'table' and type(data.Size) == 'table' then
+								baseSize = Vector3.new(data.Size[1], data.Size[2], data.Size[3])
+							end
+						end
+						d.Size = Vector3.new(baseSize.X * sc.X, baseSize.Y * sc.Y, baseSize.Z * sc.Z)
+						if state.ColorOn == true then
+							d.Color = tint
+						end
+						d.Transparency = math.clamp(tr, 0, 1)
+						d.LocalTransparencyModifier = 0
+						-- Nudge weld C0 on parts welded to Handle for rot/offset.
+						for _, w in ipairs(d:GetChildren()) do
+							if w:IsA('Weld') and w.Part0 and w.Part0.Name == 'Handle' then
+								if not w:GetAttribute('_SB2ModBaseC0') then
+									w:SetAttribute('_SB2ModBaseC0', tostring(w.C0))
+									w:SetAttribute('_SB2ModHasBase', true)
+									-- store via genv map (attributes can't hold CFrame)
+									local map = getgenv().SB2WeaponModWeldBase
+									if type(map) ~= 'table' then
+										map = {}
+										getgenv().SB2WeaponModWeldBase = map
+									end
+									map[w] = w.C0
+								end
+								local map = getgenv().SB2WeaponModWeldBase
+								local base = map and map[w]
+								if typeof(base) == 'CFrame' then
+									w.C0 = base * tf
+								end
+							end
+						end
+					end
+				end
+			end
+
+			local function axisAlignFor(anchor, lookBlade)
+				-- Map look blade long-axis onto anchor long-axis.
+				if not anchor or not lookBlade then
+					return CFrame.new()
+				end
+				local function longAxis(size)
+					if size.X >= size.Y and size.X >= size.Z then
+						return Vector3.new(1, 0, 0)
+					end
+					if size.Y >= size.X and size.Y >= size.Z then
+						return Vector3.new(0, 1, 0)
+					end
+					return Vector3.new(0, 0, 1)
+				end
+				local from = longAxis(lookBlade.Size)
+				local to = longAxis(anchor.Size)
+				if from:Dot(to) > 0.99 then
+					return CFrame.new()
+				end
+				-- Common katana(+Z) → primordial Blade(+X)
+				if math.abs(from.Z) > 0.9 and math.abs(to.X) > 0.9 then
+					return CFrame.Angles(0, math.pi / 2, 0)
+				end
+				-- Common katana(+Z) → Plane(+Y)
+				if math.abs(from.Z) > 0.9 and math.abs(to.Y) > 0.9 then
+					return CFrame.Angles(math.pi / 2, 0, 0)
+				end
+				-- Mesh along +X onto Plane +Y
+				if math.abs(from.X) > 0.9 and math.abs(to.Y) > 0.9 then
+					return CFrame.Angles(0, 0, -math.pi / 2)
+				end
+				return CFrame.new()
+			end
+
+			local function applyOverlay(tool, handle, lookTool)
+				clearOverlay(tool)
+				lookTool = sanitizeLookTool(lookTool)
+				if typeof(lookTool) ~= 'Instance' then
+					return
+				end
+				local anchor = pickAnchor(tool, handle)
+				if not anchor then
+					return
+				end
+				-- Hide native meshes (keep hitbox parts present).
+				for _, d in ipairs(tool:GetDescendants()) do
+					if d:IsA('BasePart') and not isOverlayJunk(d) then
+						rememberOrig(d)
+						d.Transparency = 1
+						d.LocalTransparencyModifier = 1
+					elseif (d:IsA('Decal') or d:IsA('Texture')) and not (d.Parent and isOverlayJunk(d.Parent)) then
+						pcall(function()
+							d.Transparency = 1
+						end)
+					end
+				end
+
+				local lookBlade = lookTool:FindFirstChild('Blade')
+				local align = axisAlignFor(anchor, lookBlade)
+				local lookRootCF = lookBlade and handleSpaceCF(lookBlade) or CFrame.new()
+				local sc = scaleVec()
+				local tint = tintColor()
+				local tf = transformCF()
+				local tr = tonumber(state.Transparency) or 0
+
+				for _, src in ipairs(lookTool:GetChildren()) do
+					if not src:IsA('BasePart') or isOverlayJunk(src) then
+						continue
+					end
+					if src.Name == 'Blade' then
+						continue
+					end
+					local part = src:Clone()
+					for _, d in ipairs(part:GetDescendants()) do
+						if d:IsA('Weld') or d:IsA('Motor6D') or d:IsA('WeldConstraint') then
+							d:Destroy()
+						end
+					end
+					part:SetAttribute(WEAPON_MOD_ATTR, true)
+					part:SetAttribute(WEAPON_MOD_ORIG, nil)
+					part.Name = 'WeaponMod_' .. src.Name:gsub('[^%w]', '_')
+					part.Anchored = false
+					part.CanCollide = false
+					part.CanTouch = false
+					part.CanQuery = false
+					part.Massless = true
+					local base = src.Size
+					part.Size = Vector3.new(base.X * sc.X, base.Y * sc.Y, base.Z * sc.Z)
+					if state.ColorOn == true then
+						part.Color = tint
+					end
+					part.Transparency = math.clamp(tr, 0, 1)
+					part.LocalTransparencyModifier = 0
+					part.Parent = tool
+
+					local rel = lookRootCF:ToObjectSpace(handleSpaceCF(src))
+					local w = Instance.new('Weld')
+					w.Name = 'WeaponModWeld'
+					w.Part0 = anchor
+					w.Part1 = part
+					w.C0 = tf * align * rel
+					w.C1 = CFrame.new()
+					w.Parent = part
+				end
+			end
+
+			local function applyToFolder(folder)
+				if not folder then
+					return false
+				end
+				local tool = folder:FindFirstChild('Tool')
+				local handle = folder:FindFirstChild('Handle')
+				if not tool then
+					return false
+				end
+				if state.Mode == 'Overlay look' then
+					local lookName = state.Look
+					if type(lookName) ~= 'string' or lookName == '' or lookName == '(none)' then
+						return false
+					end
+					local look = lookCache[lookName]
+					if typeof(look) ~= 'Instance' then
+						return false
+					end
+					sanitizeLookTool(look)
+					applyOverlay(tool, handle, look)
+					return true
+				end
+				-- Edit current
+				clearOverlay(tool)
+				applyEditCurrent(tool)
+				return true
+			end
+
+			local function applyAll()
+				syncStateFromUi()
+				if (tonumber(state.SuppressUntil) or 0) > os.clock() then
+					return
+				end
+				persistPrefs()
+				if state.Enabled ~= true then
+					for _, hand in ipairs({ 'Right', 'Left' }) do
+						restoreWeapon(getWeaponFolder(hand))
+					end
+					return
+				end
+				for _, hand in ipairs(targetHands()) do
+					applyToFolder(getWeaponFolder(hand))
+				end
+			end
+
+			local function captureEquippedLook()
+				local folder = getWeaponFolder('Right') or getWeaponFolder('Left')
+				if not folder or not folder:FindFirstChild('Tool') then
+					Library:Notify('No held weapon to capture', 4)
+					return nil
+				end
+				-- Capture clean native meshes only (never overlay stacks).
+				restoreWeapon(folder)
+				local inv = folder:FindFirstChild('InventoryID')
+				local id = inv and inv.Value
+				local name = 'Captured'
+				local profile = getLiveProfile and getLiveProfile() or nil
+				if not profile then
+					local lp = Players.LocalPlayer
+					profile = lp and ReplicatedStorage:FindFirstChild('Profiles') and ReplicatedStorage.Profiles:FindFirstChild(lp.Name)
+				end
+				if profile and id then
+					local invFolder = profile:FindFirstChild('Inventory')
+					if invFolder then
+						for _, it in ipairs(invFolder:GetChildren()) do
+							if it:IsA('IntValue') and it.Value == id then
+								name = it.Name
+								break
+							end
+						end
+					end
+				end
+				local clone = folder.Tool:Clone()
+				clone.Name = 'WeaponLook_' .. name
+				for _, d in ipairs(clone:GetDescendants()) do
+					if d:IsA('Script') or d:IsA('LocalScript') then
+						d:Destroy()
+					end
+				end
+				sanitizeLookTool(clone)
+				lookCache[name] = clone
+				if name == 'Sakura Dreams' then
+					getgenv()._SB2SakuraToolClone = clone
+				end
+				getgenv().SB2WeaponLookCache = lookCache
+				-- Re-apply mods after capture restored the native look.
+				if state.Enabled == true then
+					task.defer(applyAll)
+				end
+				return name
+			end
+
+			local function lookDropdownValues()
+				local values = { '(none)' }
+				local names = {}
+				for n in pairs(lookCache) do
+					if type(n) == 'string' and n ~= '' then
+						names[#names + 1] = n
+					end
+				end
+				table.sort(names)
+				for _, n in ipairs(names) do
+					values[#values + 1] = n
+				end
+				return values
+			end
+
+			local function stateSig()
+				return table.concat({
+					tostring(state.Enabled),
+					tostring(state.Mode),
+					tostring(state.Look),
+					tostring(state.Anchor),
+					tostring(state.ColorOn),
+					tostring(state.ColorR),
+					tostring(state.ColorG),
+					tostring(state.ColorB),
+					tostring(state.Scale),
+					tostring(state.ScaleX),
+					tostring(state.ScaleY),
+					tostring(state.ScaleZ),
+					tostring(state.RotX),
+					tostring(state.RotY),
+					tostring(state.RotZ),
+					tostring(state.OffX),
+					tostring(state.OffY),
+					tostring(state.OffZ),
+					tostring(state.Transparency),
+					tostring(state.Target),
+				}, '|')
+			end
+
+			local applyQueued = false
+			local lastSigApplied = ''
+			local function queueApply()
+				persistPrefs()
+				if applyQueued then
+					return
+				end
+				applyQueued = true
+				task.defer(function()
+					applyQueued = false
+					applyAll()
+					lastSigApplied = stateSig()
+				end)
+			end
+
+			local conn = getgenv().SB2WeaponModConn
+			if conn then
+				pcall(function()
+					conn:Disconnect()
+				end)
+			end
+			local lastApply = 0
+			getgenv().SB2WeaponModConn = RunService.Heartbeat:Connect(function()
+				if (tonumber(state.SuppressUntil) or 0) > os.clock() then
+					return
+				end
+				syncStateFromUi()
+				if state.Enabled ~= true then
+					return
+				end
+				local gui = getgenv().SB2PlayerToolsGui
+				if not (gui and gui.Parent) then
+					return
+				end
+				local now = os.clock()
+				if now - lastApply < 0.2 then
+					return
+				end
+				lastApply = now
+				local sig = stateSig()
+				local need = sig ~= lastSigApplied
+				for _, hand in ipairs(targetHands()) do
+					local folder = getWeaponFolder(hand)
+					local tool = folder and folder:FindFirstChild('Tool')
+					if not tool then
+						continue
+					end
+					if state.Mode == 'Overlay look' then
+						local has = false
+						for _, c in ipairs(tool:GetChildren()) do
+							if c:GetAttribute(WEAPON_MOD_ATTR) then
+								has = true
+								break
+							end
+						end
+						if need or not has then
+							applyToFolder(folder)
+							lastSigApplied = sig
+						else
+							for _, d in ipairs(tool:GetDescendants()) do
+								if d:IsA('BasePart') and not d:GetAttribute(WEAPON_MOD_ATTR) then
+									if d.Transparency < 1 then
+										d.Transparency = 1
+									end
+								end
+							end
+						end
+					elseif need then
+						applyToFolder(folder)
+						lastSigApplied = sig
+					end
+				end
+			end)
+
+			getgenv().SB2WeaponModCleanup = function()
+				state.Enabled = false
+				state.AnimEnabled = false
+				local c = getgenv().SB2WeaponModConn
+				if c then
+					pcall(function()
+						c:Disconnect()
+					end)
+				end
+				getgenv().SB2WeaponModConn = nil
+				pcall(function()
+					local ac = getgenv()._SB2AnimCharConn
+					if ac then
+						ac:Disconnect()
+					end
+					getgenv()._SB2AnimCharConn = nil
+				end)
+				for _, hand in ipairs({ 'Right', 'Left' }) do
+					restoreWeapon(getWeaponFolder(hand))
+				end
+				if type(getgenv().SB2AnimSwapStop) == 'function' then
+					pcall(getgenv().SB2AnimSwapStop)
+				end
+			end
+			getgenv().SB2WeaponModApply = applyAll
+			getgenv().SB2WeaponModCapture = captureEquippedLook
+
+			----------------------------------------------------------------------
+			-- Client-only animation pack swapper (local ghost clone — others keep
+			-- seeing your real/server anims; no AnimSettings / shop remotes).
+			----------------------------------------------------------------------
+			do
+				local LOCO_SLOT = {
+					Idle = { 'idle' },
+					Running = { 'run', 'walk' },
+					Jump = { 'jump' },
+					Fall = { 'fall' },
+				}
+				-- Database.Animations junk that is NOT a usable style pack.
+				local ANIM_PACK_BLOCKLIST = {
+					dagger = true,
+					daggers = true,
+					misc = true,
+					swordshield = true,
+				}
+				-- Combat-only styles (no Animate.Packs loco) → use this loco fallback.
+				local COMBAT_STYLE_LOCO = {
+					TeaCup = 'Unarmed',
+				}
+
+				local function getLiveCharacter()
+					local lp = Players.LocalPlayer
+					if not lp then
+						return nil
+					end
+					local folder = workspace:FindFirstChild('Characters')
+					local named = folder and folder:FindFirstChild(lp.Name)
+					if named then
+						return named
+					end
+					return lp.Character
+				end
+
+				local function packHasLoco(folder)
+					if not folder then
+						return false
+					end
+					local idle = folder:FindFirstChild('Idle')
+					local run = folder:FindFirstChild('Running')
+					return idle
+						and idle:IsA('Animation')
+						and type(idle.AnimationId) == 'string'
+						and idle.AnimationId ~= ''
+						and run
+						and run:IsA('Animation')
+						and type(run.AnimationId) == 'string'
+						and run.AnimationId ~= ''
+				end
+
+				local function combatUsable(folder)
+					if not folder then
+						return false
+					end
+					local swing = folder:FindFirstChild('Swing1')
+					return swing
+						and swing:IsA('Animation')
+						and type(swing.AnimationId) == 'string'
+						and swing.AnimationId ~= ''
+				end
+
+				local function animPackNames()
+					local values = { '(default)' }
+					local seen = { ['(default)'] = true }
+					local function add(name)
+						if type(name) ~= 'string' or name == '' or seen[name] then
+							return
+						end
+						if ANIM_PACK_BLOCKLIST[string.lower(name)] then
+							return
+						end
+						seen[name] = true
+						values[#values + 1] = name
+					end
+					-- Animate.Packs with real Idle+Running.
+					local char = getLiveCharacter()
+					local packs = char and char:FindFirstChild('Animate')
+					packs = packs and packs:FindFirstChild('Packs')
+					if packs then
+						for _, p in ipairs(packs:GetChildren()) do
+							if packHasLoco(p) then
+								add(p.Name)
+							end
+						end
+					end
+					-- Combat-only styles (e.g. TeaCup) from Database.Animations.
+					local db = ReplicatedStorage:FindFirstChild('Database')
+					db = db and db:FindFirstChild('Animations')
+					if db then
+						for styleName in pairs(COMBAT_STYLE_LOCO) do
+							if combatUsable(db:FindFirstChild(styleName)) then
+								add(styleName)
+							end
+						end
+					end
+					table.sort(values, function(a, b)
+						if a == '(default)' then
+							return true
+						end
+						if b == '(default)' then
+							return false
+						end
+						return a:lower() < b:lower()
+					end)
+					return values
+				end
+
+				local function findPackFolder(packName)
+					if type(packName) ~= 'string' or packName == '' or packName == '(default)' then
+						return nil, nil
+					end
+					if ANIM_PACK_BLOCKLIST[string.lower(packName)] then
+						return nil, nil
+					end
+					local char = getLiveCharacter()
+					local packs = char
+						and char:FindFirstChild('Animate')
+						and char.Animate:FindFirstChild('Packs')
+					local locoName = COMBAT_STYLE_LOCO[packName] or packName
+					local loco = packs and packs:FindFirstChild(locoName)
+					if loco and not packHasLoco(loco) then
+						loco = nil
+					end
+					-- If combat style's preferred loco missing, try Unarmed then SingleSword.
+					if not loco and packs and COMBAT_STYLE_LOCO[packName] then
+						for _, alt in ipairs({ 'Unarmed', 'SingleSword', 'Katana' }) do
+							local f = packs:FindFirstChild(alt)
+							if packHasLoco(f) then
+								loco = f
+								break
+							end
+						end
+					end
+					local db = ReplicatedStorage:FindFirstChild('Database')
+					db = db and db:FindFirstChild('Animations')
+					local combat = db and db:FindFirstChild(packName)
+					if not combatUsable(combat) then
+						combat = nil
+					end
+					if not combat and db then
+						local fallbacks = {
+							SwissSabre = { 'Rapier' },
+							Rapier = { 'SwissSabre' },
+							Samurai = { 'Katana', 'Ninja' },
+							Ninja = { 'Ninja', 'Katana' },
+							Katana = { 'Katana', 'Ninja' },
+							Noble = { 'Noble', 'SingleSword' },
+							SingleSword = { 'SingleSword', 'Noble' },
+							Reaper = { 'Reaper', 'Scythe' },
+							Scythe = { 'Scythe', 'Reaper' },
+							Vigilante = { 'Vigilante', 'DualWield' },
+							DualWield = { 'DualWield', 'Vigilante' },
+							Swiftstrike = { 'Swiftstrike', 'Spear' },
+							Spear = { 'Spear', 'Swiftstrike' },
+							Berserker = { 'Berserker', '2HSword' },
+							['2HSword'] = { '2HSword', 'Berserker' },
+							TeaCup = { 'TeaCup' },
+						}
+						for _, alt in ipairs(fallbacks[packName] or { packName }) do
+							local f = db:FindFirstChild(alt)
+							if combatUsable(f) then
+								combat = f
+								break
+							end
+						end
+					end
+					return loco, combat
+				end
+
+				local function setLtmTree(root, value)
+					if not root then
+						return
+					end
+					for _, d in ipairs(root:GetDescendants()) do
+						if d:IsA('BasePart') then
+							d.LocalTransparencyModifier = value
+						end
+					end
+					if root:IsA('BasePart') then
+						root.LocalTransparencyModifier = value
+					end
+				end
+
+				local function clearGhost()
+					local g = getgenv()._SB2AnimGhost
+					if type(g) ~= 'table' then
+						getgenv()._SB2AnimGhost = nil
+						return
+					end
+					pcall(function()
+						if g.hb then
+							g.hb:Disconnect()
+						end
+					end)
+					pcall(function()
+						if g.played then
+							g.played:Disconnect()
+						end
+					end)
+					pcall(function()
+						if g.weaponFolder and g.weaponFolder.Parent then
+							g.weaponFolder:Destroy()
+						end
+					end)
+					pcall(function()
+						if g.clone and g.clone.Parent then
+							g.clone:Destroy()
+						end
+					end)
+					pcall(function()
+						if g.world and g.world.Parent then
+							g.world:Destroy()
+						end
+					end)
+					-- Restore local transparency on real body / weapons.
+					pcall(function()
+						setLtmTree(g.real, 0)
+					end)
+					local uid = localUid()
+					local items = workspace:FindFirstChild('CharacterItems')
+					items = items and uid and items:FindFirstChild(uid)
+					if items then
+						setLtmTree(items, 0)
+					end
+					getgenv()._SB2AnimGhost = nil
+				end
+
+				local function applyLocoToAnimate(animate, locoPack)
+					if not animate or not locoPack then
+						return
+					end
+					for srcName, slots in pairs(LOCO_SLOT) do
+						local src = locoPack:FindFirstChild(srcName)
+						if not (src and src:IsA('Animation') and src.AnimationId ~= '') then
+							continue
+						end
+						for _, slotName in ipairs(slots) do
+							local slot = animate:FindFirstChild(slotName)
+							if not slot then
+								continue
+							end
+							for _, child in ipairs(slot:GetChildren()) do
+								if child:IsA('Animation') then
+									child.AnimationId = src.AnimationId
+								end
+							end
+						end
+					end
+				end
+
+				local function buildCombatRemap(combatPack)
+					local map = {}
+					if not combatPack then
+						return map
+					end
+					local db = ReplicatedStorage:FindFirstChild('Database')
+					db = db and db:FindFirstChild('Animations')
+					if not db then
+						return map
+					end
+					local targets = {}
+					for _, a in ipairs(combatPack:GetChildren()) do
+						if a:IsA('Animation')
+							and type(a.AnimationId) == 'string'
+							and a.AnimationId ~= ''
+						then
+							targets[a.Name] = a.AnimationId
+						end
+					end
+					-- TeaCup (etc.) often only ships Swing1 — reuse it for Swing2/3/4.
+					local swingFallback = targets.Swing1
+						or targets.Swing2
+						or targets.Swing3
+						or targets.Swing4
+					if swingFallback then
+						for _, n in ipairs({ 'Swing1', 'Swing2', 'Swing3', 'Swing4' }) do
+							if not targets[n] then
+								targets[n] = swingFallback
+							end
+						end
+					end
+					if not next(targets) then
+						return map
+					end
+					for _, folder in ipairs(db:GetChildren()) do
+						if ANIM_PACK_BLOCKLIST[string.lower(folder.Name)] then
+							continue
+						end
+						if folder == combatPack then
+							continue
+						end
+						for _, a in ipairs(folder:GetChildren()) do
+							if a:IsA('Animation')
+								and type(a.AnimationId) == 'string'
+								and a.AnimationId ~= ''
+								and targets[a.Name]
+							then
+								map[a.AnimationId] = targets[a.Name]
+							end
+						end
+					end
+					return map
+				end
+
+				local function stripScripts(model)
+					for _, d in ipairs(model:GetDescendants()) do
+						if d:IsA('BaseScript') or d:IsA('LocalScript') or d:IsA('Script') then
+							d:Destroy()
+						end
+					end
+				end
+
+				-- Ghost must NEVER collide/physically interact with the real character.
+				-- Clone keeps Motor6D "Handle" → live CharacterItems.Handle; that weld
+				-- yeets/ragdolls you the moment Combat Anchor is off.
+				local GHOST_COL_GROUP = 'SB2AnimGhost'
+				pcall(function()
+					PhysicsService:RegisterCollisionGroup(GHOST_COL_GROUP)
+				end)
+				pcall(function()
+					local groups = { 'Default', 'Players', 'Mobs', 'MobsNoCollision', GHOST_COL_GROUP }
+					local okList, listed = pcall(function()
+						return PhysicsService:GetRegisteredCollisionGroups()
+					end)
+					if okList and type(listed) == 'table' then
+						for _, g in ipairs(listed) do
+							local name = type(g) == 'table' and (g.name or g.Name) or g
+							if type(name) == 'string' then
+								groups[#groups + 1] = name
+							end
+						end
+					end
+					local seen = {}
+					for _, other in ipairs(groups) do
+						if not seen[other] then
+							seen[other] = true
+							pcall(function()
+								PhysicsService:CollisionGroupSetCollidable(GHOST_COL_GROUP, other, false)
+							end)
+						end
+					end
+				end)
+
+				local function enforceGhostPart(part)
+					if not part or not part:IsA('BasePart') then
+						return
+					end
+					part.CanCollide = false
+					part.CanTouch = false
+					part.CanQuery = false
+					part.Massless = true
+					part.AssemblyLinearVelocity = Vector3.zero
+					part.AssemblyAngularVelocity = Vector3.zero
+					pcall(function()
+						part.CollisionGroup = GHOST_COL_GROUP
+					end)
+				end
+
+				local function enforceGhostPhysics(model)
+					if not model then
+						return
+					end
+					for _, d in ipairs(model:GetDescendants()) do
+						if d:IsA('BasePart') then
+							enforceGhostPart(d)
+						end
+					end
+					if model:IsA('BasePart') then
+						enforceGhostPart(model)
+					end
+				end
+
+				-- Destroy joints that still point at the LIVE character / CharacterItems.
+				local function breakExternalConstraints(model, allowRoots)
+					if not model then
+						return
+					end
+					local function allowed(part)
+						if not part then
+							return true
+						end
+						if part:IsDescendantOf(model) then
+							return true
+						end
+						if type(allowRoots) == 'table' then
+							for _, root in ipairs(allowRoots) do
+								if root and part:IsDescendantOf(root) then
+									return true
+								end
+							end
+						end
+						return false
+					end
+					local kill = {}
+					for _, d in ipairs(model:GetDescendants()) do
+						if d:IsA('Motor6D') or d:IsA('Weld') or d:IsA('WeldConstraint') then
+							if not allowed(d.Part0) or not allowed(d.Part1) then
+								kill[#kill + 1] = d
+							elseif d:IsA('Motor6D') and d.Name == 'Handle' then
+								-- SB2 tool grip Motor6D — clone keeps Part1 on live CharacterItems.
+								kill[#kill + 1] = d
+							end
+						elseif d:IsA('RigidConstraint')
+							or d:IsA('SpringConstraint')
+							or d:IsA('BallSocketConstraint')
+							or d:IsA('HingeConstraint')
+							or d:IsA('PrismaticConstraint')
+							or d:IsA('CylindricalConstraint')
+						then
+							local a0, a1 = d.Attachment0, d.Attachment1
+							local p0 = a0 and a0.Parent
+							local p1 = a1 and a1.Parent
+							if (p0 and not allowed(p0)) or (p1 and not allowed(p1)) then
+								kill[#kill + 1] = d
+							end
+						end
+					end
+					for _, d in ipairs(kill) do
+						pcall(function()
+							d:Destroy()
+						end)
+					end
+				end
+
+				local function sanitizeGhostPhysics(model, opts)
+					opts = opts or {}
+					if not model then
+						return
+					end
+					breakExternalConstraints(model, opts.allowRoots)
+					enforceGhostPhysics(model)
+					for _, d in ipairs(model:GetDescendants()) do
+						if d:IsA('BodyMover') or d:IsA('BaseScript') then
+							pcall(function()
+								d:Destroy()
+							end)
+						end
+					end
+					local hum = model:FindFirstChildOfClass('Humanoid')
+					if hum then
+						-- Freeze the state machine so it cannot ragdoll or restore CanCollide.
+						pcall(function()
+							hum.EvaluateStateMachine = false
+						end)
+						hum.AutoRotate = false
+						hum.WalkSpeed = 0
+						hum.JumpPower = 0
+						hum.JumpHeight = 0
+						hum.HipHeight = 0
+						hum.PlatformStand = true
+						hum.Sit = false
+						pcall(function()
+							hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+							hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+							hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+							hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+							hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+							hum:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+						end)
+						if opts.initHum then
+							pcall(function()
+								hum:ChangeState(Enum.HumanoidStateType.Running)
+							end)
+						end
+					end
+					-- Anchor only the root. Limbs stay free so Motor6D tracks can pose them;
+					-- WorldModel + broken external joints keep forces out of the live world.
+					local root = model:FindFirstChild('HumanoidRootPart') or model.PrimaryPart
+					if root and root:IsA('BasePart') then
+						root.Anchored = true
+						enforceGhostPart(root)
+					end
+				end
+
+				local function ensureGhost(packName)
+					-- #region agent log
+					if type(getgenv().SB2DbgFling) == 'function' then
+						getgenv().SB2DbgFling('A', 'ensureGhost:enter', 'ensureGhost called', {
+							pack = tostring(packName),
+						})
+					end
+					-- #endregion
+					clearGhost()
+					local real = getLiveCharacter()
+					if not real then
+						return false
+					end
+					local hrp = real:FindFirstChild('HumanoidRootPart') or real.PrimaryPart
+					local hum = real:FindFirstChildOfClass('Humanoid')
+					if not hrp or not hum then
+						return false
+					end
+					local loco, combat = findPackFolder(packName)
+					if not loco then
+						Library:Notify('Not a locomotion pack: ' .. tostring(packName), 4)
+						return false
+					end
+
+					-- WorldModel under CurrentCamera = local render + isolated physics
+					-- (joints cannot couple into the live character / CharacterItems).
+					local cam = workspace.CurrentCamera
+					if not cam then
+						return false
+					end
+					-- Kill leftovers from older ghost builds (pre-WorldModel).
+					for _, name in ipairs({
+						'_SB2AnimGhostWorld',
+						'_SB2AnimGhostChar',
+						'_SB2AnimGhostWeapons',
+					}) do
+						local orphan = cam:FindFirstChild(name)
+						if orphan then
+							pcall(function()
+								orphan:Destroy()
+							end)
+						end
+					end
+					local world = Instance.new('WorldModel')
+					world.Name = '_SB2AnimGhostWorld'
+					world.Parent = cam
+
+					real.Archivable = true
+					local clone = real:Clone()
+					real.Archivable = false
+					-- CRITICAL: while Parent is still nil, destroy grip motors that still
+					-- point at live CharacterItems.Handle. Parenting with that weld =
+					-- instant ragdoll on reload.
+					do
+						local kill = {}
+						for _, d in ipairs(clone:GetDescendants()) do
+							if d:IsA('Motor6D') or d:IsA('Weld') or d:IsA('WeldConstraint') then
+								if d.Name == 'Handle'
+									or d.Name == 'GhostGrip'
+									or (d.Part1 and d.Part1.Name == 'Handle' and not d.Part1:IsDescendantOf(clone))
+									or (d.Part0 and not d.Part0:IsDescendantOf(clone))
+									or (d.Part1 and not d.Part1:IsDescendantOf(clone))
+								then
+									kill[#kill + 1] = d
+								end
+							end
+						end
+						for _, d in ipairs(kill) do
+							d:Destroy()
+						end
+					end
+					stripScripts(clone)
+					breakExternalConstraints(clone)
+					sanitizeGhostPhysics(clone, { initHum = true })
+					clone.Name = '_SB2AnimGhostChar'
+					clone.Parent = world
+					breakExternalConstraints(clone)
+					sanitizeGhostPhysics(clone, { initHum = true })
+					-- Belt: kill any Handle motor that reappeared on parent.
+					do
+						local kill = {}
+						for _, d in ipairs(clone:GetDescendants()) do
+							if d:IsA('Motor6D') and (d.Name == 'Handle' or d.Name == 'GhostGrip') then
+								kill[#kill + 1] = d
+							elseif (d:IsA('Motor6D') or d:IsA('Weld'))
+								and (
+									(d.Part0 and not d.Part0:IsDescendantOf(clone) and not d.Part0:IsDescendantOf(world))
+									or (d.Part1 and not d.Part1:IsDescendantOf(clone) and not d.Part1:IsDescendantOf(world))
+								)
+							then
+								kill[#kill + 1] = d
+							end
+						end
+						for _, d in ipairs(kill) do
+							d:Destroy()
+						end
+					end
+					local cloneHum = clone:FindFirstChildOfClass('Humanoid')
+					local cloneHrp = clone:FindFirstChild('HumanoidRootPart') or clone.PrimaryPart
+					if cloneHum then
+						cloneHum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+						pcall(function()
+							cloneHum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+						end)
+						pcall(function()
+							cloneHum.EvaluateStateMachine = false
+						end)
+						cloneHum.PlatformStand = true
+					end
+					if cloneHrp then
+						cloneHrp.Anchored = true
+						enforceGhostPart(cloneHrp)
+					end
+					-- Hide real body + held weapons locally; others still see the real ones.
+					setLtmTree(real, 1)
+					local uid = localUid()
+					local items = workspace:FindFirstChild('CharacterItems')
+					items = items and uid and items:FindFirstChild(uid)
+					if items then
+						setLtmTree(items, 1)
+					end
+
+					local animate = clone:FindFirstChild('Animate')
+					if animate then
+						applyLocoToAnimate(animate, loco)
+					end
+
+					-- Prefer AnimationController so a Humanoid isn't driving physics.
+					local animHost = clone:FindFirstChildOfClass('AnimationController')
+					if not animHost then
+						animHost = Instance.new('AnimationController')
+						animHost.Name = '_SB2AnimController'
+						animHost.Parent = clone
+					end
+					local animator = animHost:FindFirstChildOfClass('Animator')
+					if not animator then
+						local fromHum = cloneHum and cloneHum:FindFirstChildOfClass('Animator')
+						if fromHum then
+							fromHum.Parent = animHost
+							animator = fromHum
+						else
+							animator = Instance.new('Animator')
+							animator.Parent = animHost
+						end
+					end
+
+					local remap = buildCombatRemap(combat)
+					local tracks = {}
+					local function stopTracks(fade)
+						for _, tr in ipairs(tracks) do
+							pcall(function()
+								tr:Stop(fade or 0.1)
+							end)
+						end
+						for i = #tracks, 1, -1 do
+							tracks[i] = nil
+						end
+					end
+					local function playLoco(kind, fade)
+						if not animator then
+							return
+						end
+						local src = loco:FindFirstChild(kind) or loco:FindFirstChild('Idle')
+						if not (src and src:IsA('Animation') and src.AnimationId ~= '') then
+							return
+						end
+						stopTracks(fade or 0.1)
+						local anim = Instance.new('Animation')
+						anim.AnimationId = src.AnimationId
+						local ok, track = pcall(function()
+							return animator:LoadAnimation(anim)
+						end)
+						anim:Destroy()
+						if not ok or not track then
+							return
+						end
+						track.Looped = kind == 'Idle' or kind == 'Running'
+						if kind == 'Idle' then
+							track.Priority = Enum.AnimationPriority.Idle
+						elseif kind == 'Running' then
+							track.Priority = Enum.AnimationPriority.Movement
+						else
+							track.Priority = Enum.AnimationPriority.Action
+						end
+						pcall(function()
+							track:Play(fade or 0.12)
+						end)
+						tracks[#tracks + 1] = track
+						return track
+					end
+
+					playLoco('Idle', 0.05)
+
+					-- Mirror real AnimationPlayed → ghost with combat remap (swings etc.).
+					local realAnimator = hum:FindFirstChildOfClass('Animator') or hum
+					local playedConn = nil
+					if realAnimator and typeof(realAnimator.AnimationPlayed) == 'RBXScriptSignal' then
+						playedConn = realAnimator.AnimationPlayed:Connect(function(track)
+							if getgenv().SB2WeaponModState and getgenv().SB2WeaponModState.AnimEnabled ~= true then
+								return
+							end
+							local a = track and track.Animation
+							local id = a and a.AnimationId
+							if type(id) ~= 'string' then
+								return
+							end
+							local useId = remap[id] or id
+							local name = a and a.Name or ''
+							if name == 'Idle'
+								or name == 'Animation1'
+								or name == 'Animation2'
+								or name == 'WalkAnim'
+								or name == 'RunAnim'
+								or name == 'JumpAnim'
+								or name == 'FallAnim'
+							then
+								return
+							end
+							if not animator then
+								return
+							end
+							local anim = Instance.new('Animation')
+							anim.AnimationId = useId
+							local ok, ghostTrack = pcall(function()
+								return animator:LoadAnimation(anim)
+							end)
+							anim:Destroy()
+							if ok and ghostTrack then
+								ghostTrack.Priority = Enum.AnimationPriority.Action4
+								pcall(function()
+									ghostTrack:Play(0.05)
+									ghostTrack.Looped = track.Looped == true
+								end)
+							end
+						end)
+					end
+
+					-- Weapon visuals welded to the ghost the same way SB2 grips work:
+					-- Motor6D on Hand, Part0=RightGrip/LeftGrip, Part1=Handle, copy C0/C1.
+					local weaponFolder = Instance.new('Folder')
+					weaponFolder.Name = '_SB2AnimGhostWeapons'
+					weaponFolder.Parent = world
+					local ghostGrips = {} -- { handName = { motor, handle, invId } }
+					local function clearGhostGrips()
+						for _, info in pairs(ghostGrips) do
+							pcall(function()
+								if info.motor then
+									info.motor:Destroy()
+								end
+							end)
+						end
+						table.clear(ghostGrips)
+						for _, c in ipairs(weaponFolder:GetChildren()) do
+							c:Destroy()
+						end
+						-- Orphan grip motors (GhostGrip + leftover Handle → live items).
+						for _, handName in ipairs({ 'RightHand', 'LeftHand' }) do
+							local hand = clone:FindFirstChild(handName)
+							if hand then
+								for _, ch in ipairs(hand:GetChildren()) do
+									if ch:IsA('Motor6D')
+										and (ch.Name == 'GhostGrip' or ch.Name == 'Handle')
+									then
+										ch:Destroy()
+									end
+								end
+							end
+						end
+						breakExternalConstraints(clone, { weaponFolder })
+					end
+					local function findRealGripMotor(liveChar, handlePart, preferRight)
+						if not liveChar or not handlePart then
+							return nil
+						end
+						local handName = preferRight and 'RightHand' or 'LeftHand'
+						local hand = liveChar:FindFirstChild(handName)
+						if hand then
+							for _, ch in ipairs(hand:GetChildren()) do
+								if ch:IsA('Motor6D') and ch.Part1 == handlePart then
+									return ch
+								end
+							end
+						end
+						for _, d in ipairs(liveChar:GetDescendants()) do
+							if d:IsA('Motor6D') and d.Part1 == handlePart then
+								return d
+							end
+						end
+						return nil
+					end
+					local function sanitizeWeaponTree(root)
+						for _, d in ipairs(root:GetDescendants()) do
+							if d:IsA('BaseScript') then
+								d:Destroy()
+							elseif d:IsA('BasePart') then
+								enforceGhostPart(d)
+								d.Anchored = false
+								d.LocalTransparencyModifier = 0
+							end
+						end
+						if root:IsA('BasePart') then
+							enforceGhostPart(root)
+							root.Anchored = false
+							root.LocalTransparencyModifier = 0
+						end
+					end
+					local function refreshWeapons(liveChar, itemsRoot)
+						if not itemsRoot or not clone then
+							return
+						end
+						local needRebuild = false
+						for _, handName in ipairs({ 'RightWeapon', 'LeftWeapon' }) do
+							local folder = itemsRoot:FindFirstChild(handName)
+							local handle = folder and folder:FindFirstChild('Handle')
+							local tool = folder and folder:FindFirstChild('Tool')
+							local inv = folder and folder:FindFirstChild('InventoryID')
+							local invId = inv and tostring(inv.Value)
+								or (handle and tostring(handle:GetAttribute('InventoryID') or handle.Size))
+								or ''
+							local prev = ghostGrips[handName]
+							if not handle or not tool then
+								if prev then
+									needRebuild = true
+								end
+							elseif not prev or prev.invId ~= invId or not prev.motor or not prev.motor.Parent or not prev.handle or not prev.handle.Parent then
+								needRebuild = true
+							end
+						end
+						if not needRebuild and next(ghostGrips) then
+							return
+						end
+						clearGhostGrips()
+						for _, handName in ipairs({ 'RightWeapon', 'LeftWeapon' }) do
+							local folder = itemsRoot:FindFirstChild(handName)
+							local tool = folder and folder:FindFirstChild('Tool')
+							local handle = folder and folder:FindFirstChild('Handle')
+							if not (tool and handle and handle:IsA('BasePart')) then
+								continue
+							end
+							local isRight = handName == 'RightWeapon'
+							local gripName = isRight and 'RightGrip' or 'LeftGrip'
+							local handNameRbx = isRight and 'RightHand' or 'LeftHand'
+							local ghostHand = clone:FindFirstChild(handNameRbx)
+							local ghostGrip = clone:FindFirstChild(gripName)
+							if not ghostGrip and ghostHand then
+								-- RightGrip is often a tiny Part parented to the character root.
+								ghostGrip = ghostHand
+							end
+							if not ghostHand or not ghostGrip then
+								continue
+							end
+
+							local hClone = handle:Clone()
+							sanitizeWeaponTree(hClone)
+							hClone.Name = 'Handle'
+							hClone.Parent = weaponFolder
+
+							local tClone = tool:Clone()
+							sanitizeWeaponTree(tClone)
+							tClone.Parent = weaponFolder
+							-- Tool welds often reference the ORIGINAL Handle (outside clone tree).
+							for _, w in ipairs(tClone:GetDescendants()) do
+								if w:IsA('Weld') or w:IsA('Motor6D') or w:IsA('WeldConstraint') then
+									if w.Part0 == handle or (w.Part0 and w.Part0.Name == 'Handle') then
+										w.Part0 = hClone
+									end
+									if w.Part1 == handle or (w.Part1 and w.Part1.Name == 'Handle') then
+										w.Part1 = hClone
+									end
+								end
+							end
+
+							local realMotor = findRealGripMotor(liveChar, handle, isRight)
+							local m = Instance.new('Motor6D')
+							m.Name = 'GhostGrip'
+							m.Part0 = ghostGrip
+							m.Part1 = hClone
+							if realMotor then
+								m.C0 = realMotor.C0
+								m.C1 = realMotor.C1
+							else
+								-- Fallback: match live Handle relative to grip/hand.
+								-- Motor6D: Part1.CFrame = Part0.CFrame * C0 * C1:Inverse()
+								local liveAnchor = liveChar:FindFirstChild(gripName)
+									or liveChar:FindFirstChild(handNameRbx)
+								if liveAnchor then
+									m.C0 = CFrame.new()
+									m.C1 = liveAnchor.CFrame:ToObjectSpace(handle.CFrame):Inverse()
+								end
+							end
+							m.Parent = ghostHand
+
+							local inv = folder:FindFirstChild('InventoryID')
+							local invKey = ''
+							if inv then
+								invKey = tostring(inv.Value)
+							else
+								invKey = tostring(handle:GetAttribute('InventoryID') or handle.Size)
+							end
+							ghostGrips[handName] = {
+								motor = m,
+								handle = hClone,
+								invId = invKey,
+							}
+						end
+						breakExternalConstraints(clone, { weaponFolder })
+						enforceGhostPhysics(weaponFolder)
+					end
+					pcall(refreshWeapons, real, items)
+
+					local lastWeaponRefresh = 0
+					local lastHumSanitize = 0
+					local lastJointBreak = 0
+					local hb = RunService.RenderStepped:Connect(function()
+						if state.AnimEnabled ~= true then
+							return
+						end
+						local live = getLiveCharacter()
+						local liveHrp = live and (live:FindFirstChild('HumanoidRootPart') or live.PrimaryPart)
+						local liveHum = live and live:FindFirstChildOfClass('Humanoid')
+						if not live or not liveHrp or not clone or not clone.Parent or not cloneHrp then
+							return
+						end
+						-- Humanoid re-enables CanCollide on limbs; strip it EVERY frame or
+						-- turning Combat Anchor off flings you into the ghost overlap.
+						enforceGhostPhysics(clone)
+						if weaponFolder then
+							enforceGhostPhysics(weaponFolder)
+						end
+						cloneHrp.Anchored = true
+						cloneHrp.CFrame = liveHrp.CFrame
+						-- Keep real hidden if the game resets LTM.
+						setLtmTree(live, 1)
+						local uid2 = localUid()
+						local items2 = workspace:FindFirstChild('CharacterItems')
+						items2 = items2 and uid2 and items2:FindFirstChild(uid2)
+						if items2 then
+							setLtmTree(items2, 1)
+						end
+						-- Keep ghost grip C0/C1 matched to live (game can tweak grip each equip).
+						for handName, info in pairs(ghostGrips) do
+							local folder = items2 and items2:FindFirstChild(handName)
+							local liveHandle = folder and folder:FindFirstChild('Handle')
+							if info.motor and info.motor.Parent and liveHandle then
+								local realMotor = findRealGripMotor(live, liveHandle, handName == 'RightWeapon')
+								if realMotor then
+									info.motor.C0 = realMotor.C0
+									info.motor.C1 = realMotor.C1
+								end
+								-- Never retarget Part1 to the LIVE handle.
+								if info.motor.Part1 ~= info.handle then
+									info.motor.Part1 = info.handle
+								end
+								if not info.motor.Part0 then
+									local gripName = handName == 'RightWeapon' and 'RightGrip' or 'LeftGrip'
+									info.motor.Part0 = clone:FindFirstChild(gripName)
+										or clone:FindFirstChild(handName == 'RightWeapon' and 'RightHand' or 'LeftHand')
+								end
+							end
+						end
+						local now = os.clock()
+						if now - lastJointBreak > 0.25 then
+							lastJointBreak = now
+							breakExternalConstraints(clone, { weaponFolder })
+						end
+						if now - lastHumSanitize > 1 then
+							lastHumSanitize = now
+							sanitizeGhostPhysics(clone, { allowRoots = { weaponFolder } })
+							if weaponFolder then
+								sanitizeGhostPhysics(weaponFolder, { allowRoots = { clone } })
+							end
+						end
+						if now - lastWeaponRefresh > 2 then
+							lastWeaponRefresh = now
+							items = items2
+							pcall(refreshWeapons, live, items2)
+						end
+						-- Drive loco from REAL humanoid state (clone Humanoid never updates).
+						local want = 'Idle'
+						local speed = liveHrp.AssemblyLinearVelocity.Magnitude
+						local stateId = liveHum and liveHum:GetState()
+						if stateId == Enum.HumanoidStateType.Jumping then
+							want = 'Jump'
+						elseif stateId == Enum.HumanoidStateType.Freefall then
+							want = 'Fall'
+						elseif speed > 1.5 then
+							want = 'Running'
+						end
+						if getgenv()._SB2AnimGhostWant ~= want then
+							getgenv()._SB2AnimGhostWant = want
+							playLoco(want, 0.12)
+						end
+					end)
+
+					getgenv()._SB2AnimGhost = {
+						clone = clone,
+						real = real,
+						hb = hb,
+						played = playedConn,
+						weaponFolder = weaponFolder,
+						world = world,
+						pack = packName,
+					}
+					return true
+				end
+
+				local function stopAnimSwap()
+					clearGhost()
+					getgenv()._SB2AnimGhostWant = nil
+				end
+
+				local function applyAnimSwap()
+					if state.AnimEnabled ~= true or state.AnimPack == '(default)' or state.AnimPack == nil or state.AnimPack == '' then
+						stopAnimSwap()
+						return
+					end
+					if ANIM_PACK_BLOCKLIST[string.lower(tostring(state.AnimPack))] then
+						Library:Notify(tostring(state.AnimPack) .. ' is not a locomotion pack', 4)
+						state.AnimPack = '(default)'
+						persistPrefs()
+						stopAnimSwap()
+						return
+					end
+					local ok = ensureGhost(state.AnimPack)
+					if ok then
+						Library:Notify('Client anim pack: ' .. tostring(state.AnimPack) .. ' (only you see it)', 4)
+					end
+				end
+
+				getgenv().SB2AnimSwapStop = stopAnimSwap
+				getgenv().SB2AnimSwapApply = applyAnimSwap
+
+				-- Re-apply after respawn.
+				pcall(function()
+					local old = getgenv()._SB2AnimCharConn
+					if old then
+						old:Disconnect()
+					end
+				end)
+				local lp = Players.LocalPlayer
+				if lp then
+					getgenv()._SB2AnimCharConn = lp.CharacterAdded:Connect(function()
+						task.wait(1.2)
+						if state.AnimEnabled == true then
+							applyAnimSwap()
+						end
+					end)
+				end
+
+				WeaponModBox:AddLabel(
+					'Animation swapper — loco packs + TeaCup (Unarmed walk + teacup swings). Client ghost; others keep normal anims.'
+				)
+				WeaponModBox:AddToggle('WeaponModAnimEnabled', {
+					Text = 'Client anim pack',
+					Default = state.AnimEnabled == true,
+					Tooltip = 'Local-only clone with Idle/Run/Jump/Fall + remapped swings. No shop/remote.',
+				}):OnChanged(function(on)
+					state.AnimEnabled = on == true
+					persistPrefs()
+					if state.AnimEnabled then
+						applyAnimSwap()
+					else
+						stopAnimSwap()
+						Library:Notify('Client anim pack off', 3)
+					end
+				end)
+				WeaponModBox:AddDropdown('WeaponModAnimPack', {
+					Text = 'Anim pack',
+					Values = animPackNames(),
+					Default = (function()
+						local cur = state.AnimPack or '(default)'
+						if ANIM_PACK_BLOCKLIST[string.lower(tostring(cur))] then
+							return '(default)'
+						end
+						return cur
+					end)(),
+					Tooltip = 'Locomotion packs (Reaper, Ninja, …) plus TeaCup. Dagger/Misc/SwordShield stay out.',
+				}):OnChanged(function(v)
+					state.AnimPack = flattenOpt(v) or '(default)'
+					persistPrefs()
+					if state.AnimEnabled == true then
+						applyAnimSwap()
+					end
+				end)
+				WeaponModBox:AddButton('Refresh anim pack list', function()
+					local values = animPackNames()
+					if Options.WeaponModAnimPack and Options.WeaponModAnimPack.SetValues then
+						pcall(function()
+							Options.WeaponModAnimPack:SetValues(values)
+						end)
+					end
+					Library:Notify('Anim packs: ' .. tostring(#values - 1), 3)
+				end)
+				WeaponModBox:AddButton('Re-apply client anim', function()
+					if state.AnimEnabled ~= true then
+						Library:Notify('Enable Client anim pack first', 3)
+						return
+					end
+					applyAnimSwap()
+				end)
+
+				-- Do NOT auto-spawn ghost after reload — that ragdolled on every soft load.
+				-- Re-enable via the Client anim pack toggle or Re-apply button.
+				task.defer(function()
+					if state._AnimSkipAutoApply == true then
+						state._AnimSkipAutoApply = nil
+						state.AnimEnabled = false
+						persistPrefs()
+						if Options.WeaponModAnimEnabled
+							and type(Options.WeaponModAnimEnabled.SetValue) == 'function'
+						then
+							pcall(function()
+								Options.WeaponModAnimEnabled:SetValue(false)
+							end)
+						end
+						return
+					end
+					if state.AnimEnabled == true and state.AnimPack and state.AnimPack ~= '(default)' then
+						if ANIM_PACK_BLOCKLIST[string.lower(tostring(state.AnimPack))] then
+							state.AnimPack = '(default)'
+							persistPrefs()
+							return
+						end
+						task.wait(1.25)
+						if state.AnimEnabled == true then
+							applyAnimSwap()
+						end
+					end
+				end)
+			end
+
+			WeaponModBox:AddLabel('Client-only look for held swords (CharacterItems). Stats stay on the real equip. Overlay = capture a DIFFERENT sword first (Edit current = tint/scale this one).')
+			WeaponModBox:AddToggle('WeaponModEnabled', {
+				Text = 'Enable weapon modifier',
+				Default = state.Enabled == true,
+				Tooltip = 'Applies color / size / rotation / overlay to your held weapon model.',
+			}):OnChanged(function(on)
+				state.Enabled = on == true
+				queueApply()
+			end)
+			WeaponModBox:AddDropdown('WeaponModTarget', {
+				Text = 'Target hand',
+				Values = { 'Right', 'Left', 'Both' },
+				Default = state.Target or 'Right',
+			}):OnChanged(function(v)
+				state.Target = flattenOpt(v) or 'Right'
+				queueApply()
+			end)
+			WeaponModBox:AddDropdown('WeaponModMode', {
+				Text = 'Mode',
+				Values = { 'Edit current', 'Overlay look' },
+				Default = state.Mode or 'Edit current',
+				Tooltip = 'Edit current = tint/scale the real mesh. Overlay look = hide it and show a captured weapon mesh.',
+			}):OnChanged(function(v)
+				state.Mode = flattenOpt(v) or 'Edit current'
+				queueApply()
+			end)
+			WeaponModBox:AddDropdown('WeaponModLook', {
+				Text = 'Overlay look',
+				Values = lookDropdownValues(),
+				Default = state.Look or '(none)',
+				Tooltip = 'Capture an equipped sword first, then pick it here for Overlay mode.',
+			}):OnChanged(function(v)
+				state.Look = flattenOpt(v) or '(none)'
+				queueApply()
+			end)
+			WeaponModBox:AddDropdown('WeaponModAnchor', {
+				Text = 'Overlay anchor',
+				Values = { 'Auto', 'Blade', 'Handle', 'Plane' },
+				Default = state.Anchor or 'Auto',
+				Tooltip = 'What the overlay welds to. Auto prefers Blade (hitbox) so visuals line up with the blue box.',
+			}):OnChanged(function(v)
+				state.Anchor = flattenOpt(v) or 'Auto'
+				queueApply()
+			end)
+			WeaponModBox:AddButton('Capture equipped look', function()
+				local name = captureEquippedLook()
+				if not name then
+					return
+				end
+				state.Look = name
+				if Options.WeaponModLook and Options.WeaponModLook.SetValues then
+					pcall(function()
+						Options.WeaponModLook:SetValues(lookDropdownValues())
+					end)
+				end
+				if Options.WeaponModLook and Options.WeaponModLook.SetValue then
+					pcall(function()
+						Options.WeaponModLook:SetValue(name)
+					end)
+				end
+				Library:Notify('Captured look: ' .. name, 4)
+				queueApply()
+			end)
+			WeaponModBox:AddButton('Apply now', function()
+				applyAll()
+				Library:Notify('Weapon modifier applied', 3)
+			end)
+			WeaponModBox:AddButton('Reset held visuals', function()
+				hardResetHeldVisuals()
+			end)
+
+			WeaponModBox:AddToggle('WeaponModColorOn', {
+				Text = 'Tint color',
+				Default = state.ColorOn == true,
+			}):OnChanged(function(on)
+				state.ColorOn = on == true
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModColorR', {
+				Text = 'Tint R',
+				Default = tonumber(state.ColorR) or 255,
+				Min = 0,
+				Max = 255,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				state.ColorR = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModColorG', {
+				Text = 'Tint G',
+				Default = tonumber(state.ColorG) or 255,
+				Min = 0,
+				Max = 255,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				state.ColorG = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModColorB', {
+				Text = 'Tint B',
+				Default = tonumber(state.ColorB) or 255,
+				Min = 0,
+				Max = 255,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				state.ColorB = v
+				queueApply()
+			end)
+
+			WeaponModBox:AddSlider('WeaponModScale', {
+				Text = 'Scale (uniform)',
+				Default = tonumber(state.Scale) or 1,
+				Min = 0.25,
+				Max = 3,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.Scale = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModScaleX', {
+				Text = 'Scale X (shape)',
+				Default = tonumber(state.ScaleX) or 1,
+				Min = 0.25,
+				Max = 3,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.ScaleX = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModScaleY', {
+				Text = 'Scale Y (shape)',
+				Default = tonumber(state.ScaleY) or 1,
+				Min = 0.25,
+				Max = 3,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.ScaleY = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModScaleZ', {
+				Text = 'Scale Z (shape)',
+				Default = tonumber(state.ScaleZ) or 1,
+				Min = 0.25,
+				Max = 3,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.ScaleZ = v
+				queueApply()
+			end)
+
+			WeaponModBox:AddSlider('WeaponModRotX', {
+				Text = 'Rotation X°',
+				Default = tonumber(state.RotX) or 0,
+				Min = -180,
+				Max = 180,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				state.RotX = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModRotY', {
+				Text = 'Rotation Y°',
+				Default = tonumber(state.RotY) or 0,
+				Min = -180,
+				Max = 180,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				state.RotY = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModRotZ', {
+				Text = 'Rotation Z°',
+				Default = tonumber(state.RotZ) or 0,
+				Min = -180,
+				Max = 180,
+				Rounding = 0,
+			}):OnChanged(function(v)
+				state.RotZ = v
+				queueApply()
+			end)
+
+			WeaponModBox:AddSlider('WeaponModOffX', {
+				Text = 'Align X',
+				Default = tonumber(state.OffX) or 0,
+				Min = -10,
+				Max = 10,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.OffX = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModOffY', {
+				Text = 'Align Y',
+				Default = tonumber(state.OffY) or 0,
+				Min = -10,
+				Max = 10,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.OffY = v
+				queueApply()
+			end)
+			WeaponModBox:AddSlider('WeaponModOffZ', {
+				Text = 'Align Z',
+				Default = tonumber(state.OffZ) or 0,
+				Min = -10,
+				Max = 10,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.OffZ = v
+				queueApply()
+			end)
+
+			WeaponModBox:AddSlider('WeaponModTransparency', {
+				Text = 'Transparency',
+				Default = tonumber(state.Transparency) or 0,
+				Min = 0,
+				Max = 1,
+				Rounding = 2,
+			}):OnChanged(function(v)
+				state.Transparency = v
+				queueApply()
+			end)
+
+			-- Re-apply after UI defaults settle if it was left enabled.
+			task.defer(function()
+				if state.Enabled == true then
+					applyAll()
 				end
 			end)
 		end
@@ -18066,10 +21536,27 @@ local ok, err = pcall(function()
 			if type(Hive.getTributeWebhook) == 'function' then
 				webhookUrl, webhookOn, webhookPing = Hive.getTributeWebhook()
 			end
+			local function readHiveOptString(name)
+				local o = Options and Options[name]
+				if type(o) ~= 'table' then
+					return ''
+				end
+				local v = o.Value
+				if type(v) == 'string' then
+					return v
+				end
+				if type(v) == 'number' then
+					return tostring(v)
+				end
+				-- Ataraxia stores toggles in Options too — never treat bool as a URL.
+				return ''
+			end
 			HiveBox:AddLabel(
 				'Tribute alerts are per Roblox account. Each person sets their own webhook + Discord ID (Developer Mode → Copy User ID).'
 			)
-			HiveBox:AddInput('HiveTributeWebhook', {
+			-- Input idx must differ from the toggle — Ataraxia also puts toggles in Options,
+			-- so a shared name made Test webhook read Value==true ("need a url: true").
+			HiveBox:AddInput('HiveTributeWebhookUrl', {
 				Text = 'Your Discord webhook URL',
 				Default = webhookUrl or '',
 				Placeholder = 'https://discord.com/api/webhooks/...',
@@ -18077,7 +21564,7 @@ local ok, err = pcall(function()
 				ClearTextOnFocus = false,
 				Callback = function(value)
 					local on = Toggles.HiveTributeWebhook and Toggles.HiveTributeWebhook.Value
-					local ping = Options.HiveTributePing and Options.HiveTributePing.Value or ''
+					local ping = readHiveOptString('HiveTributePing')
 					if type(Hive.setTributeWebhook) == 'function' then
 						Hive.setTributeWebhook(tostring(value or ''), on == true, tostring(ping or ''), { quiet = true })
 					end
@@ -18091,7 +21578,7 @@ local ok, err = pcall(function()
 				ClearTextOnFocus = false,
 				Callback = function(value)
 					local on = Toggles.HiveTributeWebhook and Toggles.HiveTributeWebhook.Value
-					local url = Options.HiveTributeWebhook and Options.HiveTributeWebhook.Value or ''
+					local url = readHiveOptString('HiveTributeWebhookUrl')
 					if type(Hive.setTributeWebhook) == 'function' then
 						Hive.setTributeWebhook(tostring(url or ''), on == true, tostring(value or ''), { quiet = true })
 					end
@@ -18102,8 +21589,8 @@ local ok, err = pcall(function()
 				Default = webhookOn == true,
 				Tooltip = 'Posts when THIS Roblox account gets a Tribute. Config is per-userId under hive/.',
 			}):OnChanged(function(on)
-				local url = Options.HiveTributeWebhook and Options.HiveTributeWebhook.Value or ''
-				local ping = Options.HiveTributePing and Options.HiveTributePing.Value or ''
+				local url = readHiveOptString('HiveTributeWebhookUrl')
+				local ping = readHiveOptString('HiveTributePing')
 				if type(Hive.setTributeWebhook) == 'function' then
 					Hive.setTributeWebhook(tostring(url or ''), on == true, tostring(ping or ''))
 				elseif type(Hive.setTributeWebhookEnabled) == 'function' then
@@ -18111,8 +21598,8 @@ local ok, err = pcall(function()
 				end
 			end)
 			HiveBox:AddButton('Test webhook', function()
-				local url = Options.HiveTributeWebhook and Options.HiveTributeWebhook.Value or ''
-				local ping = Options.HiveTributePing and Options.HiveTributePing.Value or ''
+				local url = readHiveOptString('HiveTributeWebhookUrl')
+				local ping = readHiveOptString('HiveTributePing')
 				if type(Hive.testTributeWebhook) == 'function' then
 					Hive.testTributeWebhook(tostring(url or ''), tostring(ping or ''))
 				else
@@ -18134,7 +21621,11 @@ local ok, err = pcall(function()
 				refreshHiveLabels()
 			end)
 			OrdersBox:AddButton('Combat ON', function()
-				Hive.issue('combat_on', {})
+				local skill
+				pcall(function()
+					skill = flattenOptionValue(Options.SkillName and Options.SkillName.Value)
+				end)
+				Hive.issue('combat_on', { skill = skill })
 				refreshHiveLabels()
 			end)
 			OrdersBox:AddButton('Combat OFF', function()
@@ -18401,6 +21892,17 @@ local ok, err = pcall(function()
 		end
 	end)
 
+	Menu:AddButton('Test notification', function()
+		Library:Notify(
+			table.concat({
+				'Test notification',
+				'White outline · flash · timer bar',
+				'If you see this, toasts are working',
+			}, '\n'),
+			8,
+			true
+		)
+	end)
 	Menu:AddToggle('AutoSkipLoading', {
 		Text = 'Rejoin if stuck loading',
 		Default = LoadSkip.fileOn(),
@@ -18463,6 +21965,9 @@ local ok, err = pcall(function()
 		end
 		if type(getgenv().SB2InvFilterCleanup) == 'function' then
 			pcall(getgenv().SB2InvFilterCleanup)
+		end
+		if type(getgenv().SB2WeaponModCleanup) == 'function' then
+			pcall(getgenv().SB2WeaponModCleanup)
 		end
 		pcall(function()
 			Camera.CameraSubject = Character
@@ -18926,7 +22431,7 @@ local ok, err = pcall(function()
 			return true
 		end
 		getgenv().SB2PersistCombatPrefs = function()
-			-- Always force-save dive height/flee, even during autoload — otherwise OnChanged
+			-- Always force-save dive height/flee, even during autoload - otherwise OnChanged
 			-- during SetValue is dropped and the next launch resets to slider Defaults.
 			pcall(function()
 				local data = readCombatSkillsSidecar() or {}

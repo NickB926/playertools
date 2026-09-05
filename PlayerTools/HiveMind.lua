@@ -138,7 +138,7 @@ Hive = {
 	_tributeWebhookUrl = '',
 	_tributeWebhookOn = false,
 	_tributePing = '', -- each user sets their own Discord snowflake; never hardcode
-	_orderRev = 8, -- bump when order handlers / webhook payload change so soft reload re-loadstrings HiveMind
+	_orderRev = 9, -- bump when order handlers / webhook payload change so soft reload re-loadstrings HiveMind
 }
 getgenv().SB2Hive = Hive
 
@@ -223,6 +223,30 @@ local function getRoot(player)
 		return nil
 	end
 	return char:FindFirstChild('HumanoidRootPart') or char:FindFirstChild('UpperTorso')
+end
+
+-- Bare HRP.CFrame every Heartbeat desyncs the server (and the sword) → 0 killaura.
+local function warpToCFrame(cf)
+	if typeof(cf) ~= 'CFrame' then
+		return false
+	end
+	if type(getgenv().SB2PinTeleportCFrame) == 'function' then
+		return pcall(getgenv().SB2PinTeleportCFrame, cf, 0.85)
+	end
+	local model = LocalPlayer.Character
+	local root = getRoot(LocalPlayer)
+	return pcall(function()
+		if root then
+			root.Anchored = false
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end
+		if model and model.PivotTo then
+			model:PivotTo(cf)
+		elseif root then
+			root.CFrame = cf
+		end
+	end)
 end
 
 local function getHp()
@@ -574,12 +598,15 @@ local function startFollow(mode, order)
 			return
 		end
 		local offset = followOffset(mode, order)
-		pcall(function()
-			myRoot.Anchored = false
-			myRoot.CFrame = theirRoot.CFrame * CFrame.new(offset)
-			myRoot.AssemblyLinearVelocity = Vector3.zero
-			myRoot.AssemblyAngularVelocity = Vector3.zero
-		end)
+		local dest = theirRoot.CFrame * CFrame.new(offset)
+		if (myRoot.Position - dest.Position).Magnitude < 2.5 then
+			return
+		end
+		if now - (tonumber(Hive._lastFollowWarp) or 0) < 0.4 then
+			return
+		end
+		Hive._lastFollowWarp = now
+		warpToCFrame(dest)
 	end)
 end
 
@@ -609,12 +636,7 @@ local function snapOnceToCommander(order)
 		end
 	end
 	if myRoot and dest then
-		pcall(function()
-			myRoot.Anchored = false
-			myRoot.CFrame = dest
-			myRoot.AssemblyLinearVelocity = Vector3.zero
-			myRoot.AssemblyAngularVelocity = Vector3.zero
-		end)
+		warpToCFrame(dest)
 	end
 	Hive.status = 'idle'
 	notify('Warped once — free roam')
@@ -2437,6 +2459,23 @@ local function handleOrder(order)
 		rallyToCommander(order)
 	elseif t == 'combat_on' then
 		setCombatToggles(true, true)
+		local payload = type(order.payload) == 'table' and order.payload or {}
+		pcall(function()
+			local L = getgenv().SB2PlayerToolsLibrary
+			local opt = L and L.Options and L.Options.SkillName
+			if type(opt) ~= 'table' or type(opt.SetValue) ~= 'function' then
+				return
+			end
+			local pick = type(getgenv().SB2PickBestAuraWeaponSkill) == 'function'
+				and getgenv().SB2PickBestAuraWeaponSkill()
+				or nil
+			local want = payload.skill
+			if type(pick) == 'string' and pick ~= '' then
+				pcall(opt.SetValue, opt, pick)
+			elseif type(want) == 'string' and want ~= '' and want ~= '(none)' then
+				pcall(opt.SetValue, opt, want)
+			end
+		end)
 		Hive.status = 'combat'
 		notify('Order: combat on')
 	elseif t == 'combat_off' then
@@ -2978,18 +3017,30 @@ local function readTributeWebhookConfig()
 end
 
 local function stopTributeWatch()
+	-- Soft-reload leaves the OLD ChildAdded on genv while Hive._tributeWatchConn
+	-- is a new table — must disconnect BOTH or one drop → N webhook posts.
+	local prevGenv = getgenv().SB2HiveTributeWatchConn
+	if prevGenv then
+		pcall(function()
+			prevGenv:Disconnect()
+		end)
+	end
+	getgenv().SB2HiveTributeWatchConn = nil
 	local c = Hive._tributeWatchConn
-	if c then
+	if c and c ~= prevGenv then
 		pcall(function()
 			c:Disconnect()
 		end)
 	end
 	Hive._tributeWatchConn = nil
-	getgenv().SB2HiveTributeWatchConn = nil
 end
 
 local function snapshotTributeInventory()
-	local known = {}
+	local known = getgenv().SB2HiveTributeKnown
+	if type(known) ~= 'table' then
+		known = {}
+		getgenv().SB2HiveTributeKnown = known
+	end
 	local inv = getInventory()
 	if not inv then
 		return known
@@ -3000,7 +3051,30 @@ local function snapshotTributeInventory()
 			known[id] = true
 		end
 	end
+	Hive._tributeKnown = known
 	return known
+end
+
+local function tributeDbg(msg, data)
+	-- #region agent log
+	pcall(function()
+		local Hs = game:GetService('HttpService')
+		local payload = Hs:JSONEncode({
+			sessionId = '7e9135',
+			runId = 'tribute-dedupe',
+			hypothesisId = 'T1',
+			location = 'HiveMind.lua:tribute',
+			message = msg,
+			data = data or {},
+			timestamp = math.floor(os.clock() * 1000),
+		})
+		if type(appendfile) == 'function' then
+			appendfile('debug-7e9135.log', payload .. '\n')
+		elseif type(writefile) == 'function' then
+			writefile('debug-7e9135.log', payload .. '\n')
+		end
+	end)
+	-- #endregion
 end
 
 local function postTributeWebhook(payload)
@@ -3038,6 +3112,11 @@ local function postTributeWebhook(payload)
 			},
 		},
 	})
+	tributeDbg('webhook_post', {
+		name = tostring(payload.name),
+		id = tostring(payload.instanceId),
+		user = user,
+	})
 	local done, result
 	local finished = false
 	task.spawn(function()
@@ -3072,14 +3151,37 @@ local function onTributeInventoryItem(item)
 	if not id then
 		return
 	end
-	Hive._tributeKnown = Hive._tributeKnown or {}
-	if Hive._tributeKnown[id] then
+	-- Shared across soft-reloads so stacked watchers can't each "discover" the drop.
+	local known = getgenv().SB2HiveTributeKnown
+	if type(known) ~= 'table' then
+		known = {}
+		getgenv().SB2HiveTributeKnown = known
+	end
+	Hive._tributeKnown = known
+	if known[id] then
+		tributeDbg('skip_known_id', { name = item.Name, id = id })
 		return
 	end
-	Hive._tributeKnown[id] = true
+	-- Name debounce: inventory sometimes re-parents the same tribute with a new id.
+	local recent = getgenv().SB2HiveTributeRecent
+	if type(recent) ~= 'table' then
+		recent = {}
+		getgenv().SB2HiveTributeRecent = recent
+	end
+	local nameKey = string.lower(tostring(item.Name or ''))
+	local now = os.clock()
+	local lastAt = tonumber(recent[nameKey]) or 0
+	if now - lastAt < 12 then
+		known[id] = true
+		tributeDbg('skip_name_debounce', { name = item.Name, id = id, dt = now - lastAt })
+		return
+	end
+	known[id] = true
+	recent[nameKey] = now
 	local upgrade = item:FindFirstChild('Upgrade')
 	local upVal = upgrade and upgrade:IsA('ValueBase') and tonumber(upgrade.Value) or nil
 	notify(('Tribute drop: %s'):format(tostring(item.Name)))
+	tributeDbg('send_tribute', { name = item.Name, id = id })
 	postTributeWebhook({
 		name = item.Name,
 		upgrade = upVal,
@@ -3116,6 +3218,14 @@ local function startTributeWatch()
 	end)
 	Hive._tributeWatchConn = conn
 	getgenv().SB2HiveTributeWatchConn = conn
+	local knownN = 0
+	for _ in pairs(Hive._tributeKnown or {}) do
+		knownN += 1
+	end
+	tributeDbg('watch_started', {
+		user = LocalPlayer and LocalPlayer.Name,
+		knownN = knownN,
+	})
 end
 
 function Hive.getTributeWebhook()
@@ -3170,6 +3280,13 @@ end
 
 -- Sends a sample Discord post using the current (or override) URL/ping. Does not require the toggle.
 function Hive.testTributeWebhook(urlOverride, pingOverride)
+	-- UI sometimes hands us a bool/table when Options idxs collide with toggles.
+	if type(urlOverride) ~= 'string' then
+		urlOverride = ''
+	end
+	if type(pingOverride) ~= 'string' then
+		pingOverride = ''
+	end
 	local fromUi = normalizeDiscordWebhookUrl(urlOverride)
 	if fromUi ~= '' then
 		Hive._tributeWebhookUrl = fromUi
@@ -3179,9 +3296,11 @@ function Hive.testTributeWebhook(urlOverride, pingOverride)
 		saved = normalizeDiscordWebhookUrl(saved)
 		if saved ~= '' then
 			Hive._tributeWebhookUrl = saved
+		elseif type(Hive._tributeWebhookUrl) == 'string' then
+			Hive._tributeWebhookUrl = normalizeDiscordWebhookUrl(Hive._tributeWebhookUrl)
 		end
 	end
-	if type(pingOverride) == 'string' then
+	if pingOverride ~= '' then
 		Hive._tributePing = pingOverride:gsub('%D', '')
 	end
 	local url = normalizeDiscordWebhookUrl(Hive._tributeWebhookUrl)

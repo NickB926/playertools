@@ -40,14 +40,32 @@ local AUTO_BLOCK_WAIT = 60
 local ACTION_DELAY = 0.5
 local F1_PLACE = 542351431
 local F11_PLACE = 5287433115
-local OWN_ALT_NAMES = {
-	nickb928 = true,
-	nickb925 = true,
-	nickb926 = true,
-	nickb910 = true,
-	nickb929 = true,
-	dyildolover = true,
-	['62qx'] = true,
+-- Fallback UserIds if PlayerTools SB2IsOwnAlt isn't loaded. Names are not used.
+local OWN_ALT_USERIDS = {
+	[105008790] = true, -- NickB926
+	[58534583] = true, -- NickB925
+	[5629930206] = true, -- NickB910
+	[2948744565] = true, -- NickB929
+	[2567665744] = true, -- NickB928
+	[1781632332] = true, -- dyildolover
+	[475975042] = true, -- Pyrixl
+	[5512085079] = true, -- 4maug
+	[3851863758] = true, -- iSweatBadges
+	[4212822041] = true, -- marriel_lee
+	[7519173184] = true, -- TworzTheAncientTree
+	[5667361490] = true, -- TworzLeAncientTree
+	[8026129747] = true, -- SimplyPeek
+	[9461039114] = true, -- SimpIyLeek
+	[9665540384] = true, -- SFlTST
+	[9687273225] = true, -- xKilluaXx124
+	[571865792] = true, -- XxBluepok
+	[11416094898] = true, -- Da_TheDemeanor
+	[11416160497] = true, -- Ra_TheEnlightener
+	[11416154884] = true, -- Ka_TheMischief
+	[11416179129] = true, -- Z4_TheEldest
+	[11416183253] = true, -- Wa_TheCurious
+	[11025682106] = true, -- SB2ButOnlyTrading
+	[285463210] = true, -- 62qx
 }
 local function isOwnAlt(plr)
 	if type(getgenv().SB2IsOwnAlt) == 'function' and plr then
@@ -59,9 +77,21 @@ local function isOwnAlt(plr)
 	if not plr then
 		return false
 	end
+	local uid = tonumber(plr.UserId)
+	if uid and OWN_ALT_USERIDS[uid] then
+		return true
+	end
+	local extras = rawget(getgenv(), 'SB2OwnAltUserIds')
+	if uid and type(extras) == 'table' and extras[uid] == true then
+		return true
+	end
 	local name = string.lower(tostring(plr.Name or ''))
-	local display = string.lower(tostring(plr.DisplayName or ''))
-	return OWN_ALT_NAMES[name] == true or OWN_ALT_NAMES[display] == true
+	local stubId = name:match('^roblox_user_(%d+)$')
+	local stubUid = stubId and tonumber(stubId)
+	if stubUid and (OWN_ALT_USERIDS[stubUid] or (type(extras) == 'table' and extras[stubUid] == true)) then
+		return true
+	end
+	return false
 end
 
 -- Stop previous instance cleanly.

@@ -2,7 +2,7 @@
     CCI.iy (ClearCharItems) — Infinite Yield plugin
     - Waits 10s after plugin load before heavy start (lets map/stream settle)
     - Deletes children of every folder under workspace.CharacterItems
-      except YOUR folder (LocalPlayer.UserId) and optionally 105008790 (NickB926)
+      except YOUR folder (LocalPlayer.UserId) — your weapons stay visible
     - Clears workspace.ActiveBats (visual bats) as they spawn
     - Clears workspace.HitEffects (damage particles)
     - Clears workspace.MobSpawnEffects (mob spawn VFX)
@@ -10,19 +10,19 @@
     - Clears workspace.Lava (Meteor Strike pools)
     - Clears mob death VFX (KillFade suppress + HighlightModel soft-strip; never ResetEffect)
     - Does NOT wipe ResetEffect (needed for player death/respawn)
-    - Clears ParticleEmitters under workspace (skips ResetEffect / Characters / your CharacterItems)
+    - Clears ParticleEmitters under workspace (skips ResetEffect / Characters; your CharacterItems get Beam/Trail/Particle strip only)
     - Hides "Vel Obtained" chat lines (ChatVelTemplate)
     - Removes AnimationController from mobs under workspace.Mobs only
-      (no per-frame Motor6D freeze; CharacterItems keep folders untouched except BladeTrail)
+      (no per-frame Motor6D freeze; kept CharacterItems stay visible but VFX junk is stripped)
     - Deletes all Accessories under workspace.Characters (hair/hats/wings/etc.)
-      except LocalPlayer + EXTRA_KEEP (NickB926)
+      except LocalPlayer (optional EXTRA_KEEP UserIds if you want other players' gear visible)
     - Deletes workspace.OptimizedGame.Wind (and keeps clearing if it respawns)
     - Perf mode: low graphics + mute lights under VFX folders only (never Destroy map/world lights)
     - Sets Roblox volume to 1 bar (all volume sliders) and mouse sensitivity to 0.2 (locked)
     - MAP-SAFE: never Destroy workspace roots outside HitEffects/ActiveBats/MobSpawnEffects/ShadowClones/Lava
     - Menu click relay so HUD.Menu / MenuButton still open inventory if GuiButton hits fail
     - Sets exposure / maxzoom / Invisicam / mouse sens once after the 10s delay; destroys Lighting.MenuBlur once (no blur pin)
-    - Strips BladeTrail under your + NickB926 CharacterItems RightWeapon.Tool.Blade
+    - Strips Beams / Trails / ParticleEmitters / BladeTrail under kept CharacterItems (weapon mesh stays)
     - Runs IY loop fullbright (loopfb) after the 10s delay
     - Runs CCI antilag once after the 10s delay (one budgeted map strip; keeps icons; no stream catch-up)
     - Enables 2022 materials only via command (antilag keeps them off for flatter map)
@@ -33,8 +33,10 @@
     Commands: setexposure [value] | maxzoom [num|off] | sensitivity [num|off] | cci | ccioff | clearbats | clearhits | clearmobfx | clearclones | clearlava | clearvel | clearanims | cleardeath | clearparticles | perfmode | openinv | fixmouse | clearblur | 2022materials | un2022materials | autohideiyon | autohideiyoff | antilag
 ]]
 
+-- Optional: UserIds whose CharacterItems + Character hats stay visible on THIS client.
+-- Empty = wipe everyone else's weapons/hats (same as alts). LocalPlayer is always kept.
 local EXTRA_KEEP = {
-	['105008790'] = true, -- NickB926
+	-- ['105008790'] = true, -- NickB926 (uncomment to keep his weapons visible on alts again)
 }
 
 local DEFAULT_EXPOSURE = -1.5
@@ -1556,33 +1558,90 @@ local function bindParticles()
 
 	if particleConn then
 		pcall(function()
-			particleConn:Disconnect()
+			if typeof(particleConn) == 'RBXScriptConnection' then
+				particleConn:Disconnect()
+			end
 		end)
 		particleConn = nil
 	end
-	particleConn = workspace.DescendantAdded:Connect(function(desc)
-		if not particlesEnabled or not enabled then
+	-- Folder-scoped only — workspace.DescendantAdded for every ParticleEmitter was a hitch factory.
+	local particleFolderConns = getgenv().SB2ClearParticleFolderConns
+	if type(particleFolderConns) == 'table' then
+		for _, c in ipairs(particleFolderConns) do
+			pcall(function()
+				if typeof(c) == 'RBXScriptConnection' then
+					c:Disconnect()
+				end
+			end)
+		end
+	end
+	particleFolderConns = {}
+	local function hookParticleFolder(folder)
+		if not folder then
 			return
 		end
-		if not desc:IsA('ParticleEmitter') then
-			return
-		end
-		if isParticleProtected(desc) then
-			return
-		end
-		destroyParticleEmitter(desc)
-	end)
-	rootConns[#rootConns + 1] = particleConn
+		local c = folder.DescendantAdded:Connect(function(desc)
+			if not particlesEnabled or not enabled then
+				return
+			end
+			if not desc:IsA('ParticleEmitter') then
+				return
+			end
+			if isParticleProtected(desc) then
+				return
+			end
+			destroyParticleEmitter(desc)
+		end)
+		particleFolderConns[#particleFolderConns + 1] = c
+		rootConns[#rootConns + 1] = c
+	end
+	for _, name in ipairs(PARTICLE_WIPE_FOLDERS) do
+		hookParticleFolder(workspace:FindFirstChild(name))
+	end
+	do
+		local addConn = workspace.ChildAdded:Connect(function(ch)
+			if not particlesEnabled or not enabled then
+				return
+			end
+			for _, name in ipairs(PARTICLE_WIPE_FOLDERS) do
+				if ch.Name == name then
+					hookParticleFolder(ch)
+					break
+				end
+			end
+		end)
+		particleFolderConns[#particleFolderConns + 1] = addConn
+		rootConns[#rootConns + 1] = addConn
+	end
+	getgenv().SB2ClearParticleFolderConns = particleFolderConns
+	particleConn = true -- marker: particle hooks live
 
 	if particleSweepThread then
 		pcall(task.cancel, particleSweepThread)
 		particleSweepThread = nil
 	end
 	particleSweepThread = task.spawn(function()
+		-- DescendantAdded already catches new emitters. Periodic full-folder wipe was
+		-- hitching mains every ~10s when HitEffects/ActiveBats were fat.
 		while particlesEnabled and enabled do
-			task.wait(10)
+			task.wait(45)
 			if particlesEnabled and enabled then
-				wipeParticleEmitters()
+				local n = 0
+				for _, name in ipairs(PARTICLE_WIPE_FOLDERS) do
+					local folder = workspace:FindFirstChild(name)
+					if folder then
+						for _, d in ipairs(folder:GetDescendants()) do
+							if d:IsA('ParticleEmitter') and not isParticleProtected(d) then
+								destroyParticleEmitter(d)
+								n += 1
+								if n % 40 == 0 then
+									task.wait()
+								end
+							end
+						end
+					end
+					task.wait()
+				end
 			end
 		end
 	end)
@@ -1905,59 +1964,85 @@ local function wipeChildren(folder)
 	end
 end
 
--- Keep folders (you + NickB926): still strip RightWeapon.Tool.Blade.BladeTrail.
-local function isRightWeaponBladeTrail(inst)
-	if not inst or inst.Name ~= 'BladeTrail' then
+-- Keep folders (you + EXTRA_KEEP): strip weapon VFX junk, leave mesh/Handle visible.
+local function isWeaponVfxJunk(inst)
+	if not inst then
 		return false
 	end
-	local blade = inst.Parent
-	if not blade or blade.Name ~= 'Blade' then
-		return false
-	end
-	local tool = blade.Parent
-	if not tool or tool.Name ~= 'Tool' then
-		return false
-	end
-	local rw = tool.Parent
-	return rw ~= nil and rw.Name == 'RightWeapon'
-end
-
-local function destroyBladeTrail(inst)
-	if isRightWeaponBladeTrail(inst) then
-		pcall(function()
-			inst:Destroy()
-		end)
+	if inst.Name == 'BladeTrail' then
 		return true
 	end
-	return false
+	return inst:IsA('ParticleEmitter')
+		or inst:IsA('Trail')
+		or inst:IsA('Beam')
+		or inst:IsA('Fire')
+		or inst:IsA('Smoke')
+		or inst:IsA('Sparkles')
 end
 
-local function wipeBladeTrailsInKeepFolder(folder)
-	if not folder then
-		return
+local function destroyWeaponVfxJunk(inst)
+	if not isWeaponVfxJunk(inst) then
+		return false
 	end
-	local rw = folder:FindFirstChild('RightWeapon')
-	local tool = rw and rw:FindFirstChild('Tool')
-	local blade = tool and tool:FindFirstChild('Blade')
-	if blade then
-		local trail = blade:FindFirstChild('BladeTrail')
-		if trail then
-			pcall(function()
-				trail:Destroy()
-			end)
+	-- Separate pcalls: Enabled/Destroy can fail independently on replicated gear.
+	pcall(function()
+		if inst:IsA('ParticleEmitter') then
+			inst.Enabled = false
+			inst.Rate = 0
+			if inst.Clear then
+				inst:Clear()
+			end
+		elseif inst:IsA('Trail') or inst:IsA('Beam') or inst:IsA('Fire') or inst:IsA('Smoke') or inst:IsA('Sparkles') then
+			inst.Enabled = false
 		end
-		for _, d in ipairs(blade:GetDescendants()) do
-			if d.Name == 'BladeTrail' then
-				pcall(function()
-					d:Destroy()
-				end)
+	end)
+	pcall(function()
+		if inst:IsA('Beam') then
+			inst.Attachment0 = nil
+			inst.Attachment1 = nil
+			inst.Width0 = 0
+			inst.Width1 = 0
+		end
+	end)
+	pcall(function()
+		inst:Destroy()
+	end)
+	if inst.Parent then
+		pcall(function()
+			inst.Parent = nil
+		end)
+	end
+	return true
+end
+
+local function wipeWeaponVfxInKeepFolder(folder)
+	if not folder then
+		return 0
+	end
+	local n = 0
+	-- Snapshot twice: nested FX under Attachments can appear mid-pass on equip.
+	for _ = 1, 2 do
+		for _, d in ipairs(folder:GetDescendants()) do
+			if destroyWeaponVfxJunk(d) then
+				n = n + 1
 			end
 		end
-		return
 	end
-	for _, d in ipairs(folder:GetDescendants()) do
-		destroyBladeTrail(d)
+	return n
+end
+
+local function wipeAllKeepWeaponVfx()
+	local items = workspace:FindFirstChild('CharacterItems')
+	if not items then
+		return 0
 	end
+	local n = 0
+	for _, folder in ipairs(items:GetChildren()) do
+		if shouldKeepFolder(folder) then
+			n = n + wipeWeaponVfxInKeepFolder(folder)
+		end
+	end
+	return n
 end
 
 local function untrackBladeTrails(folder)
@@ -1977,16 +2062,22 @@ local function trackKeepBladeTrails(folder)
 	if not shouldKeepFolder(folder) then
 		return
 	end
-	wipeBladeTrailsInKeepFolder(folder)
-	if bladeTrailTracked[folder] then
-		return
-	end
+	wipeWeaponVfxInKeepFolder(folder)
+	-- Always refresh the DescendantAdded hook so reloads pick up new strip logic.
+	untrackBladeTrails(folder)
 	bladeTrailTracked[folder] = folder.DescendantAdded:Connect(function(desc)
 		task.defer(function()
 			if not enabled then
 				return
 			end
-			destroyBladeTrail(desc)
+			destroyWeaponVfxJunk(desc)
+			-- Parent may still be building; one more deferred pass catches late children.
+			task.defer(function()
+				if not enabled or not folder.Parent then
+					return
+				end
+				wipeWeaponVfxInKeepFolder(folder)
+			end)
 		end)
 	end)
 	folder.Destroying:Once(function()
@@ -2013,7 +2104,7 @@ local function trackFolder(folder)
 		return
 	end
 
-	-- Kept folders (you + NickB926): wipe BladeTrail only, leave weapons/items.
+	-- Kept folders (you + EXTRA_KEEP): wipe Beams/Particles/Trails, leave weapons/items.
 	if shouldKeepFolder(folder) then
 		trackKeepBladeTrails(folder)
 		return
@@ -2085,7 +2176,7 @@ local function destroyHatAccessory(inst)
 	return false
 end
 
--- Same keep set as CharacterItems: you + EXTRA_KEEP (NickB926).
+-- Same keep set as CharacterItems: you + EXTRA_KEEP (optional UserIds).
 local function shouldKeepCharacterHats(model)
 	if not model then
 		return true
@@ -2396,12 +2487,16 @@ local function startSweep()
 					if folder then
 						local kids = folder:GetChildren()
 						if #kids > 0 then
-							for _, child in ipairs(kids) do
+							for i, child in ipairs(kids) do
 								nukeEffectInstance(child)
+								if i % 25 == 0 then
+									task.wait()
+								end
 							end
 						end
 					end
 				end
+				task.wait()
 			end
 			if deathFxEnabled then
 				for _, child in ipairs(workspace:GetChildren()) do
@@ -2420,7 +2515,7 @@ local function startSweep()
 			if mobAnimEnabled then
 				local mobs = workspace:FindFirstChild('Mobs')
 				if mobs then
-					for _, mob in ipairs(mobs:GetChildren()) do
+					for i, mob in ipairs(mobs:GetChildren()) do
 						if not isPlayerProtected(mob) then
 							-- Direct children only — no per-frame GetDescendants / Motor6D freeze.
 							for _, child in ipairs(mob:GetChildren()) do
@@ -2435,6 +2530,9 @@ local function startSweep()
 								end
 							end
 						end
+						if i % 20 == 0 then
+							task.wait()
+						end
 					end
 				end
 			end
@@ -2448,7 +2546,8 @@ local function startSweep()
 					wipeVelTemplates(scroll)
 				end
 			end
-			task.wait(5)
+			-- Was 5s — felt like a hitch every few seconds on busy floors. Spread work + wait longer.
+			task.wait(12)
 		end
 	end)
 	getgenv().SB2ClearSweepThread = thread
@@ -2997,7 +3096,7 @@ local function startCciRuntime()
 		list[#list + 1] = id
 	end
 	table.sort(list)
-	say(('active — keep %s | exposure %s | maxzoom %s | invisicam | sensitivity %s | loopfb | antilag | no2022mats | autohideiy | BladeTrail strip | Character hats | one-shot pins | VFX + Vel + mob anims + death FX (ResetEffect protected)'):format(
+	say(('active — keep %s | exposure %s | maxzoom %s | invisicam | sensitivity %s | loopfb | antilag | no2022mats | autohideiy | weapon VFX strip | Character hats | one-shot pins | VFX + Vel + mob anims + death FX (ResetEffect protected)'):format(
 		table.concat(list, ', '),
 		tostring(DEFAULT_EXPOSURE),
 		tostring(DEFAULT_MAX_ZOOM),
@@ -3035,8 +3134,13 @@ local Plugin = {
 				if root then
 					getgenv().SB2ClearCharItemsBound = nil
 					charItemsHooked = nil
+					for folder in pairs(bladeTrailTracked) do
+						untrackBladeTrails(folder)
+					end
 					bindCharacterItems(root)
 					scanCharacterItems(root)
+					local stripped = wipeAllKeepWeaponVfx()
+					say(('weapon VFX stripped %s'):format(tostring(stripped)))
 				else
 					say('CharacterItems missing')
 				end
@@ -3201,9 +3305,22 @@ local Plugin = {
 				end
 				if particleConn then
 					pcall(function()
-						particleConn:Disconnect()
+						if typeof(particleConn) == 'RBXScriptConnection' then
+							particleConn:Disconnect()
+						end
 					end)
 					particleConn = nil
+				end
+				local folderConns = getgenv().SB2ClearParticleFolderConns
+				if type(folderConns) == 'table' then
+					for _, c in ipairs(folderConns) do
+						pcall(function()
+							if typeof(c) == 'RBXScriptConnection' then
+								c:Disconnect()
+							end
+						end)
+					end
+					getgenv().SB2ClearParticleFolderConns = nil
 				end
 				local ok, wiped = bindParticles()
 				if ok then

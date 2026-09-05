@@ -63,22 +63,16 @@ local function corner(parent, r)
 	return c
 end
 
-local function hairline(parent, radius)
-	local border = Instance.new('Frame')
-	border.Name = 'Hairline'
-	border.BackgroundTransparency = 1
-	border.Size = UDim2.fromScale(1, 1)
-	border.BorderSizePixel = 0
-	border.Active = false
-	border.ZIndex = (parent.ZIndex or 1) + 1
-	border.Parent = parent
-	corner(border, radius or 4)
+local function hairline(parent, _radius)
+	-- Stroke on the control itself. A full-size overlay Frame (old Hairline) sits above
+	-- children under ZIndexBehavior.Sibling and eats dropdown/option clicks.
 	local s = Instance.new('UIStroke')
+	s.Name = 'HairlineStroke'
 	s.Color = C.line
 	s.Thickness = 1
 	s.Transparency = 0.15
 	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	s.Parent = border
+	s.Parent = parent
 	return s
 end
 
@@ -137,24 +131,121 @@ function Library:PlayTabAnimation() end
 
 function Library:Notify(text, duration)
 	duration = tonumber(duration) or 5
-	local holder = self._toasts
+	-- Own ScreenGui: the in-window toast holder is 40px and clips multiline text.
+	local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass('PlayerGui')
+	if not pg then
+		warn('[Ataraxia] ' .. tostring(text))
+		return
+	end
+	local gui = pg:FindFirstChild('SB2Toasts')
+	if not (typeof(gui) == 'Instance' and gui:IsA('ScreenGui')) then
+		gui = Instance.new('ScreenGui')
+		gui.Name = 'SB2Toasts'
+		gui.ResetOnSpawn = false
+		gui.IgnoreGuiInset = true
+		gui.DisplayOrder = 100000
+		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		if type(protectgui) == 'function' then
+			pcall(protectgui, gui)
+		end
+		gui.Parent = pg
+		local holder = Instance.new('Frame')
+		holder.Name = 'Holder'
+		holder.BackgroundTransparency = 1
+		holder.ClipsDescendants = false
+		holder.Size = UDim2.fromOffset(380, 700)
+		holder.Position = UDim2.new(1, -396, 0, 16)
+		holder.Parent = gui
+	end
+	local holder = gui:FindFirstChild('Holder')
 	if not holder then
 		warn('[Ataraxia] ' .. tostring(text))
 		return
 	end
+	holder.Position = UDim2.new(1, -396, 0, 16)
+	for _, ch in ipairs(holder:GetChildren()) do
+		if ch:IsA('GuiObject') then
+			ch:Destroy()
+		end
+	end
+	local body = tostring(text):gsub('\r\n', '\n'):gsub('\r', '\n')
+	local rows = {}
+	local start = 1
+	while true do
+		local nl = string.find(body, '\n', start, true)
+		rows[#rows + 1] = string.sub(body, start, nl and (nl - 1) or #body)
+		if not nl then
+			break
+		end
+		start = nl + 1
+	end
+	if #rows == 0 then
+		rows[1] = body
+	end
+	local fontSize = 14
+	local lineH = 20
+	local barH = 4
 	local t = Instance.new('Frame')
-	t.Size = UDim2.new(1, 0, 0, 40)
+	t.Name = 'Toast'
+	t.Size = UDim2.new(1, 0, 0, 22 + #rows * lineH + barH)
 	t.BackgroundColor3 = C.bg2
 	t.BorderSizePixel = 0
+	t.ClipsDescendants = true
 	t.Parent = holder
-	corner(t, 4)
-	hairline(t, 4)
-	mkLabel(t, tostring(text), {
-		size = 12,
-		size2 = UDim2.new(1, -16, 1, 0),
-		pos = UDim2.fromOffset(8, 0),
-		wrap = true,
-	})
+	corner(t, 6)
+	local outline = Instance.new('UIStroke')
+	outline.Name = 'ToastOutline'
+	outline.Color = Color3.fromRGB(255, 255, 255)
+	outline.Thickness = 1
+	outline.Transparency = 0
+	outline.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	outline.Parent = t
+	for i, row in ipairs(rows) do
+		local l = mkLabel(t, row, {
+			size = fontSize,
+			size2 = UDim2.new(1, -24, 0, lineH),
+			pos = UDim2.fromOffset(12, 10 + (i - 1) * lineH),
+			wrap = false,
+			y = Enum.TextYAlignment.Center,
+		})
+		l.ZIndex = (t.ZIndex or 1) + 1
+	end
+	local track = Instance.new('Frame')
+	track.Name = 'TimeTrack'
+	track.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+	track.BorderSizePixel = 0
+	track.Size = UDim2.new(1, -16, 0, barH)
+	track.Position = UDim2.new(0, 8, 1, -(barH + 6))
+	track.ZIndex = (t.ZIndex or 1) + 1
+	track.Parent = t
+	corner(track, 2)
+	local fill = Instance.new('Frame')
+	fill.Name = 'TimeFill'
+	fill.BackgroundColor3 = Color3.new(1, 1, 1)
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.new(1, 0, 1, 0)
+	fill.Parent = track
+	corner(fill, 2)
+	TweenService:Create(fill, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+		Size = UDim2.new(0, 0, 1, 0),
+	}):Play()
+	local flash = Instance.new('Frame')
+	flash.Name = 'Flash'
+	flash.BackgroundColor3 = Color3.new(1, 1, 1)
+	flash.BackgroundTransparency = 0.45
+	flash.BorderSizePixel = 0
+	flash.Size = UDim2.new(1, 0, 1, 0)
+	flash.ZIndex = (t.ZIndex or 1) + 8
+	flash.Parent = t
+	corner(flash, 6)
+	TweenService:Create(flash, TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 1,
+	}):Play()
+	task.delay(0.3, function()
+		if flash.Parent then
+			flash:Destroy()
+		end
+	end)
 	task.delay(duration, function()
 		if t.Parent then
 			t:Destroy()
@@ -704,9 +795,10 @@ local function addDropdown(box, idx, opts)
 	listFrame.ScrollBarThickness = 5
 	listFrame.ScrollBarImageColor3 = C.muted
 	listFrame.ScrollingDirection = Enum.ScrollingDirection.Y
-	listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	-- Manual CanvasSize in rebuild — AutomaticCanvasSize + scale-width rows collapsed to blank.
+	listFrame.AutomaticCanvasSize = Enum.AutomaticSize.None
 	listFrame.CanvasSize = UDim2.fromOffset(0, 0)
-	listFrame.ZIndex = 500
+	listFrame.ZIndex = 2000
 	listFrame.ClipsDescendants = true
 	listFrame.Active = true
 	listFrame.Parent = Library.ScreenGui or wrap
@@ -726,7 +818,8 @@ local function addDropdown(box, idx, opts)
 	local searchBox
 	if opts.Searchable then
 		searchBox = Instance.new('TextBox')
-		searchBox.Size = UDim2.new(1, 0, 0, 26)
+		-- Offset width — scale-X inside AutomaticCanvasSize ScrollingFrame collapses to 0.
+		searchBox.Size = UDim2.fromOffset(180, 26)
 		searchBox.BackgroundColor3 = C.bg0
 		searchBox.TextColor3 = C.text
 		searchBox.PlaceholderText = 'Filter...'
@@ -736,7 +829,8 @@ local function addDropdown(box, idx, opts)
 		searchBox.TextSize = 13
 		searchBox.ClearTextOnFocus = false
 		searchBox.BorderSizePixel = 0
-		searchBox.ZIndex = 501
+		searchBox.ZIndex = 2010
+		searchBox.LayoutOrder = 0
 		searchBox.Parent = listFrame
 		corner(searchBox, 3)
 		local sp = Instance.new('UIPadding')
@@ -789,7 +883,13 @@ local function addDropdown(box, idx, opts)
 		local fp = field.AbsolutePosition
 		local fs = field.AbsoluteSize
 		-- ScreenGui uses IgnoreGuiInset; AbsolutePosition is already screen-space.
-		local maxH = math.min(220, 26 * math.min(10, math.max(1, #obj.Values)) + (searchBox and 34 or 10))
+		local nVals = 0
+		if type(obj.Values) == 'table' then
+			for _ in ipairs(obj.Values) do
+				nVals += 1
+			end
+		end
+		local maxH = math.min(220, 26 * math.min(10, math.max(1, nVals)) + (searchBox and 34 or 10))
 		local width = math.max(fs.X, 180)
 		local x = fp.X
 		local y = fp.Y + fs.Y + 4
@@ -801,6 +901,16 @@ local function addDropdown(box, idx, opts)
 		end
 		listFrame.Size = UDim2.fromOffset(width, maxH)
 		listFrame.Position = UDim2.fromOffset(x, y)
+		-- Keep filter/rows at offset width so they never collapse to 0.
+		local innerW = math.max(width - 12, 160)
+		if searchBox then
+			searchBox.Size = UDim2.fromOffset(innerW, 26)
+		end
+		for _, ch in ipairs(listFrame:GetChildren()) do
+			if ch:IsA('TextButton') then
+				ch.Size = UDim2.fromOffset(innerW, 26)
+			end
+		end
 	end
 
 	local function closePopup()
@@ -812,100 +922,118 @@ local function addDropdown(box, idx, opts)
 		obj:Display()
 	end
 
-	local function rebuild()
+	local function syncCanvas()
+		local contentH = listLay.AbsoluteContentSize.Y
+		if contentH < 8 then
+			contentH = 0
+			for _, ch in ipairs(listFrame:GetChildren()) do
+				if ch:IsA('GuiObject') and not ch:IsA('UIListLayout') and not ch:IsA('UIPadding') then
+					contentH += math.max(ch.AbsoluteSize.Y, 26) + 2
+				end
+			end
+			contentH += 8
+		end
+		listFrame.CanvasSize = UDim2.fromOffset(0, math.max(contentH, 1))
+		listFrame.CanvasPosition = Vector2.zero
+		listFrame.ScrollBarThickness = contentH > (listFrame.AbsoluteSize.Y + 2) and 5 or 0
+	end
+
+	local rebuild
+	local function makeRow(name, raw, order, innerW)
+		local item = Instance.new('TextButton')
+		item.Size = UDim2.fromOffset(innerW, 26)
+		item.BackgroundColor3 = C.bg2
+		item.BackgroundTransparency = 0
+		item.TextColor3 = C.text
+		item.Font = Enum.Font.SourceSans
+		item.TextSize = 14
+		item.TextXAlignment = Enum.TextXAlignment.Left
+		item.AutoButtonColor = true
+		item.BorderSizePixel = 0
+		item.Text = '  ' .. name
+		item.ZIndex = 2010
+		item.Active = true
+		item.LayoutOrder = order
+		item.Parent = listFrame
+		corner(item, 3)
+		local selected = multi and type(obj.Value) == 'table' and obj.Value[name] or obj.Value == name or obj.Value == raw
+		if selected then
+			item.BackgroundColor3 = C.bg3
+			item.Font = Enum.Font.SourceSansBold
+			item.Text = '  ✓ ' .. name
+		end
+		item.MouseButton1Click:Connect(function()
+			if multi then
+				if type(obj.Value) ~= 'table' then
+					obj.Value = {}
+				end
+				if obj.Value[name] then
+					obj.Value[name] = nil
+				else
+					obj.Value[name] = true
+				end
+				obj:Display()
+				rebuild()
+				fireChanged(obj, obj.Value)
+			else
+				obj.Value = raw
+				obj:Display()
+				closePopup()
+				fireChanged(obj, obj.Value)
+			end
+		end)
+		return item
+	end
+
+	rebuild = function()
 		for _, ch in ipairs(listFrame:GetChildren()) do
-			if ch:IsA('TextButton') then
+			if ch:IsA('TextButton') or (ch:IsA('TextLabel') and ch.Name == 'EmptyHint') then
 				ch:Destroy()
 			end
 		end
 		local filter = searchBox and string.lower(searchBox.Text or '') or ''
+		local width = math.max(listFrame.AbsoluteSize.X, field.AbsoluteSize.X, 180)
+		local innerW = math.max(width - 12, 160)
+		if searchBox then
+			searchBox.Size = UDim2.fromOffset(innerW, 26)
+		end
 		local count = 0
+		local order = 1
 		for _, raw in ipairs(obj.Values) do
 			local name = tostring(raw)
 			if filter == '' or string.find(string.lower(name), filter, 1, true) then
 				count += 1
-				local item = Instance.new('TextButton')
-				item.Size = UDim2.new(1, 0, 0, 26)
-				item.BackgroundColor3 = C.bg2
-				item.TextColor3 = C.text
-				item.Font = Enum.Font.SourceSans
-				item.TextSize = 14
-				item.TextXAlignment = Enum.TextXAlignment.Left
-				item.AutoButtonColor = true
-				item.BorderSizePixel = 0
-				item.Text = '  ' .. name
-				item.ZIndex = 501
-				item.Active = true
-				item.Parent = listFrame
-				corner(item, 3)
-				local selected = multi and type(obj.Value) == 'table' and obj.Value[name] or obj.Value == name or obj.Value == raw
-				if selected then
-					item.BackgroundColor3 = C.bg3
-					item.Font = Enum.Font.SourceSansBold
-					item.Text = '  ✓ ' .. name
-				end
-				item.MouseButton1Click:Connect(function()
-					if multi then
-						if type(obj.Value) ~= 'table' then
-							obj.Value = {}
-						end
-						if obj.Value[name] then
-							obj.Value[name] = nil
-						else
-							obj.Value[name] = true
-						end
-						obj:Display()
-						rebuild()
-						fireChanged(obj, obj.Value)
-					else
-						obj.Value = raw
-						obj:Display()
-						closePopup()
-						fireChanged(obj, obj.Value)
-					end
-				end)
+				order += 1
+				makeRow(name, raw, order, innerW)
 			end
 		end
-		listFrame.ScrollBarThickness = count > 6 and 5 or 0
 		-- Fallback if Values was stored as a map (Obsidian quirks).
 		if count == 0 and type(obj.Values) == 'table' then
 			for k, v in pairs(obj.Values) do
 				local name = type(k) == 'string' and k or (type(v) == 'string' and v or nil)
 				if name and (filter == '' or string.find(string.lower(name), filter, 1, true)) then
 					count += 1
-					local item = Instance.new('TextButton')
-					item.Size = UDim2.new(1, 0, 0, 26)
-					item.BackgroundColor3 = C.bg2
-					item.TextColor3 = C.text
-					item.Font = Enum.Font.SourceSans
-					item.TextSize = 14
-					item.TextXAlignment = Enum.TextXAlignment.Left
-					item.AutoButtonColor = true
-					item.BorderSizePixel = 0
-					item.Text = '  ' .. name
-					item.ZIndex = 501
-					item.Active = true
-					item.Parent = listFrame
-					corner(item, 3)
-					item.MouseButton1Click:Connect(function()
-						if multi then
-							if type(obj.Value) ~= 'table' then
-								obj.Value = {}
-							end
-							obj.Value[name] = not obj.Value[name] and true or nil
-							obj:Display()
-							rebuild()
-							fireChanged(obj, obj.Value)
-						else
-							obj.Value = name
-							obj:Display()
-							closePopup()
-							fireChanged(obj, obj.Value)
-						end
-					end)
+					order += 1
+					makeRow(name, name, order, innerW)
 				end
 			end
 		end
+		if count == 0 then
+			local empty = Instance.new('TextLabel')
+			empty.Name = 'EmptyHint'
+			empty.Size = UDim2.fromOffset(innerW, 26)
+			empty.BackgroundTransparency = 1
+			empty.TextColor3 = C.muted
+			empty.Font = Enum.Font.SourceSans
+			empty.TextSize = 13
+			empty.TextXAlignment = Enum.TextXAlignment.Left
+			empty.Text = filter ~= '' and '  No matches' or '  No options'
+			empty.ZIndex = 2010
+			empty.LayoutOrder = 1
+			empty.Parent = listFrame
+		end
+		syncCanvas()
+		task.defer(syncCanvas)
 	end
 
 	function obj:SetValues(list)
@@ -954,7 +1082,7 @@ local function addDropdown(box, idx, opts)
 		fireChanged(self, self.Value)
 	end
 
-	openBtn.MouseButton1Click:Connect(function()
+	local function toggleOpen()
 		local opening = not obj._open
 		if Library._openDropdown and Library._openDropdown ~= obj and type(Library._openDropdown) == 'table' then
 			pcall(function()
@@ -970,24 +1098,27 @@ local function addDropdown(box, idx, opts)
 		end
 		obj._open = opening
 		if obj._open then
+			-- Ignore click-away before Visible flips — same press must not instantly close.
+			obj._ignoreAwayUntil = os.clock() + 0.45
 			Library._openDropdown = obj
 			rebuild()
 			placePopup()
 			listFrame.Visible = true
-			obj._ignoreAwayUntil = os.clock() + 0.2
+			listFrame.ZIndex = 2000
 			obj:Display()
 		else
 			closePopup()
 		end
-	end)
+	end
+	openBtn.MouseButton1Click:Connect(toggleOpen)
 	if searchBox then
 		searchBox:GetPropertyChangedSignal('Text'):Connect(function()
 			rebuild()
 		end)
 	end
 
-	-- click-away closes (ignore the same click that opened)
-	track(UserInputService.InputBegan:Connect(function(input)
+	-- click-away on InputEnded (InputBegan races the open click on some clients)
+	track(UserInputService.InputEnded:Connect(function(input)
 		if not obj._open then
 			return
 		end
@@ -1250,7 +1381,9 @@ function Library:CreateWindow(info)
 	gui.ResetOnSpawn = false
 	gui.IgnoreGuiInset = true
 	gui.DisplayOrder = 99998
-	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	-- Global: nested controls (dropdown rows, open hit-target) must beat ancestor chrome.
+	-- Sibling left Main/Hairline overlays above option rows so menus looked dead.
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
 	if type(protectgui) == 'function' then
 		pcall(protectgui, gui)
 	end
@@ -1281,8 +1414,8 @@ function Library:CreateWindow(info)
 
 	local toastHolder = Instance.new('Frame')
 	toastHolder.BackgroundTransparency = 1
-	toastHolder.Size = UDim2.fromOffset(300, 220)
-	toastHolder.Position = UDim2.new(1, -316, 0, 16)
+	toastHolder.Size = UDim2.fromOffset(320, 420)
+	toastHolder.Position = UDim2.new(1, -336, 0, 16)
 	toastHolder.ZIndex = 100
 	toastHolder.Parent = gui
 	Instance.new('UIListLayout', toastHolder).Padding = UDim.new(0, 6)

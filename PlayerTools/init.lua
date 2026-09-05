@@ -1,43 +1,23 @@
 --[[
     PlayerTools folder entrypoint (Potassium one-folder layout).
     Tries folder-local paths first, then scripts-root paths.
+    Ataraxia chrome only — see launch.lua.
 ]]
 
 if getgenv().SB2PlayerTools == true
 	and getgenv().SB2PlayerToolsGui
 	and getgenv().SB2PlayerToolsGui.Parent
 then
-	local starRS = 0
-	if type(getgenv().SB2CountStarlightRenderStepped) == 'function' then
-		starRS = getgenv().SB2CountStarlightRenderStepped()
-	end
-	local leakThreshold = getgenv().SB2StarlightRSLeakThreshold or 35
-	if starRS > leakThreshold then
-		warn(('[PlayerTools] %d leaked Starlight hooks — full reload instead of refresh'):format(starRS))
-		if type(getgenv().SB2TeardownStarlightLeaks) == 'function' then
-			pcall(getgenv().SB2TeardownStarlightLeaks)
-		end
-	elseif type(getgenv().SB2RefreshPlayerTools) == 'function' then
-		if type(getgenv().SB2DisconnectStarlightLibHooks) == 'function' then
-			pcall(getgenv().SB2DisconnectStarlightLibHooks)
-		end
+	if type(getgenv().SB2RefreshPlayerTools) == 'function' then
 		return getgenv().SB2RefreshPlayerTools()
-	else
-		warn('[PlayerTools] already loaded — skipping duplicate execute')
-		return
 	end
+	warn('[PlayerTools] already loaded — skipping duplicate execute')
+	return
 end
 getgenv().SB2PlayerToolsInstance = nil
 
 local compile = loadstring or load
 assert(compile, '[PlayerTools] loadstring/load unavailable')
-
-local candidates = {
-	'PlayerTools.lua', -- when Potassium cwd is the PlayerTools folder
-	'PlayerTools/PlayerTools.lua', -- when cwd is scripts/
-	'init.lua',
-	'PlayerTools/init.lua',
-}
 
 local function tryRead(path)
 	if type(isfile) == 'function' then
@@ -56,7 +36,7 @@ local function tryRead(path)
 	return nil
 end
 
--- launch.lua picks the UI backend (Starlight, falling back to Obsidian).
+-- launch.lua loads Ataraxia chrome + feature app.
 for _, path in ipairs({ 'PlayerTools/launch.lua', 'launch.lua' }) do
 	local src = tryRead(path)
 	if src then
