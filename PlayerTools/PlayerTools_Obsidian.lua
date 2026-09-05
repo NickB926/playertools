@@ -1069,7 +1069,26 @@ local ok, err = pcall(function()
 		game.Loaded:Wait()
 	end
 
-	if game.GameId ~= 212154879 then
+	local SB2_GAME_ID = 212154879
+	-- Wave Defense is its own universe, not the main SB2 GameId.
+	local EXTRA_LAUNCH_PLACE_IDS = {
+		[121252145396212] = true, -- Wave Defense
+	}
+	local EXTRA_LAUNCH_GAME_IDS = {
+		[8460001097] = true, -- Wave Defense
+	}
+	local function isAllowedSb2Session()
+		local placeId = tonumber(game.PlaceId)
+		local gameId = tonumber(game.GameId)
+		if placeId and EXTRA_LAUNCH_PLACE_IDS[placeId] then
+			return true
+		end
+		if gameId and EXTRA_LAUNCH_GAME_IDS[gameId] then
+			return true
+		end
+		return gameId == SB2_GAME_ID
+	end
+	if not isAllowedSb2Session() then
 		getgenv()[CONFIG.GenvKey] = false
 		notify('Player Tools', 'Wrong game — need Swordburst 2')
 		return
@@ -1078,9 +1097,6 @@ local ok, err = pcall(function()
 	-- Launch allowlist = ReplicatedStorage.Database.Locations (dynamic: events/future floors
 	-- included automatically). Login hub is not a Locations playable place.
 	local LOGIN_PLACE_ID = 659222129
-	local EXTRA_LAUNCH_PLACE_IDS = {
-		[121252145396212] = true, -- Wave Defense
-	}
 	local function mergeExtraLaunchPlaces(ids)
 		ids = type(ids) == 'table' and ids or {}
 		for pid in pairs(EXTRA_LAUNCH_PLACE_IDS) do
