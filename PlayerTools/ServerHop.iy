@@ -8,7 +8,8 @@
       join F11
       join F1
       hop Hypersiddia
-      join 5287433115
+      join Wave Defense
+      join 121252145396212
       shlist / shgui     — toggle Join panel (DEX-style chip on load)
 ]]
 
@@ -63,6 +64,16 @@ local HARD_STORY_FLOORS = {
 	{ placeId = 2659143505, name = 'Transylvania', floor = 10 },
 	{ placeId = 5287433115, name = 'Hypersiddia', floor = 11 },
 	{ placeId = 6144637080, name = 'Sector - 235', floor = 12 },
+}
+
+-- Event / extra places that should always appear even if Database.Locations is stale.
+local EXTRA_PLACES = {
+	{
+		placeId = 121252145396212,
+		name = 'Wave Defense',
+		category = 'Event',
+		aliases = { 'wd', 'wave', 'wavedefense', 'wave defence' },
+	},
 }
 
 local HUB_NAMES = {
@@ -315,6 +326,47 @@ local function applyHardFloors()
 	rebuildCategories()
 end
 
+local function applyExtraPlaces()
+	for _, spec in ipairs(EXTRA_PLACES) do
+		local placeId = tonumber(spec.placeId)
+		if not placeId then
+			continue
+		end
+		catalog.placeIds[placeId] = true
+		local rec = nil
+		for _, existing in ipairs(catalog.all) do
+			if existing.placeId == placeId then
+				rec = existing
+				if spec.name and (not rec.name or rec.name == '' or string.match(tostring(rec.name), '^Place ')) then
+					rec.name = spec.name
+				end
+				if spec.category and (not rec.category or rec.category == '') then
+					rec.category = spec.category
+				end
+				break
+			end
+		end
+		if not rec then
+			rec = {
+				placeId = placeId,
+				name = spec.name or ('Place ' .. placeId),
+				category = spec.category or 'Event',
+				floor = nil,
+			}
+			catalog.all[#catalog.all + 1] = rec
+		end
+		addAlias(rec.name, rec)
+		addAlias(placeId, rec)
+		addAlias((tostring(rec.name):gsub('%W', '')), rec)
+		if type(spec.aliases) == 'table' then
+			for _, alias in ipairs(spec.aliases) do
+				addAlias(alias, rec)
+			end
+		end
+	end
+	rebuildCategories()
+end
+
 local function publishCatalog()
 	getgenv().SB2ServerHopCatalog = catalog
 	getgenv().SB2LocationsPlaceIds = catalog.placeIds
@@ -330,11 +382,18 @@ local function publishCatalog()
 		if #catalog.all == 0 then
 			loadLocations()
 			applyHardFloors()
+			applyExtraPlaces()
 			getgenv().SB2ServerHopCatalog = catalog
 			getgenv().SB2LocationsPlaceIds = catalog.placeIds
 		end
 		return catalog.placeIds[placeId] == true
 	end
+end
+
+local function finishCatalogLoad()
+	applyHardFloors()
+	applyExtraPlaces()
+	publishCatalog()
 end
 
 local function resolveTarget(raw)
@@ -405,15 +464,13 @@ end
 
 getgenv().SB2ServerHopBooted = true
 local okLoad, loadInfo = loadLocations()
-applyHardFloors()
-publishCatalog()
+finishCatalogLoad()
 getgenv().SB2ServerHopResolveTarget = resolveTarget
 getgenv().SB2EnsureServerHopCatalog = function()
 	if #catalog.all == 0 then
 		okLoad, loadInfo = loadLocations()
 	end
-	applyHardFloors()
-	publishCatalog()
+	finishCatalogLoad()
 	return catalog
 end
 if okLoad then
@@ -714,6 +771,7 @@ end
 
 local function fillFloorList(list)
 	applyHardFloors()
+	applyExtraPlaces()
 	for _, child in ipairs(list:GetChildren()) do
 		if not child:IsA('UIListLayout') and not child:IsA('UIPadding') then
 			child:Destroy()
@@ -772,8 +830,7 @@ local function fillFloorList(list)
 		Instance.new('UICorner', retry).CornerRadius = UDim.new(0, 6)
 		retry.MouseButton1Click:Connect(function()
 			okLoad, loadInfo = loadLocations()
-			applyHardFloors()
-			publishCatalog()
+			finishCatalogLoad()
 			fillFloorList(list)
 		end)
 		return
@@ -1085,8 +1142,7 @@ do
 		-- Fill floor list once DB is ready; chip already visible.
 		for _ = 1, 80 do
 			local loaded = select(1, loadLocations())
-			applyHardFloors()
-			publishCatalog()
+			finishCatalogLoad()
 			if loaded and (#catalog.floors > 0 or #catalog.all > 0) then
 				local gui = getgenv().SB2ServerHopGui
 				local list = gui and gui:FindFirstChild('Root') and gui.Root:FindFirstChild('List')
@@ -1097,8 +1153,7 @@ do
 			end
 			task.wait(0.15)
 		end
-		applyHardFloors()
-		publishCatalog()
+		finishCatalogLoad()
 		local gui = getgenv().SB2ServerHopGui
 		local list = gui and gui:FindFirstChild('Root') and gui.Root:FindFirstChild('List')
 		if list then
@@ -1120,6 +1175,7 @@ local Plugin = {
 					okLoad, loadInfo = loadLocations()
 				end
 				applyHardFloors()
+				applyExtraPlaces()
 				local raw = args and table.concat(args, ' ') or ''
 				local low = string.lower(raw)
 				if low == 'floors' or low == 'list' or low == 'gui' then

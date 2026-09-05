@@ -1078,15 +1078,29 @@ local ok, err = pcall(function()
 	-- Launch allowlist = ReplicatedStorage.Database.Locations (dynamic: events/future floors
 	-- included automatically). Login hub is not a Locations playable place.
 	local LOGIN_PLACE_ID = 659222129
+	local EXTRA_LAUNCH_PLACE_IDS = {
+		[121252145396212] = true, -- Wave Defense
+	}
+	local function mergeExtraLaunchPlaces(ids)
+		ids = type(ids) == 'table' and ids or {}
+		for pid in pairs(EXTRA_LAUNCH_PLACE_IDS) do
+			ids[pid] = true
+		end
+		return ids
+	end
 	local function refreshLocationsPlaceIds()
 		local ids = getgenv().SB2LocationsPlaceIds
 		if type(ids) == 'table' and next(ids) ~= nil then
+			ids = mergeExtraLaunchPlaces(ids)
+			getgenv().SB2LocationsPlaceIds = ids
 			return ids
 		end
 		if type(getgenv().SB2EnsureServerHopCatalog) == 'function' then
 			pcall(getgenv().SB2EnsureServerHopCatalog)
 			ids = getgenv().SB2LocationsPlaceIds
 			if type(ids) == 'table' and next(ids) ~= nil then
+				ids = mergeExtraLaunchPlaces(ids)
+				getgenv().SB2LocationsPlaceIds = ids
 				return ids
 			end
 		end
@@ -1113,6 +1127,7 @@ local ok, err = pcall(function()
 				end
 			end
 		end
+		ids = mergeExtraLaunchPlaces(ids)
 		getgenv().SB2LocationsPlaceIds = ids
 		return ids
 	end
@@ -14917,6 +14932,7 @@ local ok, err = pcall(function()
 				[2659143505] = 'F10 Transylvania',
 				[5287433115] = 'F11 Hypersiddia',
 				[6144637080] = 'F12 Sector - 235',
+				[121252145396212] = 'Wave Defense',
 			}
 			local function currentFloorLabel()
 				local pid = tonumber(game.PlaceId) or game.PlaceId
