@@ -265,8 +265,10 @@ local ok, err = pcall(function()
 	end
 
 	if game.GameId ~= 212154879
-		and tonumber(game.GameId) ~= 8460001097
-		and tonumber(game.PlaceId) ~= 121252145396212
+		and tostring(game.GameId) ~= '8460001097'
+		and string.format('%.0f', tonumber(game.GameId) or 0) ~= '8460001097'
+		and tostring(game.PlaceId) ~= '121252145396212'
+		and string.format('%.0f', tonumber(game.PlaceId) or 0) ~= '121252145396212'
 	then
 		getgenv()[CONFIG.GenvKey] = false
 		notify('Player Tools', 'Wrong game — need Swordburst 2')

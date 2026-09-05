@@ -1069,28 +1069,49 @@ local ok, err = pcall(function()
 		game.Loaded:Wait()
 	end
 
-	local SB2_GAME_ID = 212154879
-	-- Wave Defense is its own universe, not the main SB2 GameId.
+	local function idStr(v)
+		if v == nil then
+			return ''
+		end
+		if type(v) == 'number' then
+			return string.format('%.0f', v)
+		end
+		local n = tonumber((tostring(v):gsub('%s+', '')))
+		if n then
+			return string.format('%.0f', n)
+		end
+		return tostring(v)
+	end
+	local SB2_GAME_ID = '212154879'
+	-- Wave Defense is its own universe (GameId 8460001097), place 121252145396212.
 	local EXTRA_LAUNCH_PLACE_IDS = {
-		[121252145396212] = true, -- Wave Defense
+		['121252145396212'] = true,
 	}
 	local EXTRA_LAUNCH_GAME_IDS = {
-		[8460001097] = true, -- Wave Defense
+		[SB2_GAME_ID] = true,
+		['8460001097'] = true,
 	}
 	local function isAllowedSb2Session()
-		local placeId = tonumber(game.PlaceId)
-		local gameId = tonumber(game.GameId)
-		if placeId and EXTRA_LAUNCH_PLACE_IDS[placeId] then
+		local placeId = idStr(game.PlaceId)
+		local gameId = idStr(game.GameId)
+		if EXTRA_LAUNCH_PLACE_IDS[placeId] or EXTRA_LAUNCH_GAME_IDS[gameId] then
 			return true
 		end
-		if gameId and EXTRA_LAUNCH_GAME_IDS[gameId] then
+		local rs = game:GetService('ReplicatedStorage')
+		if rs:FindFirstChild('Database') or rs:FindFirstChild('Profiles') then
 			return true
 		end
-		return gameId == SB2_GAME_ID
+		return false
 	end
 	if not isAllowedSb2Session() then
 		getgenv()[CONFIG.GenvKey] = false
-		notify('Player Tools', 'Wrong game — need Swordburst 2')
+		local msg = ('Wrong game — PlaceId %s GameId %s (need SB2 / Wave Defense %s)'):format(
+			idStr(game.PlaceId),
+			idStr(game.GameId),
+			'121252145396212'
+		)
+		notify('Player Tools', msg)
+		warn('[PlayerTools] ' .. msg)
 		return
 	end
 
@@ -1101,6 +1122,10 @@ local ok, err = pcall(function()
 		ids = type(ids) == 'table' and ids or {}
 		for pid in pairs(EXTRA_LAUNCH_PLACE_IDS) do
 			ids[pid] = true
+			local n = tonumber(pid)
+			if n then
+				ids[n] = true
+			end
 		end
 		return ids
 	end

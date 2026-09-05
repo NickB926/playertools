@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.16",
-    "message":  "Ataraxia chrome: ship backend file + migrate friends off Obsidian",
+    "version":  "1.0.17",
+    "message":  "Allow Wave Defense place 121252145396212",
     "files":  [
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",

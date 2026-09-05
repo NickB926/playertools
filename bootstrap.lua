@@ -74,13 +74,24 @@ local Updater = fn()
 getgenv().SB2PlayerToolsUpdateBase = BASE
 
 local hasLaunch = type(isfile) == 'function' and isfile('PlayerTools/launch.lua')
+local function localHasWaveDefenseAllow()
+	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+		return false
+	end
+	if not isfile('PlayerTools/PlayerTools_Obsidian.lua') then
+		return false
+	end
+	local ok, body = pcall(readfile, 'PlayerTools/PlayerTools_Obsidian.lua')
+	return ok and type(body) == 'string' and body:find('121252145396212', 1, true) ~= nil
+end
 local info = Updater.check and Updater.check() or { ok = false }
-if info.ok and not info.needsUpdate and hasLaunch then
+local needWave = not localHasWaveDefenseAllow()
+if info.ok and not info.needsUpdate and hasLaunch and not needWave then
 	say(('Already on %s — skip download'):format(tostring(info.remoteVersion)))
 else
-	-- First install or new version: pull files. Never force same-version rewrite.
+	-- First install, new version, or missing Wave Defense allow (same-version publish used to skip).
 	local ok, detail = Updater.apply({
-		force = not hasLaunch,
+		force = not hasLaunch or needWave,
 		notify = say,
 		quietWarn = true,
 	})
