@@ -1,8 +1,8 @@
 --[[
     CCI.iy (ClearCharItems) — Infinite Yield plugin
     - Waits 10s after plugin load before heavy start (lets map/stream settle)
-    - Deletes children of every folder under workspace.CharacterItems
-      except YOUR folder (LocalPlayer.UserId) — your weapons stay visible
+    - Leaves CharacterItems weapons visible for everyone (does not Destroy other players' meshes)
+      — Beams / Trails / Particles / BladeTrail on those weapons are still stripped
     - Clears workspace.ActiveBats (visual bats) as they spawn
     - Clears workspace.HitEffects (damage particles)
     - Clears workspace.MobSpawnEffects (mob spawn VFX)
@@ -10,10 +10,10 @@
     - Clears workspace.Lava (Meteor Strike pools)
     - Clears mob death VFX (KillFade suppress + HighlightModel soft-strip; never ResetEffect)
     - Does NOT wipe ResetEffect (needed for player death/respawn)
-    - Clears ParticleEmitters under workspace (skips ResetEffect / Characters; your CharacterItems get Beam/Trail/Particle strip only)
+    - Clears ParticleEmitters under workspace (skips ResetEffect / Characters; all CharacterItems get Beam/Trail/Particle strip only)
     - Hides "Vel Obtained" chat lines (ChatVelTemplate)
     - Removes AnimationController from mobs under workspace.Mobs only
-      (no per-frame Motor6D freeze; kept CharacterItems stay visible but VFX junk is stripped)
+      (no per-frame Motor6D freeze; CharacterItems stay visible but VFX junk is stripped)
     - Deletes all Accessories under workspace.Characters (hair/hats/wings/etc.)
       except LocalPlayer (optional EXTRA_KEEP UserIds if you want other players' gear visible)
     - Deletes workspace.OptimizedGame.Wind (and keeps clearing if it respawns)
@@ -22,7 +22,7 @@
     - MAP-SAFE: never Destroy workspace roots outside HitEffects/ActiveBats/MobSpawnEffects/ShadowClones/Lava
     - Menu click relay so HUD.Menu / MenuButton still open inventory if GuiButton hits fail
     - Sets exposure / maxzoom / Invisicam / mouse sens once after the 10s delay; destroys Lighting.MenuBlur once (no blur pin)
-    - Strips Beams / Trails / ParticleEmitters / BladeTrail under kept CharacterItems (weapon mesh stays)
+    - Strips Beams / Trails / ParticleEmitters / BladeTrail under all CharacterItems (weapon mesh stays)
     - Runs IY loop fullbright (loopfb) after the 10s delay
     - Runs CCI antilag once after the 10s delay (one budgeted map strip; keeps icons; no stream catch-up)
     - Enables 2022 materials only via command (antilag keeps them off for flatter map)
@@ -33,8 +33,8 @@
     Commands: setexposure [value] | maxzoom [num|off] | sensitivity [num|off] | cci | ccioff | clearbats | clearhits | clearmobfx | clearclones | clearlava | clearvel | clearanims | cleardeath | clearparticles | perfmode | openinv | fixmouse | clearblur | 2022materials | un2022materials | autohideiyon | autohideiyoff | antilag
 ]]
 
--- Optional: UserIds whose CharacterItems + Character hats stay visible on THIS client.
--- Empty = wipe everyone else's weapons/hats (same as alts). LocalPlayer is always kept.
+-- Optional: UserIds whose Character hats stay visible on THIS client.
+-- Weapons stay for everyone (VFX stripped). LocalPlayer hats are always kept. Empty = strip everyone else's hats.
 local EXTRA_KEEP = {
 	-- ['105008790'] = true, -- NickB926 (uncomment to keep his weapons visible on alts again)
 }
@@ -95,7 +95,7 @@ local SAFE_WIPE_ROOT_NAMES = {
 	Lava = true,
 }
 
--- Roots CCI is allowed to touch (VFX wipe / CharacterItems clear / mob anim strip).
+-- Roots CCI is allowed to touch (VFX wipe / CharacterItems VFX strip / mob anim strip).
 -- Everything else under Workspace is treated as map and is untouchable.
 local CCI_MANAGED_ROOT_NAMES = {
 	ActiveBats = true,
@@ -1946,25 +1946,7 @@ local function rebindWipeFolder(target)
 	return true
 end
 
-local function wipeChildren(folder)
-	if not enabled or not folder or not folder.Parent then
-		return
-	end
-	if shouldKeepFolder(folder) then
-		return
-	end
-	local parent = folder.Parent
-	if not parent or parent.Name ~= 'CharacterItems' then
-		return
-	end
-	for _, child in ipairs(folder:GetChildren()) do
-		pcall(function()
-			child:Destroy()
-		end)
-	end
-end
-
--- Keep folders (you + EXTRA_KEEP): strip weapon VFX junk, leave mesh/Handle visible.
+-- All CharacterItems folders: strip weapon VFX junk, leave mesh/Handle visible.
 local function isWeaponVfxJunk(inst)
 	if not inst then
 		return false
@@ -2038,9 +2020,7 @@ local function wipeAllKeepWeaponVfx()
 	end
 	local n = 0
 	for _, folder in ipairs(items:GetChildren()) do
-		if shouldKeepFolder(folder) then
-			n = n + wipeWeaponVfxInKeepFolder(folder)
-		end
+		n = n + wipeWeaponVfxInKeepFolder(folder)
 	end
 	return n
 end
@@ -2057,9 +2037,6 @@ end
 
 local function trackKeepBladeTrails(folder)
 	if not enabled or not folder then
-		return
-	end
-	if not shouldKeepFolder(folder) then
 		return
 	end
 	wipeWeaponVfxInKeepFolder(folder)
@@ -2104,31 +2081,9 @@ local function trackFolder(folder)
 		return
 	end
 
-	-- Kept folders (you + EXTRA_KEEP): wipe Beams/Particles/Trails, leave weapons/items.
-	if shouldKeepFolder(folder) then
-		trackKeepBladeTrails(folder)
-		return
-	end
-
-	wipeChildren(folder)
-	tracked[folder] = folder.ChildAdded:Connect(function(child)
-		task.defer(function()
-			if not enabled then
-				return
-			end
-			if shouldKeepFolder(folder) then
-				return
-			end
-			if child and child.Parent == folder then
-				pcall(function()
-					child:Destroy()
-				end)
-			end
-		end)
-	end)
-	folder.Destroying:Once(function()
-		untrackFolder(folder)
-	end)
+	-- All CharacterItems: wipe Beams/Particles/Trails, leave weapon meshes.
+	-- Hats are still cleared on workspace.Characters (Accessories).
+	trackKeepBladeTrails(folder)
 end
 
 local function scanCharacterItems(root)
@@ -3124,7 +3079,7 @@ local Plugin = {
 	['Commands'] = {
 		['cci'] = {
 			['ListName'] = 'cci / clearcharitems',
-			['Description'] = 'Re-scan CharacterItems + Character hats + effect folders + Vel + mob anims + death FX (keeps your items; never ResetEffect)',
+			['Description'] = 'Re-scan CharacterItems VFX + Character hats + effect folders + Vel + mob anims + death FX (keeps weapons; never ResetEffect)',
 			['Aliases'] = { 'clearcharitems' },
 			['Function'] = function()
 				enabled = true

@@ -1114,6 +1114,8 @@ local ok, err = pcall(function()
 		warn('[PlayerTools] ' .. msg)
 		return
 	end
+	getgenv().SB2WaveDefensePlace = idStr(game.PlaceId) == '121252145396212'
+		or idStr(game.GameId) == '8460001097'
 
 	-- Launch allowlist = ReplicatedStorage.Database.Locations (dynamic: events/future floors
 	-- included automatically). Login hub is not a Locations playable place.
@@ -1847,12 +1849,9 @@ local ok, err = pcall(function()
 				return false
 			end
 			-- Summoned undead / map mobs — never janitor these.
-			if name ~= 'Bat' then
-				local hum = inst:FindFirstChildWhichIsA('Humanoid')
-					or inst:FindFirstChildWhichIsA('Humanoid', true)
-				if hum then
-					return false
-				end
+			-- Recursive Humanoid search on every ChildAdded hitch on kill FX.
+			if name ~= 'Bat' and inst:FindFirstChildWhichIsA('Humanoid') then
+				return false
 			end
 			if FX_NAME[name] then
 				return true
@@ -1869,14 +1868,17 @@ local ok, err = pcall(function()
 
 		local function debrisTtl(inst)
 			local name = inst and inst.Name or ''
+			if FX_NAME[name] then
+				return 0.22
+			end
 			if name == 'Bat' or name == 'ActiveBats' or name == 'Trail' then
 				return 10
 			end
 			if name == 'Meteor' or name == 'Whirlpool' or name == 'Lava' then
 				return 6
 			end
-			if name == 'SweepingStrike' or hasBodyMover(inst) then
-				return 1.35
+			if hasBodyMover(inst) then
+				return 0.3
 			end
 			return 2.4
 		end
@@ -1889,7 +1891,14 @@ local ok, err = pcall(function()
 					inst.CanQuery = false
 					inst.CanTouch = false
 				end
+				-- Skip full GetDescendants during Event dive / overload — that's the kill stutter.
+				if getgenv().SB2DiveFarmOn == true then
+					return
+				end
 				local desc = inst:GetDescendants()
+				if #desc > 40 then
+					return
+				end
 				for i = 1, #desc do
 					local d = desc[i]
 					local dCls = d.ClassName
@@ -1963,8 +1972,10 @@ local ok, err = pcall(function()
 				return
 			end
 			local overload = #pending > 400
-			local batch = overload and 280 or 160
-			local n = 0
+			local diving = getgenv().SB2DiveFarmOn == true
+			local fastBudget = (diving or overload) and 140 or 90
+			local slowBudget = diving and 12 or (overload and 40 or 32)
+			local nFast, nSlow = 0, 0
 			local keep = {}
 			for i = 1, #pending do
 				local inst = pending[i]
@@ -1972,19 +1983,39 @@ local ok, err = pcall(function()
 					queued[inst] = nil
 				else
 					local a = age(inst)
-					if a >= math.max(0.45, debrisTtl(inst) - 0.35) then
-						killMoversAndAnchor(inst)
+					local name = inst.Name
+					local fast = FX_NAME[name] == true
+						or inst.ClassName == 'Sound'
+						or inst.ClassName == 'Attachment'
+						or hasBodyMover(inst)
+					local ttl = debrisTtl(inst)
+					if overload then
+						ttl = math.min(ttl, 0.35)
 					end
-					local ttl = overload and math.min(debrisTtl(inst), 0.8) or debrisTtl(inst)
 					if a >= ttl then
-						if n < batch then
-							queued[inst] = nil
-							pcall(function()
-								inst:Destroy()
-							end)
-							n += 1
+						if fast then
+							if nFast < fastBudget then
+								queued[inst] = nil
+								pcall(function()
+									inst:Destroy()
+								end)
+								nFast += 1
+							else
+								keep[#keep + 1] = inst
+							end
 						else
-							keep[#keep + 1] = inst
+							if not diving then
+								killMoversAndAnchor(inst)
+							end
+							if nSlow < slowBudget then
+								queued[inst] = nil
+								pcall(function()
+									inst:Destroy()
+								end)
+								nSlow += 1
+							else
+								keep[#keep + 1] = inst
+							end
 						end
 					else
 						keep[#keep + 1] = inst
@@ -2017,12 +2048,13 @@ local ok, err = pcall(function()
 					return
 				end
 				local now = os.clock()
-				-- Flush at most ~4Hz; full workspace scan every 8s (was every Heartbeat + 4s scan).
-				if now - (getgenv().SB2SkillFxFlushAt or 0) >= 0.25 then
+				local diving = getgenv().SB2DiveFarmOn == true
+				local flushGap = diving and 0.12 or 0.25
+				if now - (getgenv().SB2SkillFxFlushAt or 0) >= flushGap then
 					getgenv().SB2SkillFxFlushAt = now
 					flushBatch()
 				end
-				if now - lastSweep >= 8 then
+				if not diving and now - lastSweep >= 8 then
 					lastSweep = now
 					scanWorkspace()
 				end
@@ -2471,6 +2503,21 @@ local ok, err = pcall(function()
 			end)
 		end
 	end
+	-- Keep yaw, drop pitch/roll. lookAt(pos, pos-down) laid people flat on the floor.
+	local function uprightWorldCFrame(cf)
+		if typeof(cf) ~= 'CFrame' then
+			return cf
+		end
+		local p = cf.Position
+		local look = cf.LookVector
+		local flat = Vector3.new(look.X, 0, look.Z)
+		if flat.Magnitude < 0.05 then
+			return CFrame.new(p)
+		end
+		return CFrame.lookAt(p, p + flat.Unit)
+	end
+	getgenv().SB2UprightWorldCFrame = uprightWorldCFrame
+
 	-- Soft-pin HRP at cf: stay UNanchored so server learns the new CFrame, hold
 	-- with PivotTo + zero velocity (anti-gravity / anti-push) for a short settle.
 	local function pinTeleportCFrame(cf, seconds)
@@ -2478,6 +2525,7 @@ local ok, err = pcall(function()
 		if typeof(cf) ~= 'CFrame' then
 			return
 		end
+		cf = uprightWorldCFrame(cf)
 		-- Never pin into the void (boss WP saved under the map → 0 damage AA).
 		if cf.Position.Y < -20 then
 			-- #region agent log
@@ -2596,6 +2644,7 @@ local ok, err = pcall(function()
 		if typeof(cf) ~= 'CFrame' then
 			return
 		end
+		cf = uprightWorldCFrame(cf)
 		if cf.Position.Y < -20 then
 			return
 		end
@@ -4949,6 +4998,95 @@ local ok, err = pcall(function()
 		return false
 	end
 
+	-- Wiki Hitboxes line from selected player's held RightWeapon.
+	local readSelectedHitboxLine = function()
+		local classMap = {
+			['1HSword'] = 'Longswords',
+			['SingleSword'] = 'Longswords',
+			['Longsword'] = 'Longswords',
+			['2HSword'] = 'Greatswords',
+			['Greatsword'] = 'Greatswords',
+			['Katana'] = 'Katanas',
+			['Rapier'] = 'Rapiers',
+			['Spear'] = 'Spears',
+			['Scythe'] = 'Scythes',
+		}
+		local name = getSelectedProfileName()
+		if type(name) ~= 'string' or name == '' then
+			return nil, 'Select a player first'
+		end
+		local userId
+		local plr = getSelectedPlayer()
+		if plr and type(plr.UserId) == 'number' then
+			userId = plr.UserId
+		else
+			local prefixed = string.match(name, '^[Rr]oblox_user_(%d+)$')
+			if prefixed then
+				userId = tonumber(prefixed)
+			else
+				local okUid, got = pcall(function()
+					return Players:GetUserIdFromNameAsync(name)
+				end)
+				if okUid and type(got) == 'number' then
+					userId = got
+				end
+			end
+		end
+		if not userId then
+			return nil, 'Could not resolve UserId for ' .. name
+		end
+		local items = workspace:FindFirstChild('CharacterItems')
+		local folder = items and items:FindFirstChild(tostring(userId))
+		if not folder then
+			return nil, name .. ' has no CharacterItems (not in this server?)'
+		end
+		local weapon = folder:FindFirstChild('RightWeapon') or folder:FindFirstChild('LeftWeapon')
+		if not weapon then
+			return nil, name .. ' has no RightWeapon'
+		end
+		local weaponName = weapon:GetAttribute('Name') or weapon:GetAttribute('ItemName')
+		if type(weaponName) ~= 'string' or weaponName == '' then
+			return nil, 'Weapon has no Name attribute'
+		end
+		local tool = weapon:FindFirstChild('Tool')
+		local blade = tool and tool:FindFirstChild('Blade')
+		if not (blade and blade:IsA('BasePart')) then
+			return nil, 'No Tool.Blade on weapon'
+		end
+		local size = blade.Size
+		local length = math.max(size.X, size.Y, size.Z)
+		local database = game:GetService('ReplicatedStorage'):FindFirstChild('Database')
+		local itemsDb = database and database:FindFirstChild('Items')
+		local entry = itemsDb and itemsDb:FindFirstChild(weaponName)
+		local classVal
+		if entry then
+			local cls = entry:FindFirstChild('Class')
+			if cls and cls:IsA('ValueBase') then
+				classVal = cls.Value
+			else
+				local stats = entry:FindFirstChild('Stats')
+				cls = stats and stats:FindFirstChild('Class')
+				if cls and cls:IsA('ValueBase') then
+					classVal = cls.Value
+				end
+			end
+		end
+		local category = classMap[tostring(classVal or '')]
+		if not category and classVal then
+			local lower = string.lower(tostring(classVal))
+			for key, wiki in pairs(classMap) do
+				if string.lower(key) == lower or string.lower(wiki) == lower then
+					category = wiki
+					break
+				end
+			end
+		end
+		if type(category) ~= 'string' or category == '' then
+			return nil, weaponName .. ' class not in Database.Items'
+		end
+		return ('|%s; %s; %s'):format(weaponName, string.format('%.3f', length), category), nil
+	end
+
 	local readPlayerMobKills = function(playerOrName)
 		local name = resolveProfileName(playerOrName)
 			or (typeof(playerOrName) == 'Instance' and playerOrName.Name)
@@ -4977,6 +5115,25 @@ local ok, err = pcall(function()
 			return a.count > b.count
 		end)
 		return total, rows, name
+	end
+
+	local mobKillsBtn = nil
+	local refreshMobKillsButton = function()
+		if not (mobKillsBtn and mobKillsBtn.Parent) then
+			return
+		end
+		local name = getSelectedProfileName()
+			or resolveProfileName(Options.PlayerList and Options.PlayerList.Value)
+		if not name then
+			mobKillsBtn.Text = 'Mob kills'
+			return
+		end
+		local total = readPlayerMobKills(name)
+		if type(total) ~= 'number' then
+			mobKillsBtn.Text = 'Mob kills'
+			return
+		end
+		mobKillsBtn.Text = 'Mob kills: ' .. formatNumber(total)
 	end
 
 	local showPlayerMobKills = function()
@@ -5021,6 +5178,7 @@ local ok, err = pcall(function()
 		local text = table.concat(lines, '\n')
 		local copied = copyTextToClipboard(text)
 		Library:Notify(name .. ' — mob kills\n' .. text, 14, true)
+		refreshMobKillsButton()
 		if copied then
 			task.defer(function()
 				Library:Notify('Copied mob kills to clipboard', 4)
@@ -5259,6 +5417,7 @@ local ok, err = pcall(function()
 		then
 			debug.setupvalue(RequiredServices.InventoryUI.GetInventoryData, 2, profile)
 		end
+		refreshMobKillsButton()
 	end)
 
 	PlayersBox:AddButton('Refresh profiles', refreshPlayerListDropdown)
@@ -5379,11 +5538,39 @@ local ok, err = pcall(function()
 		showPlayerStatsNotify()
 	end)
 
-	PlayersBox:AddButton('Mob kills', function()
+	mobKillsBtn = PlayersBox:AddButton('Mob kills', function()
 		showPlayerMobKills()
+	end)
+	pcall(function()
+		mobKillsBtn.TextTruncate = Enum.TextTruncate.AtEnd
+	end)
+	task.defer(refreshMobKillsButton)
+	task.spawn(function()
+		while mobKillsBtn and mobKillsBtn.Parent do
+			refreshMobKillsButton()
+			task.wait(2)
+		end
 	end)
 	PlayersBox:AddButton('All kills', function()
 		showAllProfilesMobKills()
+	end)
+
+	PlayersBox:AddLabel('Wiki hitbox')
+	PlayersBox:AddButton('Copy hitbox', function()
+		local ok, line, err = pcall(readSelectedHitboxLine)
+		if not ok then
+			Library:Notify('Copy hitbox error: ' .. tostring(line))
+			return
+		end
+		if not line then
+			Library:Notify(err or 'Could not read hitbox')
+			return
+		end
+		if copyTextToClipboard(line) then
+			Library:Notify('Copied: ' .. line)
+		else
+			Library:Notify('Clipboard unavailable')
+		end
 	end)
 
 	if RequiredServices
@@ -5596,7 +5783,9 @@ local ok, err = pcall(function()
 	end)
 
 	-- Join any Roblox username's SB2 server (right column, beside Players).
-	-- GetPlayerPlaceInstanceAsync is server-only — look up via Presence HTTP instead.
+	-- In-game join is Locations → Friend teleport. Presence often lies "offline"
+	-- when join privacy is on — GetPlayerPlaceInstanceAsync + job id still works,
+	-- and does not need a teleport pad.
 	do
 		local JoinBox = PlayersTab:AddRightGroupbox('Join player')
 		assert(JoinBox, 'Join player groupbox nil')
@@ -5610,7 +5799,7 @@ local ok, err = pcall(function()
 			Finished = false,
 			ClearTextOnFocus = false,
 			AllowEmpty = true,
-			Tooltip = 'Type a username (or user id), then press Join. Join selected uses the Profiles dropdown on the left.',
+			Tooltip = 'Type a username (or user id). Uses the same join as Locations → Friends, without treating private profiles as offline.',
 		})
 
 		local function httpRequest(opts)
@@ -5640,6 +5829,10 @@ local ok, err = pcall(function()
 			local asNum = tonumber(raw)
 			if asNum and asNum == math.floor(asNum) and asNum > 0 then
 				return asNum, raw
+			end
+			local prefixed = string.match(raw, '^[Rr]oblox_user_(%d+)$')
+			if prefixed then
+				return tonumber(prefixed), raw
 			end
 			local ok, userId = pcall(function()
 				return Players:GetUserIdFromNameAsync(raw)
@@ -5690,6 +5883,7 @@ local ok, err = pcall(function()
 			return resolveProfileName(selectedProfileName)
 		end
 
+		-- Roblox userPresenceType: 0 Offline, 1 Online (website), 2 InGame, 3 InStudio.
 		local function lookupPlaceViaPresence(userId)
 			local body = HttpService:JSONEncode({ userIds = { userId } })
 			local urls = {
@@ -5697,6 +5891,7 @@ local ok, err = pcall(function()
 				'https://presence.roproxy.com/v1/presence/users',
 			}
 			local lastErr = nil
+			local presenceType = nil
 			for _, url in ipairs(urls) do
 				local res, err = httpRequest({
 					Url = url,
@@ -5730,24 +5925,176 @@ local ok, err = pcall(function()
 					lastErr = 'no presence row'
 					continue
 				end
-				local presenceType = tonumber(row.userPresenceType or row.UserPresenceType) or 0
+				presenceType = tonumber(row.userPresenceType or row.UserPresenceType) or presenceType
 				local placeId = tonumber(row.placeId or row.PlaceId or row.rootPlaceId or row.RootPlaceId)
 				local jobId = row.gameId or row.GameId or row.instanceId or row.InstanceId
 				if type(jobId) == 'string' and jobId == '' then
 					jobId = nil
 				end
-				if presenceType == 0 then
-					return nil, nil, 'offline'
+				-- Privacy often reports Offline (type 0) while they are in-game.
+				-- If we got a place + job, join anyway — same as in-game join.
+				if type(placeId) == 'number' and placeId > 0 and type(jobId) == 'string' then
+					return placeId, jobId, nil, presenceType
 				end
-				if presenceType == 1 then
-					return nil, nil, 'online on website (not in a game)'
+				lastErr = 'presence hid place/job'
+			end
+			return nil, nil, lastErr or 'presence lookup failed', presenceType
+		end
+
+		local function describeJoinUnavailable(displayName, presenceType, lookErr)
+			local who = tostring(displayName)
+			local p = tonumber(presenceType)
+			if p == 0 then
+				return who .. ' is not online'
+			end
+			if p == 1 then
+				return who .. ' is online, but not in a game'
+			end
+			if p == 3 then
+				return who .. ' is in Studio, not in a game'
+			end
+			if p == 2 then
+				return 'Cannot join ' .. who .. ' — they look in-game, but their server is hidden'
+			end
+			if type(lookErr) == 'string' then
+				local low = lookErr:lower()
+				if low:find('offline', 1, true) then
+					return who .. ' is not online'
 				end
-				if type(placeId) ~= 'number' or placeId <= 0 or type(jobId) ~= 'string' then
-					return nil, nil, 'in a game but place/job hidden (join privacy / not friends)'
+				if low:find('not currently in', 1, true)
+					or low:find('not in a game', 1, true)
+					or low:find('not in any game', 1, true)
+				then
+					return who .. ' is not in a game'
 				end
+			end
+			return 'Cannot join ' .. who .. ' — could not find their server'
+		end
+
+		local function lookupViaTeleportService(userId)
+			local ok, a, b, c, d = pcall(function()
+				return TeleportService:GetPlayerPlaceInstanceAsync(userId)
+			end)
+			if not ok then
+				return nil, nil, tostring(a)
+			end
+			-- Docs: currentInstance, errorMessage, placeId, jobId
+			if a == true then
+				return game.PlaceId, game.JobId, nil
+			end
+			local placeId = tonumber(c) or tonumber(b)
+			local jobId = (type(d) == 'string' and d ~= '' and d)
+				or (type(c) == 'string' and c ~= '' and c)
+				or nil
+			if type(placeId) == 'number' and placeId > 0 and type(jobId) == 'string' then
 				return placeId, jobId, nil
 			end
-			return nil, nil, lastErr or 'presence lookup failed'
+			if type(b) == 'string' and b ~= '' then
+				return nil, nil, b
+			end
+			return nil, nil, 'no instance'
+		end
+
+		-- Potassium Connection:Fire() is often a no-op; the real handler is .Function.
+		local function fireGuiButton(btn)
+			if not (btn and btn:IsA('GuiButton')) then
+				return false
+			end
+			pcall(function()
+				btn.Visible = true
+				btn.Active = true
+			end)
+			local ran = false
+			if type(getconnections) == 'function' then
+				pcall(function()
+					for _, sigName in ipairs({ 'Activated', 'MouseButton1Click', 'MouseButton1Down' }) do
+						local ok, cons = pcall(getconnections, btn[sigName])
+						if not (ok and type(cons) == 'table') then
+							continue
+						end
+						for _, c in ipairs(cons) do
+							pcall(function()
+								if c.Enabled == false and type(c.Enable) == 'function' then
+									c:Enable()
+								end
+							end)
+							pcall(function()
+								if type(c.Function) == 'function' then
+									c.Function()
+									ran = true
+								end
+							end)
+							pcall(function()
+								if type(c.fn) == 'function' then
+									c.fn()
+									ran = true
+								end
+							end)
+							pcall(function()
+								if type(c.Fire) == 'function' then
+									c:Fire()
+								end
+							end)
+						end
+					end
+				end)
+			end
+			if type(firesignal) == 'function' then
+				pcall(function()
+					firesignal(btn.Activated)
+					ran = true
+				end)
+				pcall(function()
+					firesignal(btn.MouseButton1Click)
+					ran = true
+				end)
+			end
+			pcall(function()
+				btn:Activate()
+				ran = true
+			end)
+			return ran
+		end
+
+		local function tryNativeFriendTeleport(username)
+			username = trimName(username)
+			if username == '' then
+				return false
+			end
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local mf, locFrame, locTab, box, btn
+			pcall(function()
+				mf = pg.CardinalUI.PlayerUI.MainFrame
+				locFrame = mf.TabFrames.Locations
+				locTab = mf.Tabs.Locations
+				box = locFrame.FriendTeleport.ByName.PlayerSearch.SearchBox
+				btn = locFrame.FriendTeleport.ByName.Teleport
+			end)
+			if not (box and box:IsA('TextBox') and btn and btn:IsA('GuiButton')) then
+				return false
+			end
+			-- Open Travel so the in-game Join handler isn't skipped on a hidden tab.
+			pcall(function()
+				mf.Visible = true
+			end)
+			if locTab then
+				fireGuiButton(locTab)
+			end
+			pcall(function()
+				locFrame.Visible = true
+				local ft = locFrame:FindFirstChild('FriendTeleport')
+				if ft then
+					ft.Visible = true
+				end
+			end)
+			task.wait()
+			box.Text = username
+			pcall(function()
+				if type(firesignal) == 'function' and box.FocusLost then
+					firesignal(box.FocusLost, true)
+				end
+			end)
+			return fireGuiButton(btn)
 		end
 
 		local function joinUserId(userId, displayName)
@@ -5763,33 +6110,62 @@ local ok, err = pcall(function()
 			end
 
 			Library:Notify('Looking up ' .. tostring(displayName) .. '…')
-			local placeId, jobId, lookErr = lookupPlaceViaPresence(userId)
-			if not placeId or not jobId then
-				Library:Notify(
-					('Cannot join %s — %s'):format(tostring(displayName), tostring(lookErr or 'unknown')),
-					10,
-					true
-				)
-				return
+			local placeId, jobId, tpErr = lookupViaTeleportService(userId)
+			local lookErr = tpErr
+			local presenceType = nil
+			if not (placeId and jobId) then
+				local pPlace, pJob, pErr, pType = lookupPlaceViaPresence(userId)
+				placeId, jobId = pPlace, pJob
+				presenceType = pType
+				lookErr = tpErr or pErr
 			end
-			if placeId == game.PlaceId and jobId == game.JobId then
-				Library:Notify(tostring(displayName) .. ' is already in this server')
+			if placeId and jobId then
+				if placeId == game.PlaceId and jobId == game.JobId then
+					Library:Notify(tostring(displayName) .. ' is already in this server')
+					return
+				end
+				if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
+					pcall(getgenv().SB2PlayerToolsArmTeleport)
+				end
+				Library:Notify(
+					('Joining %s — place %s'):format(tostring(displayName), tostring(placeId)),
+					6
+				)
+				local tpOk, tpErr = pcall(function()
+					TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+				end)
+				if not tpOk then
+					Library:Notify('Teleport failed: ' .. tostring(tpErr), 8, true)
+				end
 				return
 			end
 
-			if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
-				pcall(getgenv().SB2PlayerToolsArmTeleport)
+			-- Website / Studio: not joinable. Private profiles still look Offline (0)
+			-- or InGame (2) with no job — those still get the in-game Join fallback.
+			local ptype = tonumber(presenceType)
+			if ptype == 1 or ptype == 3 then
+				Library:Notify(describeJoinUnavailable(displayName, ptype, lookErr), 8, true)
+				return
 			end
-			Library:Notify(
-				('Joining %s — place %s'):format(tostring(displayName), tostring(placeId)),
-				6
-			)
-			local tpOk, tpErr = pcall(function()
-				TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+
+			-- Same path as Locations → Friend teleport (needs the real username).
+			local menuName = tostring(displayName)
+			pcall(function()
+				menuName = Players:GetNameFromUserIdAsync(userId)
 			end)
-			if not tpOk then
-				Library:Notify('Teleport failed: ' .. tostring(tpErr), 8, true)
+			if tryNativeFriendTeleport(menuName) then
+				if ptype == 0 then
+					Library:Notify(
+						tostring(displayName) .. ' is not online — tried in-game join in case their profile is private',
+						8,
+						true
+					)
+				else
+					Library:Notify('Trying in-game join for ' .. tostring(menuName) .. '…', 6)
+				end
+				return
 			end
+			Library:Notify(describeJoinUnavailable(displayName, ptype, lookErr), 10, true)
 		end
 
 		local function startJoin(rawName)
@@ -6452,6 +6828,21 @@ local ok, err = pcall(function()
 		-- Dump extra swings into bosses/elites per tick (1/tick felt like "not hitting").
 		local BOSS_HITS_PER_TICK = 10
 		local BOSS_ATTACK_DELAY = 0.02
+		-- Wave Defense packs huge waves. 48 mobs × 4 remotes × 12 Hz melted the server.
+		if getgenv().SB2WaveDefensePlace == true then
+			AURA_DAMAGE_RANGE = 72
+			BOSS_DAMAGE_RANGE = 96
+			AUTO_ATTACK_RANGE = 72
+			SKILL_HIT_RANGE = 96
+			AUTO_ATTACK_INTERVAL = 0.22
+			AUTO_ATTACK_DELAY = 0.12
+			HIT_LIVES_ATTACK_INTERVAL = 0.16
+			HIT_LIVES_ATTACK_DELAY = 0.12
+			HIT_LIVES_MIN_DELAY = 0.12
+			MAX_ATTACKS_PER_TICK = 6
+			BOSS_HITS_PER_TICK = 2
+			BOSS_ATTACK_DELAY = 0.08
+		end
 		-- Gap between any UseSkill casts (weapon + support).
 		local SKILL_CAST_GAP = 0.5
 		local lastAnySkillCastAt = 0
@@ -6580,6 +6971,40 @@ local ok, err = pcall(function()
 			end
 			-- Reuse last key; don't deplete / refill.
 			return combatState.keys[#combatState.keys] or '2'
+		end
+
+		-- Hard cap Combat Attack remotes. Unlimited FireServer is Error 268.
+		local function tryFireAttackRemote(mob, skillTag)
+			if not mob then
+				return false
+			end
+			if not CombatEvent then
+				CombatEvent = ReplicatedStorage:FindFirstChild('Event')
+			end
+			if not CombatEvent or type(combatState.rpcKey) ~= 'table' then
+				return false
+			end
+			local now = os.clock()
+			local diving = getgenv().SB2DiveFarmOn == true
+				or (type(isToggleOn) == 'function' and isToggleOn('DiveFarm'))
+			local cap = diving and 6 or 10
+			if now - (tonumber(getgenv()._SB2AtkRemoteSec) or 0) >= 1 then
+				getgenv()._SB2AtkRemoteSec = now
+				getgenv()._SB2AtkRemoteN = 0
+			end
+			if (tonumber(getgenv()._SB2AtkRemoteN) or 0) >= cap then
+				return false
+			end
+			getgenv()._SB2AtkRemoteN = (tonumber(getgenv()._SB2AtkRemoteN) or 0) + 1
+			local ok = pcall(function()
+				CombatEvent:FireServer('Combat', combatState.rpcKey, {
+					'Attack',
+					mob,
+					skillTag,
+					takeCombatKey(),
+				})
+			end)
+			return ok == true
 		end
 
 		task.spawn(function()
@@ -8386,6 +8811,16 @@ local ok, err = pcall(function()
 
 		local fireUseSkill = function(skillName, info, opts)
 			opts = opts or {}
+			if not opts.ignoreCombatGate then
+				local skillOn = isToggleOn('AutoSkill')
+				local supportOn = isToggleOn('SupportSkill')
+				local comboOn = getgenv().SB2BossComboLock == true
+				local diveHeal = opts.allowHeal == true
+					and (isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true)
+				if not skillOn and not supportOn and not comboOn and not diveHeal then
+					return false
+				end
+			end
 			if not opts.ignoreMobsGate and not workspaceHasMobs() then
 				return false
 			end
@@ -8678,14 +9113,29 @@ local ok, err = pcall(function()
 			end
 
 			local hit = false
-			-- Neuublue / AutoFarm: tag the skill name, then also send a basic hit.
-			-- Pistol (Anytime) can reject a skill-only tag and do 0 damage.
+			local tag = (type(attackName) == 'string' and attackName ~= '') and attackName or nil
+
+			if getgenv().SB2WaveDefensePlace == true then
+				if RequiredServices
+					and RequiredServices.Combat
+					and type(RequiredServices.Combat.DealDamage) == 'function'
+				then
+					if tag then
+						hit = pcall(RequiredServices.Combat.DealDamage, mob, tag)
+					end
+					if not hit then
+						hit = pcall(RequiredServices.Combat.DealDamage, mob, nil)
+					end
+				end
+				return hit
+			end
+
 			if RequiredServices
 				and RequiredServices.Combat
 				and type(RequiredServices.Combat.DealDamage) == 'function'
 			then
-				if attackName then
-					local okSkill = pcall(RequiredServices.Combat.DealDamage, mob, attackName)
+				if tag then
+					local okSkill = pcall(RequiredServices.Combat.DealDamage, mob, tag)
 					if okSkill then
 						hit = true
 					end
@@ -8696,46 +9146,16 @@ local ok, err = pcall(function()
 				end
 			end
 
-			if not CombatEvent then
-				CombatEvent = ReplicatedStorage:FindFirstChild('Event')
-			end
-			-- Neuublue remote: Event Combat + RPCKey + Attack key '2'.
-			if CombatEvent then
-				if not combatState.rpcReady then
-					-- Don't InvokeServer from the attack hot path — one-shot boot fetch only.
-				elseif type(combatState.rpcKey) == 'table' then
-					if attackName then
-						local ok = pcall(function()
-							CombatEvent:FireServer('Combat', combatState.rpcKey, {
-								'Attack',
-								mob,
-								attackName,
-								takeCombatKey(),
-							})
-						end)
-						if ok then
-							hit = true
-						end
-					end
-					local ok2 = pcall(function()
-						CombatEvent:FireServer('Combat', combatState.rpcKey, {
-							'Attack',
-							mob,
-							nil,
-							takeCombatKey(),
-						})
-					end)
-					if ok2 then
-						hit = true
-					end
-				end
+			-- One Attack remote per call, globally capped. Two remotes × a pack is 268.
+			if tryFireAttackRemote(mob, tag) then
+				hit = true
 			end
 
 			if hit then
 				local probe = getgenv().SB2CombatProbe or {}
 				probe.lastHitMob = mob.Name
 				probe.lastHitAt = os.clock()
-				probe.lastHitName = attackName
+				probe.lastHitName = tag
 				probe.hits = (probe.hits or 0) + 1
 				getgenv().SB2CombatProbe = probe
 			end
@@ -8774,8 +9194,15 @@ local ok, err = pcall(function()
 		end
 
 		local looksClientStacked = function(origin)
+			local now = os.clock()
+			if now - (tonumber(getgenv()._SB2StackLookAt) or 0) < 0.22 then
+				return getgenv()._SB2StackLook == true
+			end
 			local near, alive = countNearMobs(origin, 30)
-			return alive >= 6 and near >= math.max(5, math.floor(alive * 0.45))
+			local stacked = alive >= 6 and near >= math.max(5, math.floor(alive * 0.45))
+			getgenv()._SB2StackLookAt = now
+			getgenv()._SB2StackLook = stacked
+			return stacked
 		end
 
 		local cacheMobRealPositions = function(origin)
@@ -8783,6 +9210,11 @@ local ok, err = pcall(function()
 			if not mobsRoot or not origin then
 				return
 			end
+			local now = os.clock()
+			if now - (tonumber(getgenv()._SB2MobCacheAt) or 0) < 0.35 then
+				return
+			end
+			getgenv()._SB2MobCacheAt = now
 			local stacked = looksClientStacked(origin)
 			for _, mob in mobsRoot:GetChildren() do
 				if isDeadMob(mob) then
@@ -8894,6 +9326,11 @@ local ok, err = pcall(function()
 					and getgenv().SB2DiveFarmOn == true
 					and getgenv().SB2DiveFarmThread ~= nil
 				then
+					local now = os.clock()
+					if now - lastPulse < 0.5 then
+						return
+					end
+					lastPulse = now
 					pcall(castSelectedSupportSkill)
 					return
 				end
@@ -8920,6 +9357,8 @@ local ok, err = pcall(function()
 				getgenv().SB2AutoSkillOnlyConn = nil
 			end
 			if not value then
+				getgenv().SB2SkillActiveName = nil
+				getgenv().SB2SkillActiveUntil = 0
 				return
 			end
 			startAutoSkillLoop()
@@ -9040,6 +9479,10 @@ local ok, err = pcall(function()
 			if not value then
 				return
 			end
+			if getgenv().SB2WaveDefensePlace == true and getgenv()._SB2WdAuraTold ~= true then
+				getgenv()._SB2WdAuraTold = true
+				Library:Notify('Wave Defense: killaura capped (6 nearby / slower) so the server does not choke', 7)
+			end
 
 			-- Hive follow/stack already warps. Pinning in place here froze alts
 			-- at a half-moved pad and Combat Anchor snapped them backward.
@@ -9091,7 +9534,10 @@ local ok, err = pcall(function()
 			local lastTick = 0
 			getgenv().SB2AutoAttackConn = RunService.Heartbeat:Connect(function()
 				local gui = getgenv().SB2PlayerToolsGui
-				if getgenv().SB2AutoAttackOn ~= true or not (gui and gui.Parent) then
+				if getgenv().SB2AutoAttackOn ~= true
+					or not isToggleOn('AutoAttack')
+					or not (gui and gui.Parent)
+				then
 					local conn = getgenv().SB2AutoAttackConn
 					if conn then
 						conn:Disconnect()
@@ -9104,6 +9550,9 @@ local ok, err = pcall(function()
 				local now = os.clock()
 				local hitLivesRush = wantHitLivesRush()
 				local tickGap = hitLivesRush and HIT_LIVES_ATTACK_INTERVAL or AUTO_ATTACK_INTERVAL
+				if usingEventFarmSkills() then
+					tickGap = math.max(tickGap, 0.18)
+				end
 				if now - lastTick < tickGap then
 					return
 				end
@@ -9199,9 +9648,9 @@ local ok, err = pcall(function()
 						attackName = skillTagFallback()
 					end
 				else
-					-- Killaura alone: still tag the selected skill. Without a name,
-					-- DealDamage(nil) barely ticks at aura range.
-					attackName = skillTagFallback()
+					-- Killaura alone: basic hits only. Tagging a skill name here looked
+					-- like Auto Skill was still on.
+					attackName = nil
 				end
 
 				-- Pistol: UseSkill shot only. Tagging DealDamage with "Summon Pistol" does not
@@ -9267,17 +9716,22 @@ local ok, err = pcall(function()
 				end)
 
 				local attacked = 0
+				local maxAttacks = MAX_ATTACKS_PER_TICK
+				local diving = usingEventFarmSkills()
+				if diving then
+					maxAttacks = 4
+				end
 				for _, entry in ipairs(mobList) do
 					local mob = entry.mob
-					if attacked >= MAX_ATTACKS_PER_TICK then
+					if attacked >= maxAttacks then
 						break
 					end
 					local strikes = 1
-					if entry.priority or entry.boss or entry.hitLives then
+					if not diving and (entry.priority or entry.boss or entry.hitLives) then
 						strikes = BOSS_HITS_PER_TICK
 					end
 					for _ = 1, strikes do
-						if attacked >= MAX_ATTACKS_PER_TICK then
+						if attacked >= maxAttacks then
 							break
 						end
 						if onCooldown[mob] and not (entry.priority or entry.boss) then
@@ -9470,10 +9924,10 @@ local ok, err = pcall(function()
 		local DIVE_DASH_CHASE_MULT = 2.8
 		local DIVE_DASH_BLINK_FLAT = 48
 		local DIVE_BOSS_TRACK_INTERVAL = 0.14
-		local DIVE_HIT_DELAY = 0.06
+		local DIVE_HIT_DELAY = 0.14
 		local DIVE_AURA_RANGE = AUTO_ATTACK_RANGE
 		local DIVE_FLEE_RANGE = math.max(320, AUTO_ATTACK_RANGE)
-		local DIVE_STREAM_RADIUS = 512
+		local DIVE_STREAM_RADIUS = 72
 		local DIVE_MAX_KEEP = 360
 		local DIVE_HP_FLEE = 0.50
 		local DIVE_HP_RETURN = 0.95
@@ -9507,7 +9961,7 @@ local ok, err = pcall(function()
 		local DIVE_TELE_NEAR = 160
 		local DIVE_NUKE_HOLD = 1.2
 		local DIVE_NUKE_COOLDOWN = 2.5
-		local DIVE_TELE_CACHE_SEC = 0.45
+		local DIVE_TELE_CACHE_SEC = 0.9
 		-- Hard rails — never blink across the map / into void.
 		local DIVE_SAFE_FLAT = 48
 		local DIVE_SAFE_Y = 36
@@ -9544,6 +9998,52 @@ local ok, err = pcall(function()
 			return manual
 		end
 
+		-- Event darkness (workspace.DarknerOrb): lock vacuum XZ to its center.
+		-- Never touch Y — Farm height slider / existing hover owns that.
+		local diveDarknerOrbInst = nil
+		local function diveDarknerOrbPos()
+			local orb = diveDarknerOrbInst
+			if not (orb and orb.Parent) then
+				orb = workspace:FindFirstChild('DarknerOrb')
+				diveDarknerOrbInst = orb
+			end
+			if not orb then
+				return nil
+			end
+			local pos = nil
+			pcall(function()
+				if orb:IsA('BasePart') then
+					pos = orb.Position
+				elseif orb:IsA('Model') then
+					pos = orb:GetPivot().Position
+				elseif orb:IsA('Attachment') then
+					pos = orb.WorldPosition
+				elseif orb:IsA('PVInstance') then
+					pos = orb:GetPivot().Position
+				else
+					local part = orb:FindFirstChildWhichIsA('BasePart', true)
+					if part then
+						pos = part.Position
+					end
+				end
+			end)
+			if typeof(pos) == 'Vector3' then
+				return pos
+			end
+			return nil
+		end
+
+		local function diveLockDarknerOrbXZ(pos)
+			if typeof(pos) ~= 'Vector3' then
+				return pos
+			end
+			local orb = diveDarknerOrbPos()
+			if not orb then
+				return pos
+			end
+			return Vector3.new(orb.X, pos.Y, orb.Z)
+		end
+
 		local function diveFleeUnderDepth(isBoss)
 			local base = math.clamp(diveOptNumber('DiveFleeDepth', DIVE_FLEE_UNDER), 10, 120)
 			if isBoss then
@@ -9561,6 +10061,23 @@ local ok, err = pcall(function()
 			Mobs = true,
 			Baseplate = true,
 			['AntiFall-Maze'] = true,
+			SweepingStrike = true,
+			Bat = true,
+			ActiveBats = true,
+			Trail = true,
+			SoulLightning = true,
+			Meteor = true,
+			Soul = true,
+			Whirlpool = true,
+			Lava = true,
+			Indicator = true,
+			Lines = true,
+			Circle = true,
+			EffectHitbox = true,
+			Skill = true,
+			SummonPortal = true,
+			TreeEffect = true,
+			CharacterItems = true,
 		}
 		local diveNoclipOrig = {}
 		local diveNoclipGroups = {}
@@ -9744,6 +10261,7 @@ local ok, err = pcall(function()
 		local diveNukeAnchor = nil
 		local diveYaw = (((tonumber(LocalPlayer.UserId) or 1) % 12) / 12) * math.pi * 2
 		local lastDiveStreamAt = 0
+		local lastDiveStreamPos = nil
 		local lastDiveMoveAt = 0
 		local lastDiveHealAt = 0
 		local lastDiveMendAt = 0
@@ -9923,30 +10441,12 @@ local ok, err = pcall(function()
 
 		local function detectEventElement()
 			local now = os.clock()
-			if diveElementCache.id and (now - diveElementCache.at) < 1.2 then
+			if diveElementCache.id and (now - diveElementCache.at) < 4 then
 				return diveElementCache.id
 			end
 			local found = nil
 			for _, child in ipairs(workspace:GetChildren()) do
 				found = textHasElementHint(child.Name)
-				if found then
-					break
-				end
-				if child:IsA('Folder') or child:IsA('Model') then
-					local n = 0
-					for _, d in ipairs(child:GetDescendants()) do
-						n += 1
-						if n > 80 then
-							break
-						end
-						if d:IsA('BasePart') or d:IsA('ParticleEmitter') then
-							found = textHasElementHint(d.Name)
-							if found then
-								break
-							end
-						end
-					end
-				end
 				if found then
 					break
 				end
@@ -10087,6 +10587,7 @@ local ok, err = pcall(function()
 				silentFail = true,
 				ignoreGap = true,
 				ignoreMobsGate = true,
+				allowHeal = true,
 				skipReadyCheck = opts.skipReadyCheck == true,
 			})
 			if ok then
@@ -10426,16 +10927,23 @@ local ok, err = pcall(function()
 			end
 			diveHoldPos = nil
 			pcall(function()
-				local look = lookAt or (diveStickRoot and diveStickRoot.Parent and diveStickRoot.Position) or (dest - Vector3.new(0, DIVE_HOVER, 0))
+				local look = lookAt or (diveStickRoot and diveStickRoot.Parent and diveStickRoot.Position)
 				local cf
-				local preserve = writeOpts.preserveFacing
-				if preserve == nil and getgenv().SB2DiveFarmOn then
-					preserve = not writeOpts.forceLook
+				local pos = dest
+				local lookFlat = nil
+				if typeof(look) == 'Vector3' then
+					lookFlat = Vector3.new(look.X - pos.X, 0, look.Z - pos.Z)
 				end
-				if preserve then
-					cf = CFrame.new(dest) * (hrp.CFrame - hrp.CFrame.Position)
+				if lookFlat and lookFlat.Magnitude >= 0.08 then
+					cf = CFrame.lookAt(pos, pos + lookFlat.Unit)
 				else
-					cf = CFrame.lookAt(dest, look)
+					local lv = hrp.CFrame.LookVector
+					local keep = Vector3.new(lv.X, 0, lv.Z)
+					if keep.Magnitude >= 0.08 then
+						cf = CFrame.lookAt(pos, pos + keep.Unit)
+					else
+						cf = CFrame.new(pos)
+					end
 				end
 				-- HRP only — PivotTo desyncs CharacterItems welds (stuck-to-weapon).
 				local toDest = dest - hrp.Position
@@ -10506,6 +11014,49 @@ local ok, err = pcall(function()
 			end)
 			return true
 		end
+
+		local function diveSnapXZToDarknerOrb(hrp)
+			if not hrp or getgenv().SB2DiveFarmOn ~= true then
+				return false
+			end
+			local orb = diveDarknerOrbPos()
+			if not orb then
+				return false
+			end
+			local dest = Vector3.new(orb.X, hrp.Position.Y, orb.Z)
+			local dx = hrp.Position.X - orb.X
+			local dz = hrp.Position.Z - orb.Z
+			if (dx * dx + dz * dz) < 1 then
+				return true
+			end
+			if typeof(diveLastCluster) == 'Vector3' then
+				diveLastCluster = Vector3.new(orb.X, diveLastCluster.Y, orb.Z)
+			else
+				diveLastCluster = dest
+			end
+			return diveWriteCFrame(hrp, dest, dest, { force = true, noClamp = true })
+		end
+
+		pcall(function()
+			workspace.ChildAdded:Connect(function(ch)
+				if not ch or ch.Name ~= 'DarknerOrb' then
+					return
+				end
+				diveDarknerOrbInst = ch
+				task.defer(function()
+					diveSnapXZToDarknerOrb(getMyBringPart())
+				end)
+			end)
+			workspace.ChildRemoved:Connect(function(ch)
+				if ch and ch.Name == 'DarknerOrb' and diveDarknerOrbInst == ch then
+					diveDarknerOrbInst = nil
+				end
+			end)
+			local existing = workspace:FindFirstChild('DarknerOrb')
+			if existing then
+				diveDarknerOrbInst = existing
+			end
+		end)
 
 		local function diveSnapTo(hrp, goalPos, lookAt, clampOpts)
 			if not hrp or not goalPos then
@@ -10582,6 +11133,7 @@ local ok, err = pcall(function()
 			if dt <= 0 then
 				dt = 1 / 60
 			end
+			targetPos = diveLockDarknerOrbXZ(targetPos)
 			local pos = hrp.Position
 			local toTarget = targetPos - pos
 			local totalDist = toTarget.Magnitude
@@ -10670,7 +11222,7 @@ local ok, err = pcall(function()
 					targetPos = Vector3.new(targetPos.X + u.X, targetPos.Y, targetPos.Z + u.Z)
 				end
 			end
-			return targetPos
+			return diveLockDarknerOrbXZ(targetPos)
 		end
 
 		-- Hit from the dive loop (like AutoFarm vacuum) so we don't depend on
@@ -10777,7 +11329,7 @@ local ok, err = pcall(function()
 			else
 				pos = diveClampToFarmZone(pos)
 			end
-			return pos
+			return diveLockDarknerOrbXZ(pos)
 		end
 
 		local function diveStayUnder(hrp, xzPos, dt)
@@ -10788,11 +11340,11 @@ local ok, err = pcall(function()
 			if diveStickMob and diveStickRoot and diveStickRoot.Parent then
 				local dest = diveVacuumTargetPos(diveStickMob, diveStickRoot, hrp, 0)
 				if dest then
-					diveFlyStep(hrp, diveClampToFarmZone(dest), dt or 1)
+					diveFlyStep(hrp, diveLockDarknerOrbXZ(diveClampToFarmZone(dest)), dt or 1)
 					return
 				end
 			end
-			local goal = diveClampToFarmZone(Vector3.new(xzPos.X, diveHoverY(xzPos), xzPos.Z))
+			local goal = diveLockDarknerOrbXZ(diveClampToFarmZone(Vector3.new(xzPos.X, diveHoverY(xzPos), xzPos.Z)))
 			diveFlyStep(hrp, goal, dt or 1)
 		end
 
@@ -10973,11 +11525,20 @@ local ok, err = pcall(function()
 		end
 
 		local function diveFocusStream(cluster)
-			if not cluster then
+			if typeof(cluster) ~= 'Vector3' then
 				return
 			end
-			-- Stream mobs near the fight — NEVER move ReplicationFocus off the player
-			-- (that desyncs the character mesh from HRP while we blink around).
+			-- 512-stud RequestStreamAroundAsync every tick stalled Data Ping (~20s).
+			-- Only re-stream when we moved or the last request aged out.
+			local now = os.clock()
+			if lastDiveStreamPos
+				and (cluster - lastDiveStreamPos).Magnitude < 32
+				and (now - lastDiveStreamAt) < 2.8
+			then
+				return
+			end
+			lastDiveStreamAt = now
+			lastDiveStreamPos = cluster
 			pcall(function()
 				LocalPlayer:RequestStreamAroundAsync(cluster, DIVE_STREAM_RADIUS)
 			end)
@@ -11026,6 +11587,10 @@ local ok, err = pcall(function()
 				yMax = yRef + yPad
 			end
 			local y = math.clamp(goalPos.Y, yMin, yMax)
+			local orb = diveDarknerOrbPos()
+			if orb then
+				return Vector3.new(orb.X, y, orb.Z)
+			end
 			local dx = goalPos.X - anchor.X
 			local dz = goalPos.Z - anchor.Z
 			local flat = math.sqrt(dx * dx + dz * dz)
@@ -11161,7 +11726,7 @@ local ok, err = pcall(function()
 					y = refY - under
 				end
 			end
-			return diveClampToFarmZone(Vector3.new(goalPos.X, y, goalPos.Z))
+			return diveLockDarknerOrbXZ(diveClampToFarmZone(Vector3.new(goalPos.X, y, goalPos.Z)))
 		end
 
 		local function clampNearCluster(pos, cluster, maxDist)
@@ -11558,7 +12123,7 @@ local ok, err = pcall(function()
 						continue
 					end
 					local n = 0
-					local cap = 120
+					local cap = 60
 					for _, d in ipairs(child:GetDescendants()) do
 						n += 1
 						if n > cap then
@@ -11803,6 +12368,21 @@ local ok, err = pcall(function()
 			if type(detachLock) == 'function' then
 				pcall(detachLock)
 			end
+			pcall(function()
+				local hrp = getMyBringPart()
+				if not hrp then
+					return
+				end
+				local upright = getgenv().SB2UprightWorldCFrame
+				local cf = hrp.CFrame
+				if type(upright) == 'function' then
+					cf = upright(cf)
+				end
+				if typeof(cf) == 'CFrame' then
+					hrp.CFrame = cf
+					hrp.AssemblyAngularVelocity = Vector3.zero
+				end
+			end)
 			pcall(applyCombatAnchor, false)
 			diveStickMob = nil
 			diveStickRoot = nil
@@ -11902,17 +12482,7 @@ local ok, err = pcall(function()
 					Toggles.AutoAttack:SetValue(true)
 				end
 			end)
-			pcall(function()
-				if Toggles.AutoSkill and Toggles.AutoSkill.SetValue and not Toggles.AutoSkill.Value then
-					Toggles.AutoSkill:SetValue(true)
-				end
-			end)
-			pcall(function()
-				if Toggles.SupportSkill and Toggles.SupportSkill.SetValue and not Toggles.SupportSkill.Value then
-					Toggles.SupportSkill:SetValue(true)
-				end
-			end)
-			-- Combat support often left empty — mirror Dive multi-support so CE actually fires.
+			applyCombatAnchor(false)
 			pcall(function()
 				local farmOpt = Options.FarmSupportSkillName
 				local combatOpt = Options.SupportSkillName
@@ -11926,7 +12496,6 @@ local ok, err = pcall(function()
 					syncMultiSkillOrder('SB2SupportSkillOrder', farmMap)
 				end
 			end)
-			applyCombatAnchor(false)
 			setDiveNoclip(true)
 			pcall(function()
 				local hrp = getMyBringPart()
@@ -12416,6 +12985,11 @@ local ok, err = pcall(function()
 				if bigBoss and lockedFocus then
 					stickY = lockedFocus.Y
 				end
+				local orb = diveDarknerOrbPos()
+				if orb then
+					-- Darkness center: no blade-ring standoff. Y still slider/stickY.
+					return Vector3.new(orb.X, stickY, orb.Z), lookPos, focusPart
+				end
 				local stick = Vector3.new(
 					focusPos.X + dir.X * standoff,
 					stickY,
@@ -12771,6 +13345,12 @@ local ok, err = pcall(function()
 				local pullIn = false
 				local approachY = stickyFightY
 				local approach = Vector3.new(lockedPos.X, approachY, lockedPos.Z)
+				local darknerOrb = diveDarknerOrbPos()
+				if darknerOrb then
+					lockedPos = Vector3.new(darknerOrb.X, lockedPos.Y, darknerOrb.Z)
+					approach = Vector3.new(darknerOrb.X, approachY, darknerOrb.Z)
+					diveLastCluster = lockedPos
+				end
 				local lookFocus = bossAim
 				local approachClamp = {
 					yRef = approachY,
@@ -12789,7 +13369,7 @@ local ok, err = pcall(function()
 						lockedFloorY
 					)
 				)
-				if dist0 > DIVE_APPROACH_MAX then
+				if not darknerOrb and dist0 > DIVE_APPROACH_MAX then
 					diveDebug('skip-far', string.format('d=%.0f', dist0))
 					diveFinishedUntil[mob] = os.clock() + 0.6
 					return
@@ -13183,13 +13763,18 @@ local ok, err = pcall(function()
 					-- Pin fight Y at feet-line lock; look-at stays on boss body center.
 					stickPos = diveClampGoal(stickPos, lockedPos, fightClamp)
 					stickPos = Vector3.new(stickPos.X, stickyFightY, stickPos.Z)
+					local orbNow = diveDarknerOrbPos()
+					if orbNow then
+						stickPos = Vector3.new(orbNow.X, stickyFightY, orbNow.Z)
+						lockedPos = Vector3.new(orbNow.X, lockedPos.Y, orbNow.Z)
+					end
 					if not aimAt then
 						aimAt = bossAim or lockedPos
 					end
 					local flatNow = Vector3.new(myPart.Position.X - stickPos.X, 0, myPart.Position.Z - stickPos.Z)
 					local distNow = flatNow.Magnitude
 					local runawayLimit = isBigBoss and (DIVE_SAFE_FLAT + 95) or (DIVE_SAFE_FLAT + 30)
-					if distNow > runawayLimit then
+					if not orbNow and distNow > runawayLimit then
 						runawayStrikes += 1
 						diveDebug('runaway-snap', string.format('d=%.0f', distNow))
 						local safe = diveClampGoal(
@@ -13211,8 +13796,12 @@ local ok, err = pcall(function()
 							if isBigBoss and distNow > 14 then
 								chaseSpeed = DIVE_TWEEN_SPEED * DIVE_DASH_CHASE_MULT
 							end
-							if isBigBoss and distNow > DIVE_DASH_BLINK_FLAT then
-								diveWriteCFrame(myPart, stickPos, aimAt, { clamp = fightClamp, force = true })
+							if orbNow or (isBigBoss and distNow > DIVE_DASH_BLINK_FLAT) then
+								diveWriteCFrame(myPart, stickPos, aimAt, {
+									clamp = fightClamp,
+									force = true,
+									noClamp = orbNow ~= nil,
+								})
 							else
 								diveStepToward(myPart, stickPos, chaseSpeed, aimAt, fightClamp)
 							end
@@ -13291,14 +13880,21 @@ local ok, err = pcall(function()
 
 					if not fleeing and (os.clock() - lastHit) >= DIVE_HIT_DELAY then
 						lastHit = os.clock()
-						local attackName = nil
 						if isToggleOn('AutoSkill') then
 							pcall(castSelectedSupportSkill)
-							pcall(function()
-								attackName = ensureSkillWindow()
-							end)
+							pcall(ensureSkillWindow)
 						end
-						pcall(fireMobAttack, mob, attackName)
+						if not isToggleOn('AutoAttack') then
+							local attackName = nil
+							local untilT = getgenv().SB2SkillActiveUntil
+							if isToggleOn('AutoSkill')
+								and type(untilT) == 'number'
+								and untilT > time()
+							then
+								attackName = getgenv().SB2SkillActiveName
+							end
+							pcall(fireMobAttack, mob, attackName)
+						end
 					end
 
 					if os.clock() - lastDbgAt > 1 then
@@ -13316,7 +13912,7 @@ local ok, err = pcall(function()
 						)
 					end
 
-					if os.clock() - lastDiveStreamAt > 1.4 then
+					if os.clock() - lastDiveStreamAt > 2.8 then
 						lastDiveStreamAt = os.clock()
 						diveFocusStream(lockedPos)
 					end
@@ -13397,6 +13993,7 @@ local ok, err = pcall(function()
 							continue
 						end
 						setDiveNoclip(true)
+						pcall(diveSnapXZToDarknerOrb, myPart)
 						pcall(cacheMobRealPositions, myPart.Position)
 						local target = diveNearestMob(myPart.Position)
 						if target then
@@ -13428,6 +14025,7 @@ local ok, err = pcall(function()
 								dest = diveIdleHoverPos(myPart)
 							end
 							if dest then
+								dest = diveLockDarknerOrbXZ(dest)
 								pcall(function()
 									diveStepToward(myPart, dest, DIVE_TWEEN_SPEED, dest, {
 										yRef = dest.Y,
@@ -13451,7 +14049,7 @@ local ok, err = pcall(function()
 							if diveFarmZone() and typeof(streamAt) == 'Vector3' and not divePosInFarmZone(streamAt) then
 								streamAt = diveFarmZoneCenter(myPart.Position.Y) or myPart.Position
 							end
-							if os.clock() - lastDiveStreamAt > 0.45 then
+							if os.clock() - lastDiveStreamAt > 2.8 then
 								lastDiveStreamAt = os.clock()
 								diveFocusStream(streamAt)
 							end
@@ -14115,15 +14713,34 @@ local ok, err = pcall(function()
 			return names
 		end
 
+		local function waypointOnThisFloor(name)
+			if type(name) ~= 'string' or name == '' or name == WP_NONE then
+				return false
+			end
+			local fn = getgenv().SB2WaypointOnThisFloor
+			if type(fn) == 'function' then
+				local ok, yes = pcall(fn, name)
+				if ok then
+					return yes == true
+				end
+			end
+			for _, listed in ipairs(listSoloWaypoints()) do
+				if listed == name then
+					return true
+				end
+			end
+			return false
+		end
+
 		local function currentSoloWaypoint()
 			local opt = Options.SoloResumeWaypoint and Options.SoloResumeWaypoint.Value
-			if type(opt) == 'string' and opt ~= '' and opt ~= WP_NONE then
+			if type(opt) == 'string' and opt ~= '' and opt ~= WP_NONE and waypointOnThisFloor(opt) then
 				return opt
 			end
 			local getter = getgenv().SB2WaypointsGetSelected
 			if type(getter) == 'function' then
 				local ok, name = pcall(getter)
-				if ok and type(name) == 'string' and name ~= '' then
+				if ok and type(name) == 'string' and name ~= '' and waypointOnThisFloor(name) then
 					return name
 				end
 			end
@@ -15098,10 +15715,6 @@ local ok, err = pcall(function()
 						break
 					end
 				end
-				if wpDefault == WP_NONE then
-					wpValues[#wpValues + 1] = selected
-					wpDefault = selected
-				end
 			end
 		end
 		SoloBox:AddDropdown('SoloResumeWaypoint', {
@@ -15115,6 +15728,11 @@ local ok, err = pcall(function()
 		pcall(function()
 			Options.SoloResumeWaypoint:OnChanged(function(value)
 				if value == WP_NONE then
+					local peek = getgenv().SB2WaypointsPeekSelected
+					local raw = type(peek) == 'function' and peek() or nil
+					if type(raw) == 'string' and raw ~= '' and not waypointOnThisFloor(raw) then
+						return
+					end
 					value = nil
 				end
 				local setter = getgenv().SB2WaypointsSetSelected
@@ -15128,8 +15746,10 @@ local ok, err = pcall(function()
 			if Options.SoloResumeWaypoint then
 				Options.SoloResumeWaypoint:SetValues(names)
 				local cur = currentSoloWaypoint()
-				if cur then
+				if cur and waypointOnThisFloor(cur) then
 					Options.SoloResumeWaypoint:SetValue(cur)
+				else
+					Options.SoloResumeWaypoint:SetValue(WP_NONE)
 				end
 			end
 			Library:Notify(('Waypoints: %d'):format(math.max(0, #names - 1)))
@@ -15633,23 +16253,14 @@ local ok, err = pcall(function()
 			if not Options.SoloResumeWaypoint then
 				return
 			end
-			local values = Options.SoloResumeWaypoint.Values or listSoloWaypoints()
-			if type(name) == 'string' and name ~= '' then
-				local found = false
-				for _, v in ipairs(values) do
-					if v == name then
-						found = true
-						break
-					end
-				end
-				if not found then
-					values = listSoloWaypoints()
-					if not table.find(values, name) then
-						values[#values + 1] = name
-					end
-					Options.SoloResumeWaypoint:SetValues(values)
-				end
+			local values = listSoloWaypoints()
+			pcall(function()
+				Options.SoloResumeWaypoint:SetValues(values)
+			end)
+			if type(name) == 'string' and name ~= '' and waypointOnThisFloor(name) then
 				Options.SoloResumeWaypoint:SetValue(name)
+			else
+				Options.SoloResumeWaypoint:SetValue(WP_NONE)
 			end
 		end
 
@@ -23112,7 +23723,7 @@ local ok, err = pcall(function()
 				Default = LocalPlayer.Name,
 				AllowNull = false,
 				Searchable = true,
-				Tooltip = 'Who the other clients TP / follow / stack onto. Shared across all hive clients.',
+				Tooltip = 'Who the other clients TP / floor-hop / stack onto. Shared across all hive clients.',
 			}):OnChanged(function(name)
 				if Hive._syncingCommanderUi then
 					return
@@ -23231,29 +23842,17 @@ local ok, err = pcall(function()
 				end
 			end)
 
-			OrdersBox:AddLabel('TP hops to the commander then free roam. Follow/Stack keep locking until Stop workers.')
+			OrdersBox:AddLabel('TP stacks workers on the commander. Floor hop joins their place. Stack keeps locking until Stop workers.')
 			OrdersBox:AddButton('TP others to commander', function()
 				Hive.issue('rally', {})
 				refreshHiveLabels()
 			end)
-			OrdersBox:AddButton('Follow commander', function()
-				Hive.issue('follow', { radius = 5 })
+			OrdersBox:AddButton('Teleport to commander floor', function()
+				Hive.issue('goto_floor', {})
 				refreshHiveLabels()
 			end)
 			OrdersBox:AddButton('Stack on commander', function()
 				Hive.issue('stack', {})
-				refreshHiveLabels()
-			end)
-			OrdersBox:AddButton('Combat ON', function()
-				local skill
-				pcall(function()
-					skill = flattenOptionValue(Options.SkillName and Options.SkillName.Value)
-				end)
-				Hive.issue('combat_on', { skill = skill })
-				refreshHiveLabels()
-			end)
-			OrdersBox:AddButton('Combat OFF', function()
-				Hive.issue('combat_off', {})
 				refreshHiveLabels()
 			end)
 			OrdersBox:AddButton('Stop workers', function()
@@ -23346,18 +23945,124 @@ local ok, err = pcall(function()
 			}):OnChanged(function(on)
 				Hive.setAcceptHiveTrades(on == true)
 			end)
-			TradeBox:AddButton('Workers: deposit to commander', function()
-				local rarity = Options.HiveCrystalType and Options.HiveCrystalType.Value or 'Legendary'
-				local amount = Options.HiveCrystalAmount and Options.HiveCrystalAmount.Value or 64
-				Hive.issue('deposit_crystals', {
-					rarity = rarity,
-					amount = amount,
-				})
+			local lastHiveDepositIssueAt = 0
+			local lastHiveDumpIssueAt = 0
+			local hiveTradeIssueBusy = false
+			local function hiveIssueDeposit(on, quiet)
+				if hiveTradeIssueBusy then
+					return
+				end
+				hiveTradeIssueBusy = true
+				pcall(function()
+					if on then
+						local rarity = Options.HiveCrystalType and Options.HiveCrystalType.Value or 'Legendary'
+						local amount = Options.HiveCrystalAmount and Options.HiveCrystalAmount.Value or 64
+						Hive.issue('deposit_crystals', {
+							rarity = rarity,
+							amount = amount,
+							persist = true,
+						}, quiet == true)
+						lastHiveDepositIssueAt = os.clock()
+					else
+						Hive.issue('deposit_crystals', { on = false }, quiet == true)
+					end
+				end)
+				hiveTradeIssueBusy = false
+			end
+			local function hiveDumpRarityMap()
+				local collect = collectMultiSkillMap
+				local raw = Options.HiveDumpRarities and Options.HiveDumpRarities.Value
+				if type(collect) == 'function' then
+					return collect(raw)
+				end
+				local map = {}
+				if type(raw) == 'table' then
+					for k, on in pairs(raw) do
+						if on == true and type(k) == 'string' then
+							map[k] = true
+						elseif type(on) == 'string' then
+							map[on] = true
+						end
+					end
+				elseif type(raw) == 'string' and raw ~= '' then
+					map[raw] = true
+				end
+				return map
+			end
+			local function hiveIssueDump(on, quiet)
+				if hiveTradeIssueBusy then
+					return
+				end
+				hiveTradeIssueBusy = true
+				pcall(function()
+					if on then
+						Hive.issue('dump_items', {
+							persist = true,
+							skipCrystals = true,
+							skipCommon = true,
+							rarities = hiveDumpRarityMap(),
+						}, quiet == true)
+						lastHiveDumpIssueAt = os.clock()
+					else
+						Hive.issue('dump_items', { on = false }, quiet == true)
+					end
+				end)
+				hiveTradeIssueBusy = false
+			end
+			TradeBox:AddToggle('HiveDepositCommander', {
+				Text = 'Workers: deposit to commander',
+				Default = false,
+				Tooltip = 'Keeps depositing the selected crystal type to the commander. Turn off to abort.',
+			}):OnChanged(function(on)
+				if on then
+					pcall(function()
+						local other = Toggles.HiveDumpItems
+						if other and other.Value == true and other.SetValue then
+							other:SetValue(false)
+						end
+					end)
+				end
+				hiveIssueDeposit(on == true)
 				refreshHiveLabels()
 			end)
-			TradeBox:AddLabel('Dump: snaps to commander, gear then crystals (max 400/trade), then ALL worker vel (10% fee, receiver cap 1B). Pick commanding client first.')
-			TradeBox:AddButton('Workers: trade ALL items + vel to commander', function()
-				Hive.issue('dump_items', {})
+			TradeBox:AddLabel('Dump: workers send only the rarities you tick (crystals never included), then ALL worker vel (10% fee, receiver cap 1B). Pick commanding client first.')
+			TradeBox:AddDropdown('HiveDumpRarities', {
+				Text = 'Dump item rarities',
+				Values = {
+					'Common',
+					'Uncommon',
+					'Rare',
+					'Legendary',
+					'Tribute',
+					'Burst',
+					'Exotic',
+				},
+				Default = { 'Legendary', 'Tribute' },
+				Multi = true,
+				AllowNull = true,
+				Tooltip = 'Multi-select. Workers only trade items of these rarities. Crystals/protection scrolls are never dumped.',
+			}):OnChanged(function()
+				pcall(function()
+					if Toggles.HiveDumpItems and Toggles.HiveDumpItems.Value == true then
+						hiveIssueDump(false, true)
+						hiveIssueDump(true)
+					end
+				end)
+			end)
+			TradeBox:AddToggle('HiveDumpItems', {
+				Text = 'Workers: trade ALL items + vel to commander',
+				Default = false,
+				Tooltip = 'Keeps sending matching-rarity items + vel. Uses Dump item rarities. Skips crystals. Turn off to abort.',
+			}):OnChanged(function(on)
+				if on then
+					pcall(function()
+						local other = Toggles.HiveDepositCommander
+						if other and other.Value == true and other.SetValue then
+							other:SetValue(false)
+						end
+					end)
+				end
+				hiveIssueDump(on == true)
 				refreshHiveLabels()
 			end)
 
@@ -23378,6 +24083,17 @@ local ok, err = pcall(function()
 					end
 					if Hive.isAlive and Hive.isAlive() then
 						pcall(refreshHiveLabels)
+						pcall(function()
+							if Toggles.HiveDepositCommander and Toggles.HiveDepositCommander.Value == true then
+								if os.clock() - lastHiveDepositIssueAt > 8 then
+									hiveIssueDeposit(true, true)
+								end
+							elseif Toggles.HiveDumpItems and Toggles.HiveDumpItems.Value == true then
+								if os.clock() - lastHiveDumpIssueAt > 8 then
+									hiveIssueDump(true, true)
+								end
+							end
+						end)
 					end
 				end
 			end)
@@ -24188,6 +24904,20 @@ local ok, err = pcall(function()
 		local function ensureDropdownHasValue(opt, value)
 			if type(opt) ~= 'table' or value == nil then
 				return
+			end
+			if Options and opt == Options.SoloResumeWaypoint then
+				local onFloor = getgenv().SB2WaypointOnThisFloor
+				local here = false
+				if type(onFloor) == 'function' then
+					local ok, yes = pcall(onFloor, value)
+					here = ok and yes == true
+				end
+				if not here then
+					pcall(function()
+						opt:SetValue('(none)')
+					end)
+					return
+				end
 			end
 			local collectMap = getgenv().SB2CollectMultiSkillMap
 			local syncOrder = getgenv().SB2SyncMultiSkillOrder

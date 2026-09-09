@@ -256,6 +256,46 @@ local function teleportTo(cf)
 	if not char then
 		return false, 'no character'
 	end
+	if typeof(cf) ~= 'CFrame' then
+		return false, 'bad cframe'
+	end
+	if cf.Position.Y < -20 then
+		return false, 'void waypoint'
+	end
+	pcall(function()
+		local h = getgenv().SB2Hive
+		if type(h) == 'table' and type(h.stopMovement) == 'function' then
+			h.stopMovement()
+		end
+	end)
+	pcall(function()
+		LocalPlayer:RequestStreamAroundAsync(cf.Position, 48)
+	end)
+	if type(getgenv().SB2UprightWorldCFrame) == 'function' then
+		local okU, out = pcall(getgenv().SB2UprightWorldCFrame, cf)
+		if okU and typeof(out) == 'CFrame' then
+			cf = out
+		end
+	else
+		cf = CFrame.new(cf.Position)
+	end
+	-- Same mover as hive / Event dive. Bare PivotTo + HRP.CFrame desyncs the server
+	-- so other clients never see you at the pad.
+	if type(getgenv().SB2MoveCharacter) == 'function' then
+		local okMove = pcall(getgenv().SB2MoveCharacter, cf, 0.75)
+		if okMove then
+			if type(getgenv().SB2FixCamera) == 'function' then
+				pcall(getgenv().SB2FixCamera, char)
+			end
+			return true
+		end
+	end
+	if type(getgenv().SB2PinTeleportCFrame) == 'function' then
+		local okPin = pcall(getgenv().SB2PinTeleportCFrame, cf, 0.75)
+		if okPin then
+			return true
+		end
+	end
 	if type(getgenv().SB2HoldCombatAnchor) == 'function' then
 		pcall(getgenv().SB2HoldCombatAnchor, 4)
 	end
@@ -328,18 +368,20 @@ local function findWaypoint(name, anyPlace)
 	end
 	local lname = string.lower(name)
 	local pid = placeId()
+	local other, otherIdx
 	for i, wp in ipairs(store.waypoints) do
 		if type(wp) == 'table' and type(wp.name) == 'string' and string.lower(wp.name) == lname then
-			if anyPlace or tonumber(wp.placeId) == pid or wp.placeId == nil then
+			local wpPlace = tonumber(wp.placeId)
+			if wpPlace == pid or wp.placeId == nil then
 				return wp, i
+			end
+			if not other then
+				other, otherIdx = wp, i
 			end
 		end
 	end
-	-- second pass: same name any place
-	for i, wp in ipairs(store.waypoints) do
-		if type(wp) == 'table' and type(wp.name) == 'string' and string.lower(wp.name) == lname then
-			return wp, i
-		end
+	if anyPlace then
+		return other, otherIdx
 	end
 	return nil, nil
 end
@@ -438,12 +480,49 @@ end
 
 local refreshGui
 
+local function publishHiveWaypoint(wp, doTp)
+	if type(wp) ~= 'table' then
+		return
+	end
+	local Hive = getgenv().SB2Hive
+	if type(Hive) ~= 'table' or Hive._alive ~= true or type(Hive.issue) ~= 'function' then
+		return
+	end
+	if type(Hive.fileOptedIn) == 'function' and Hive.fileOptedIn() ~= true then
+		return
+	end
+	local key = tostring(wp.name)
+		.. ':'
+		.. tostring(doTp == true)
+		.. ':'
+		.. tostring(wp.x)
+		.. ':'
+		.. tostring(wp.z)
+	local now = os.clock()
+	if getgenv().SB2HiveWpKey == key and now - (tonumber(getgenv().SB2HiveWpAt) or 0) < 0.9 then
+		return
+	end
+	getgenv().SB2HiveWpKey = key
+	getgenv().SB2HiveWpAt = now
+	pcall(function()
+		Hive.issue('goto_wp', {
+			name = wp.name,
+			x = tonumber(wp.x),
+			y = tonumber(wp.y),
+			z = tonumber(wp.z),
+			placeId = tonumber(wp.placeId) or game.PlaceId,
+			tp = doTp == true,
+		}, true)
+	end)
+end
+
 local function teleportNamed(name)
 	local wp = findWaypoint(name, true)
 	if not wp then
 		return false, 'waypoint not found'
 	end
 	local ok, err = teleportTo(wpCFrame(wp))
+	publishHiveWaypoint(wp, true)
 	return ok, err
 end
 
@@ -453,11 +532,12 @@ local function getSelectedName()
 	if not name then
 		return nil
 	end
+	-- Other-floor selection stays in the save for when you hop back — hide it here.
 	local wp = findWaypoint(name, false)
 	if not wp then
-		wp = findWaypoint(name, true)
+		return nil
 	end
-	return wp and wp.name or name, wp
+	return wp.name, wp
 end
 
 local function setSelectedName(name, skipCallback)
@@ -472,6 +552,10 @@ local function setSelectedName(name, skipCallback)
 		pcall(refreshGui)
 	end
 	if not skipCallback then
+		local wp = findWaypoint(name, true)
+		if wp then
+			publishHiveWaypoint(wp, false)
+		end
 		local cb = getgenv().SB2OnWaypointSelected
 		if type(cb) == 'function' then
 			pcall(cb, name)
@@ -955,7 +1039,9 @@ local function buildGui()
 			end))
 
 			track(tp.MouseButton1Click:Connect(function()
+				setSelectedName(wp.name, true)
 				local ok, err = teleportTo(wpCFrame(wp))
+				publishHiveWaypoint(wp, true)
 				if ok then
 					setStatus('Teleported → ' .. wp.name)
 				else
@@ -1030,6 +1116,10 @@ getgenv().SB2WaypointsRefreshGui = function()
 	end
 end
 getgenv().SB2WaypointsGetSelected = getSelectedName
+getgenv().SB2WaypointsPeekSelected = function()
+	local store = (getgenv()[GENV_KEY] and getgenv()[GENV_KEY].store) or loadStore()
+	return normalizeName(store.selected)
+end
 getgenv().SB2WaypointsSetSelected = setSelectedName
 getgenv().SB2WaypointsTeleportSelected = teleportSelected
 getgenv().SB2WaypointsTeleportNamed = teleportNamed
@@ -1039,6 +1129,9 @@ getgenv().SB2WaypointsListForPlace = function()
 		names[#names + 1] = wp.name
 	end
 	return names
+end
+getgenv().SB2WaypointOnThisFloor = function(name)
+	return findWaypoint(name, false) ~= nil
 end
 
 getgenv().SB2WaypointsToggleGui = toggleGui

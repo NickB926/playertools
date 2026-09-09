@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.17",
+    "version":  "1.0.18",
     "message":  "Allow Wave Defense place 121252145396212",
     "files":  [
                   "PlayerTools/launch.lua",

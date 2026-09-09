@@ -7,20 +7,26 @@
 	  PlayerTools/hive/roster.json
 	  PlayerTools/hive/commander.json
 
-	Pick a commanding client; other hive clients TP / follow / stack on them.
+	Pick a commanding client; other hive clients TP / floor-hop / stack on them.
 
 	Roles:
 	  commander — issues orders
 	  worker    — executes orders
 	  idle      — heartbeat only
 
-	Orders: stop | follow | stack | rally | combat_on | combat_off | solo_resume | solo_resume_off | boss_route_on | boss_route_off | hide_menu | deposit_crystals | dump_items
+	Orders: stop | stack | rally | goto_floor | combat_on | combat_off | solo_resume | solo_resume_off | boss_route_on | boss_route_off | hide_menu | deposit_crystals | dump_items | goto_wp
+	  goto_floor: Teleport to the commander's PlaceId (same floor). Same floor = no-op.
+	  rally: same instance stacks ON TOP of commander; other job/floor hops then stacks.
+	  goto_wp payload: name, x, y, z, placeId, tp (true = everyone MoveCharacter there).
+	  deposit_crystals / dump_items payload.on == false aborts the trade (toggle off).
+	  dump_items payload.rarities = { Legendary = true, Tribute = true, ... } allowlist.
+	  Crystals/protection scrolls still skipped unless skipCrystals is false.
 
 	Usage from PlayerTools (or alone):
 	  local Hive = loadstring(readfile('PlayerTools/HiveMind.lua'))()
 	  Hive.start()
 	  Hive.claimCommander()
-	  Hive.issue('follow')
+	  Hive.issue('goto_floor')
 ]]
 
 local Players = game:GetService('Players')
@@ -228,10 +234,30 @@ local function getRoot(player)
 end
 
 -- One owner for hive motion. Overlapping 0.85s pins + Combat Anchor lock = rewind.
+local function uprightWorldCFrame(cf)
+	if type(getgenv().SB2UprightWorldCFrame) == 'function' then
+		local ok, out = pcall(getgenv().SB2UprightWorldCFrame, cf)
+		if ok and typeof(out) == 'CFrame' then
+			return out
+		end
+	end
+	if typeof(cf) ~= 'CFrame' then
+		return cf
+	end
+	local p = cf.Position
+	local look = cf.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.05 then
+		return CFrame.new(p)
+	end
+	return CFrame.lookAt(p, p + flat.Unit)
+end
+
 local function warpToCFrame(cf)
 	if typeof(cf) ~= 'CFrame' then
 		return false
 	end
+	cf = uprightWorldCFrame(cf)
 	if type(getgenv().SB2SetAnchorLockCF) == 'function' then
 		pcall(getgenv().SB2SetAnchorLockCF, cf)
 	else
@@ -318,6 +344,146 @@ local function resolveToggles()
 		return L.Toggles
 	end
 	return type(t) == 'table' and t or nil
+end
+
+local function resolveOptions()
+	local L = rawget(_G, 'Library')
+	if type(L) ~= 'table' then
+		L = getgenv().SB2Library or getgenv().Library
+	end
+	if type(L) == 'table' and type(L.Options) == 'table' then
+		return L.Options
+	end
+	local o = rawget(_G, 'Options')
+	return type(o) == 'table' and o or nil
+end
+
+local function applyHiveWaypoint(payload)
+	payload = type(payload) == 'table' and payload or {}
+	local name = tostring(payload.name or '')
+	local x, y, z = tonumber(payload.x), tonumber(payload.y), tonumber(payload.z)
+	local pid = tonumber(payload.placeId)
+	if name ~= '' then
+		pcall(function()
+			local st = getgenv().SB2Waypoints
+			if type(st) == 'table' and type(st.store) == 'table' then
+				local list = st.store.waypoints
+				if type(list) ~= 'table' then
+					st.store.waypoints = {}
+					list = st.store.waypoints
+				end
+				local lname = string.lower(name)
+				local found = false
+				for _, rec in ipairs(list) do
+					if type(rec) == 'table' and string.lower(tostring(rec.name or '')) == lname then
+						if x then
+							rec.x = x
+						end
+						if y then
+							rec.y = y
+						end
+						if z then
+							rec.z = z
+						end
+						if pid then
+							rec.placeId = pid
+						end
+						found = true
+						break
+					end
+				end
+				if not found and x and y and z then
+					list[#list + 1] = {
+						name = name,
+						x = x,
+						y = y,
+						z = z,
+						placeId = pid or game.PlaceId,
+					}
+				end
+				st.store.selected = name
+			end
+		end)
+		pcall(function()
+			if type(getgenv().SB2WaypointsSetSelected) == 'function' then
+				getgenv().SB2WaypointsSetSelected(name, true)
+			end
+		end)
+		pcall(function()
+			if pid and pid ~= game.PlaceId then
+				return
+			end
+			local opts = resolveOptions()
+			local dd = opts and opts.SoloResumeWaypoint
+			if type(dd) == 'table' and type(dd.SetValue) == 'function' then
+				if type(dd.SetValues) == 'function' and type(dd.Values) == 'table' then
+					local has = false
+					for _, v in ipairs(dd.Values) do
+						if v == name then
+							has = true
+							break
+						end
+					end
+					if not has then
+						local vals = {}
+						for _, v in ipairs(dd.Values) do
+							vals[#vals + 1] = v
+						end
+						vals[#vals + 1] = name
+						dd:SetValues(vals)
+					end
+				end
+				dd:SetValue(name)
+			end
+		end)
+	end
+	if payload.tp ~= true then
+		return true, 'selected'
+	end
+	if not (x and y and z) then
+		return false, 'no coords'
+	end
+	if pid and pid ~= game.PlaceId then
+		notify('Waypoint is another floor — skip TP')
+		return false, 'other floor'
+	end
+	if y < -20 then
+		notify('Waypoint is under the map — skip TP')
+		return false, 'void'
+	end
+	pcall(function()
+		if type(Hive.stopMovement) == 'function' then
+			Hive.stopMovement()
+		end
+	end)
+	pcall(function()
+		LocalPlayer:RequestStreamAroundAsync(Vector3.new(x, y, z), 48)
+	end)
+	task.wait(0.12)
+	local cf = CFrame.new(x, y, z)
+	if type(getgenv().SB2UprightWorldCFrame) == 'function' then
+		local ok, out = pcall(getgenv().SB2UprightWorldCFrame, cf)
+		if ok and typeof(out) == 'CFrame' then
+			cf = out
+		end
+	end
+	if type(getgenv().SB2MoveCharacter) == 'function' then
+		pcall(getgenv().SB2MoveCharacter, cf, 0.75)
+	elseif type(getgenv().SB2PinTeleportCFrame) == 'function' then
+		pcall(getgenv().SB2PinTeleportCFrame, cf, 0.75)
+	else
+		pcall(function()
+			local char = LocalPlayer.Character
+			local root = getRoot(LocalPlayer)
+			if char and char.PivotTo then
+				char:PivotTo(cf)
+			elseif root then
+				root.CFrame = cf
+			end
+		end)
+	end
+	Hive.status = 'at_waypoint'
+	return true, 'tp'
 end
 
 local function setCombatToggles(attack, skill)
@@ -566,9 +732,10 @@ end
 local function followOffset(mode, order)
 	local slot, total = workerSlotIndex(order)
 	if mode == 'stack' then
-		return Vector3.new(0, 2 + (slot - 1) * 0.15, 0)
+		-- Sit on the commander's head, then each other — not a ring around them.
+		return Vector3.new(0, 5 + (slot - 1) * 4.5, 0)
 	end
-	-- ring around commander
+	-- ring around commander (legacy follow)
 	local angle = ((slot - 1) / math.max(total, 1)) * math.pi * 2
 	local radius = (order and order.payload and tonumber(order.payload.radius)) or 5
 	return Vector3.new(math.cos(angle) * radius, 3, math.sin(angle) * radius)
@@ -590,13 +757,13 @@ local function commanderDestCFrame(order, mode)
 	local peerPos = peer and peer.pos and Vector3.new(peer.pos.x, peer.pos.y, peer.pos.z) or nil
 	if theirRoot and peerPos and (theirRoot.Position - peerPos).Magnitude > 20 then
 		-- Streamed commander is stale; peer heartbeat is this machine's live pad.
-		return CFrame.new(peerPos) * CFrame.new(offset)
+		return uprightWorldCFrame(CFrame.new(peerPos) * CFrame.new(offset))
 	end
 	if theirRoot then
-		return theirRoot.CFrame * CFrame.new(offset)
+		return uprightWorldCFrame(CFrame.new(theirRoot.Position) * CFrame.new(offset))
 	end
 	if peerPos then
-		return CFrame.new(peerPos) * CFrame.new(offset)
+		return uprightWorldCFrame(CFrame.new(peerPos) * CFrame.new(offset))
 	end
 	return nil
 end
@@ -642,9 +809,15 @@ local function startFollow(mode, order)
 			else
 				getgenv().SB2AnchorLockCF = dest
 			end
+			-- Close on XZ but still pitched over (copied a dive lookAt) — stand them up.
+			local up = myRoot.CFrame.UpVector
+			if typeof(up) == 'Vector3' and up.Y < 0.75 then
+				warpToCFrame(dest)
+			end
 			return
 		end
-		if now - (tonumber(Hive._lastFollowWarp) or 0) < 0.75 then
+		local warpCd = getgenv().SB2WaveDefensePlace == true and 1.4 or 0.75
+		if now - (tonumber(Hive._lastFollowWarp) or 0) < warpCd then
 			return
 		end
 		if getgenv().SB2TpPinActive == true and typeof(getgenv().SB2TpPinCFrame) == 'CFrame' then
@@ -659,12 +832,12 @@ end
 
 local function snapOnceToCommander(order)
 	stopFollow()
-	local dest = commanderDestCFrame(order, 'follow')
+	local dest = commanderDestCFrame(order, 'stack')
 	if dest then
 		warpToCFrame(dest)
 	end
 	Hive.status = 'idle'
-	notify('Warped once — free roam')
+	notify('Stacked on commander — free roam')
 end
 
 local function pendingSnapPath()
@@ -687,7 +860,7 @@ local function rallyToCommander(order)
 		return
 	end
 
-	-- Same server: one warp to them, then let the client walk.
+	-- Same server: stack on their head, then let the client walk.
 	if cmdPeer.jobId == game.JobId and cmdPeer.placeId == game.PlaceId then
 		snapOnceToCommander(order)
 		return
@@ -698,6 +871,7 @@ local function rallyToCommander(order)
 		commanderId = cmdId,
 		seq = order and order.seq,
 		ts = tick(),
+		stack = true,
 	})
 	if type(getgenv().SB2HoldCombatAnchor) == 'function' then
 		pcall(getgenv().SB2HoldCombatAnchor, 1.1)
@@ -711,6 +885,62 @@ local function rallyToCommander(order)
 	end)
 	if not ok then
 		notify('Rally teleport failed: ' .. tostring(err))
+		Hive.status = 'rally_failed'
+		if type(delfile) == 'function' then
+			pcall(delfile, pendingSnapPath())
+		end
+	end
+end
+
+local function hopToCommanderFloor(order)
+	stopFollow()
+	local cmdId = order and tonumber(order.commanderId)
+	local cmdPeer
+	for _, p in ipairs(listPeers()) do
+		if p.userId == cmdId then
+			cmdPeer = p
+			break
+		end
+	end
+	if not cmdPeer then
+		notify('Floor hop failed — commander peer stale')
+		Hive.status = 'rally_failed'
+		return
+	end
+	local destPlace = tonumber(cmdPeer.placeId)
+	if not destPlace then
+		notify('Floor hop failed — no placeId')
+		Hive.status = 'rally_failed'
+		return
+	end
+	if destPlace == game.PlaceId then
+		notify('Already on commander floor')
+		Hive.status = 'idle'
+		return
+	end
+	Hive.status = 'hopping'
+	writeJson(pendingSnapPath(), {
+		commanderId = cmdId,
+		seq = order and order.seq,
+		ts = tick(),
+		stack = true,
+	})
+	if type(getgenv().SB2HoldCombatAnchor) == 'function' then
+		pcall(getgenv().SB2HoldCombatAnchor, 1.1)
+	end
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	notify(('Floor hop → %s'):format(tostring(cmdPeer.name)))
+	local ok, err = pcall(function()
+		if cmdPeer.jobId then
+			TeleportService:TeleportToPlaceInstance(destPlace, cmdPeer.jobId, LocalPlayer)
+		else
+			TeleportService:Teleport(destPlace, LocalPlayer)
+		end
+	end)
+	if not ok then
+		notify('Floor teleport failed: ' .. tostring(err))
 		Hive.status = 'rally_failed'
 		if type(delfile) == 'function' then
 			pcall(delfile, pendingSnapPath())
@@ -1103,37 +1333,32 @@ local function setupTradeListener()
 			local ourRole = weReq and 'Requester' or 'Partner'
 			local theyConfirmed = state[targetRole .. 'Confirmed'] == true
 			local weAccepted = state[ourRole .. 'Accepted'] == true
+			local canLock = Hive._acceptHiveTrades or Hive._depositBusy or Hive.role == 'commander'
 			-- If the other side already confirmed, finish even while still adding (full 400 trap).
 			if theyConfirmed and not weAccepted then
 				if Hive._addingItems then
 					Hive._addingItems = false
 				end
-				if Hive._acceptHiveTrades or Hive._depositBusy or Hive.role == 'commander' or Hive._depositBusy then
-					fireTrade('Trade', 'TradeConfirm', {})
-					fireTrade('Trade', 'TradeAccept', {})
-					local tu = getTradeUI()
-					if tu then
-						pcall(function()
-							if type(tu.Confirm) == 'function' then
-								tu.Confirm()
-							end
-							if type(tu.Accept) == 'function' then
-								tu.Accept()
-							end
-						end)
+				if canLock then
+					local fire = getgenv().SB2HiveFireTradeConfirm
+					local acc = getgenv().SB2HiveFireTradeAccept
+					if type(fire) == 'function' then
+						pcall(fire)
+					else
+						fireTrade('Trade', 'TradeConfirm')
+						fireTrade('Trade', 'TradeConfirm', {})
+					end
+					if type(acc) == 'function' then
+						pcall(acc)
+					else
+						fireTrade('Trade', 'TradeAccept')
+						fireTrade('Trade', 'TradeAccept', {})
 					end
 				end
 				return
 			end
 			if Hive._addingItems then
 				return
-			end
-			if not (Hive._acceptHiveTrades or Hive._depositBusy or Hive.role == 'commander') then
-				return
-			end
-			if theyConfirmed and not weAccepted then
-				fireTrade('Trade', 'TradeConfirm', {})
-				fireTrade('Trade', 'TradeAccept', {})
 			end
 		elseif action == 'TradeCompleted' or action == 'TradeComplete' or action == 'Completed' then
 			Hive._lastTradeAction = 'completed'
@@ -1661,6 +1886,90 @@ local function isCrystalStack(item)
 	return false
 end
 
+local function itemRarityName(item)
+	if not item then
+		return ''
+	end
+	local s = ''
+	pcall(function()
+		local r = item:FindFirstChild('Rarity')
+		if r and r:IsA('ValueBase') then
+			s = tostring(r.Value or '')
+		end
+	end)
+	if s == '' then
+		pcall(function()
+			local db = ReplicatedStorage:FindFirstChild('Database')
+			local items = db and db:FindFirstChild('Items')
+			local ref = items and items:FindFirstChild(item.Name)
+			local rar = ref and ref:FindFirstChild('Rarity')
+			if rar and rar:IsA('ValueBase') then
+				s = tostring(rar.Value or '')
+			end
+		end)
+	end
+	if s == 'Uncomon' then
+		s = 'Uncommon'
+	end
+	return s
+end
+
+local function itemIsCommon(item)
+	return string.lower(itemRarityName(item)) == 'common'
+end
+
+local function normDumpRarity(s)
+	s = tostring(s or ''):gsub('^%s+', ''):gsub('%s+$', '')
+	if s == 'Uncomon' then
+		s = 'Uncommon'
+	end
+	return string.lower(s)
+end
+
+local function rarityAllowMap(raw)
+	local map = {}
+	if type(raw) ~= 'table' then
+		return map
+	end
+	for k, v in pairs(raw) do
+		if v == true and type(k) == 'string' and k ~= '' then
+			map[normDumpRarity(k)] = true
+		elseif type(k) == 'number' and type(v) == 'string' and v ~= '' then
+			map[normDumpRarity(v)] = true
+		elseif type(v) == 'string' and v ~= '' and (v == true or k == v) then
+			map[normDumpRarity(v)] = true
+		end
+	end
+	return map
+end
+
+local function dumpWantsItem(item, equipped, opts)
+	opts = opts or {}
+	if not canTradeItem(item, equipped) then
+		return false
+	end
+	if opts.skipCrystals ~= false and isCrystalStack(item) then
+		return false
+	end
+	if opts.hasRarityFilter then
+		local allow = opts.rarities
+		if type(allow) ~= 'table' or not next(allow) then
+			return false
+		end
+		local rar = normDumpRarity(itemRarityName(item))
+		return rar ~= '' and allow[rar] == true
+	end
+	if opts.skipCommon and itemIsCommon(item) then
+		return false
+	end
+	return true
+end
+
+local function abortHiveTrades()
+	Hive._abortTrade = true
+	getgenv().SB2HiveDumpGen = (getgenv().SB2HiveDumpGen or 0) + 1
+end
+
 local function tradePartnerIs(state, cmd)
 	if type(state) ~= 'table' or not cmd then
 		return false
@@ -1725,6 +2034,127 @@ local function tradeUiLooksOpen(cmd)
 		end
 	end
 	return false
+end
+
+local function tradeButtonMatches(inst, kind)
+	local n = string.lower(tostring(inst.Name or ''))
+	local t = ''
+	pcall(function()
+		if inst:IsA('TextButton') or inst:IsA('TextLabel') then
+			t = string.lower(tostring(inst.Text or ''))
+		end
+	end)
+	if n:find('cancel', 1, true) or t:find('cancel', 1, true) then
+		return false
+	end
+	if kind == 'accept' then
+		return n:find('accept', 1, true) or t:find('accept', 1, true)
+	end
+	return n:find('confirm', 1, true)
+		or n:find('ready', 1, true)
+		or t:find('confirm', 1, true)
+		or t == 'ready'
+end
+
+local function clickTradeGui(kind)
+	local tf = findTradeRoot()
+	if not tf then
+		return false
+	end
+	local hit = false
+	for _, inst in ipairs(tf:GetDescendants()) do
+		if not inst:IsA('GuiButton') then
+			continue
+		end
+		if not tradeButtonMatches(inst, kind) then
+			continue
+		end
+		pcall(function()
+			inst.Visible = true
+			inst.Active = true
+			if inst:IsA('GuiObject') then
+				inst.AutoButtonColor = inst.AutoButtonColor
+			end
+		end)
+		if type(firesignal) == 'function' then
+			pcall(firesignal, inst.MouseButton1Click)
+			pcall(firesignal, inst.Activated)
+		end
+		if type(getconnections) == 'function' then
+			pcall(function()
+				for _, sigName in ipairs({ 'MouseButton1Click', 'Activated', 'MouseButton1Down' }) do
+					local ok, conns = pcall(getconnections, inst[sigName])
+					if ok and type(conns) == 'table' then
+						for _, c in ipairs(conns) do
+							pcall(function()
+								if type(c.Fire) == 'function' then
+									c:Fire()
+								elseif type(c.Function) == 'function' then
+									c.Function()
+								end
+							end)
+						end
+					end
+				end
+			end)
+		end
+		hit = true
+	end
+	return hit
+end
+
+local function fireTradeConfirm()
+	fireTrade('Trade', 'TradeConfirm')
+	fireTrade('Trade', 'TradeConfirm', {})
+	fireTrade('Trade', 'Confirm')
+	invokeTrade('Trade', 'TradeConfirm', {})
+	local tu = getTradeUI()
+	if tu and type(tu.Confirm) == 'function' then
+		pcall(tu.Confirm)
+	end
+	clickTradeGui('confirm')
+end
+
+local function fireTradeAccept()
+	fireTrade('Trade', 'TradeAccept')
+	fireTrade('Trade', 'TradeAccept', {})
+	fireTrade('Trade', 'Accept')
+	invokeTrade('Trade', 'TradeAccept', {})
+	local tu = getTradeUI()
+	if tu and type(tu.Accept) == 'function' then
+		pcall(tu.Accept)
+	end
+	clickTradeGui('accept')
+end
+
+getgenv().SB2HiveFireTradeConfirm = fireTradeConfirm
+getgenv().SB2HiveFireTradeAccept = fireTradeAccept
+
+local function weHaveConfirmed(state)
+	state = state or Hive._tradeState
+	if type(state) ~= 'table' then
+		return false
+	end
+	return state[ourTradeRole() .. 'Confirmed'] == true
+end
+
+local function theyHaveConfirmed(state)
+	state = state or Hive._tradeState
+	if type(state) ~= 'table' then
+		return false
+	end
+	local weReq = tradeUserId(state, 'Requester') == USER_ID
+		or (typeof(state.Requester) == 'Instance' and state.Requester == LocalPlayer)
+	local theyRole = weReq and 'Partner' or 'Requester'
+	return state[theyRole .. 'Confirmed'] == true
+end
+
+local function weHaveAccepted(state)
+	state = state or Hive._tradeState
+	if type(state) ~= 'table' then
+		return false
+	end
+	return state[ourTradeRole() .. 'Accepted'] == true
 end
 
 local function tradeStateReady(state, cmd)
@@ -1914,39 +2344,50 @@ end
 
 local function confirmTrade()
 	Hive._addingItems = false
-	local settle = Hive._addedSlow and TRADE_SETTLE or TRADE_SETTLE_FAST
+	local settle = math.max(0.85, Hive._addedSlow and TRADE_SETTLE or 0.55)
 	task.wait(settle)
 	if tradeAborted() or Hive._lastTradeAction == 'cancel' then
 		return false
 	end
-	local genBefore = Hive._tradeGen or 0
-	fireTrade('Trade', 'TradeConfirm', {})
-	task.wait(0.2)
-	fireTrade('Trade', 'TradeAccept', {})
-	local tu = getTradeUI()
-	if tu then
-		pcall(function()
-			if type(tu.Confirm) == 'function' then
-				tu.Confirm()
-			end
-		end)
-		task.wait(0.15)
-		pcall(function()
-			if type(tu.Accept) == 'function' then
-				tu.Accept()
-			end
-		end)
+	notify('Confirming trade')
+	local deadline = os.clock() + 10
+	while os.clock() < deadline and not tradeAborted() do
+		if Hive._lastTradeAction == 'cancel' then
+			return false
+		end
+		if Hive._lastTradeAction == 'completed' then
+			return true
+		end
+		fireTradeConfirm()
+		if weHaveConfirmed() then
+			break
+		end
+		task.wait(0.35)
 	end
-	-- #region agent log
-	pcall(function()
-		warn('[TRADE-DBG] confirmTrade fired last=' .. tostring(Hive._lastTradeAction))
-	end)
-	-- #endregion
+	deadline = os.clock() + 12
+	while os.clock() < deadline and not tradeAborted() do
+		if Hive._lastTradeAction == 'cancel' then
+			return false
+		end
+		if Hive._lastTradeAction == 'completed' then
+			Hive._tradeState = nil
+			getgenv().SB2HiveTradeOpenLock = false
+			return true
+		end
+		if theyHaveConfirmed() or weHaveConfirmed() then
+			fireTradeAccept()
+		else
+			fireTradeConfirm()
+		end
+		task.wait(0.35)
+	end
 	local ok = waitFor(TRADE_COMPLETE_TIMEOUT, function()
 		if Hive._lastTradeAction == 'completed' or Hive._lastTradeAction == 'cancel' then
 			return true
 		end
-		-- Completion event name can differ; UI closed + no state == done.
+		if weHaveAccepted() and theyHaveConfirmed() then
+			fireTradeAccept()
+		end
 		if type(Hive._tradeState) ~= 'table' and not tradeUiLooksOpen() then
 			Hive._lastTradeAction = 'completed'
 			return true
@@ -1954,18 +2395,6 @@ local function confirmTrade()
 		return false
 	end)
 	local success = ok and Hive._lastTradeAction == 'completed'
-	-- #region agent log
-	pcall(function()
-		warn('[TRADE-DBG] confirmTrade result ok='
-			.. tostring(success)
-			.. ' last='
-			.. tostring(Hive._lastTradeAction)
-			.. ' gen='
-			.. tostring(genBefore)
-			.. '→'
-			.. tostring(Hive._tradeGen))
-	end)
-	-- #endregion
 	if success then
 		Hive._tradeState = nil
 		getgenv().SB2HiveTradeOpenLock = false
@@ -2077,6 +2506,10 @@ local function depositCrystals(order)
 		return
 	end
 	local payload = order and order.payload or {}
+	if payload.on == false then
+		return
+	end
+	local persist = payload.persist == true
 	local rarity = tostring(payload.rarity or 'Legendary')
 	local amount = math.max(1, math.floor(tonumber(payload.amount) or 64))
 	local crystalName = rarity .. ' Upgrade Crystal'
@@ -2093,7 +2526,7 @@ local function depositCrystals(order)
 
 	local inv = getInventory()
 	local item = inv and inv:FindFirstChild(crystalName)
-	if not item then
+	if not item and not persist then
 		notify('No ' .. crystalName)
 		Hive.status = 'deposit_failed'
 		return
@@ -2105,50 +2538,64 @@ local function depositCrystals(order)
 	setupTradeListener()
 
 	task.spawn(function()
-		local remaining = amount
 		local totalSent = 0
-		while remaining > 0 and not tradeAborted() do
-			item = getInventory() and getInventory():FindFirstChild(crystalName)
-			if not item then
-				break
-			end
-			local owned = itemCount(item)
-			if owned <= 0 then
-				break
-			end
-			local want = math.min(remaining, owned, TRADE_MAX)
-			local added, status = runTradeBatch(cmd, function(addOne)
-				local n = 0
-				while n < want do
-					item = getInventory() and getInventory():FindFirstChild(crystalName)
-					if not item or itemCount(item) <= 0 then
-						break
-					end
-					local ok, why = addOne(item, 'fast')
-					if not ok then
-						return false, why
-					end
-					n += 1
+		repeat
+			local remaining = amount
+			local passSent = 0
+			while remaining > 0 and not tradeAborted() do
+				item = getInventory() and getInventory():FindFirstChild(crystalName)
+				if not item then
+					break
 				end
-				return true
-			end)
-			if status == 'abort' or status == 'request' or status == 'confirm' then
-				if status ~= 'abort' then
-					notify('Crystal deposit failed: ' .. tostring(status))
+				local owned = itemCount(item)
+				if owned <= 0 then
+					break
 				end
-				break
+				local want = math.min(remaining, owned, TRADE_MAX)
+				local added, status = runTradeBatch(cmd, function(addOne)
+					local n = 0
+					while n < want do
+						item = getInventory() and getInventory():FindFirstChild(crystalName)
+						if not item or itemCount(item) <= 0 then
+							break
+						end
+						local ok, why = addOne(item, 'fast')
+						if not ok then
+							return false, why
+						end
+						n += 1
+					end
+					return true
+				end)
+				if status == 'abort' or status == 'request' or status == 'confirm' then
+					if status ~= 'abort' then
+						notify('Crystal deposit failed: ' .. tostring(status))
+					end
+					break
+				end
+				if status == 'empty' then
+					break
+				end
+				if status == 'ok' then
+					totalSent += added
+					passSent += added
+					remaining -= added
+				end
+				if added <= 0 and status ~= 'bounce' then
+					break
+				end
 			end
-			if status == 'empty' then
-				break
+			if persist and not tradeAborted() then
+				if passSent <= 0 then
+					local waitUntil = os.clock() + 4
+					while os.clock() < waitUntil and not tradeAborted() do
+						task.wait(0.35)
+					end
+				else
+					task.wait(0.5)
+				end
 			end
-			if status == 'ok' then
-				totalSent += added
-				remaining -= added
-			end
-			if added <= 0 and status ~= 'bounce' then
-				break
-			end
-		end
+		until not persist or tradeAborted()
 		Hive._depositBusy = false
 		Hive._addingItems = false
 		if Hive.status == 'trading' then
@@ -2187,6 +2634,21 @@ local function dumpAllItems(order)
 		notify('Dump skipped — this client is the commander')
 		return
 	end
+	local payload = order and order.payload or {}
+	if payload.on == false then
+		getgenv().SB2HiveDumpBusy = false
+		Hive._depositBusy = false
+		return
+	end
+	local skipCrystals = payload.skipCrystals ~= false
+	local skipCommon = payload.skipCommon ~= false
+	local persist = payload.persist == true
+	local dumpOpts = {
+		skipCrystals = skipCrystals,
+		skipCommon = skipCommon,
+		rarities = rarityAllowMap(payload.rarities),
+		hasRarityFilter = type(payload.rarities) == 'table',
+	}
 
 	Hive._abortTrade = false
 	Hive.status = 'trading'
@@ -2213,22 +2675,26 @@ local function dumpAllItems(order)
 			return
 		end
 		ensureGameChatVisible()
-		notify(('Dump start — same server as %s (no TP)'):format(cmd.Name))
+		notify(('Dump start — same server as %s (no TP, rarities filtered, skip crystals=%s)'):format(
+			cmd.Name,
+			tostring(skipCrystals)
+		))
 
 		local equipped = equippedIdSet()
 		local inv = getInventory()
 		local tradeable = 0
 		if inv then
 			for _, item in ipairs(inv:GetChildren()) do
-				if canTradeItem(item, equipped) then
+				if dumpWantsItem(item, equipped, dumpOpts) then
 					tradeable += 1
 				end
 			end
 		end
-		notify(('Dump start — %s tradeable (locked/equipped skipped)'):format(tostring(tradeable)))
+		notify(('Dump start — %s tradeable (rarity filter / crystals / locked skipped)'):format(tostring(tradeable)))
 
 		local totalSent = 0
 		local batches = 0
+		repeat
 		local emptyStreak = 0
 		local loopIter = 0
 		while not tradeAborted() and getgenv().SB2HiveDumpGen == dumpGen do
@@ -2241,7 +2707,7 @@ local function dumpAllItems(order)
 			end
 			local hasAny = false
 			for _, item in ipairs(inv:GetChildren()) do
-				if canTradeItem(item, equipped) then
+				if dumpWantsItem(item, equipped, dumpOpts) then
 					hasAny = true
 					break
 				end
@@ -2263,7 +2729,7 @@ local function dumpAllItems(order)
 							if tradeAborted() then
 								return false, 'abort'
 							end
-							if not canTradeItem(item, equipped) then
+							if not dumpWantsItem(item, equipped, dumpOpts) then
 								continue
 							end
 							if crystalsOnly ~= isCrystalStack(item) then
@@ -2308,11 +2774,11 @@ local function dumpAllItems(order)
 						end
 						return true
 					end
-					-- Gear/uniques first — crystal stacks used to fill all 400 slots before items.
+					-- Gear/uniques first. Crystals are skipped unless skipCrystals is false.
 					local lastWhy = nil
 					local ok, why = addFromInv(false)
 					lastWhy = why
-					if ok or why == 'full' then
+					if skipCrystals ~= true and (ok or why == 'full') then
 						ok, why = addFromInv(true)
 						if why then
 							lastWhy = why
@@ -2321,6 +2787,7 @@ local function dumpAllItems(order)
 					-- Always try vel before closing the add phase (even when item slots are full).
 					if lastWhy ~= 'abort' and lastWhy ~= 'cancel' and Hive._lastTradeAction ~= 'cancel' then
 						offerVelToCommander(cmd)
+						task.wait(0.55)
 					end
 					if lastWhy == 'abort' or lastWhy == 'cancel' then
 						return false, lastWhy
@@ -2385,6 +2852,15 @@ local function dumpAllItems(order)
 				break
 			end
 		end
+		if persist and not tradeAborted() and getgenv().SB2HiveDumpGen == dumpGen then
+			local waitUntil = os.clock() + 5
+			while os.clock() < waitUntil and not tradeAborted() and getgenv().SB2HiveDumpGen == dumpGen do
+				task.wait(0.4)
+			end
+		else
+			break
+		end
+		until tradeAborted() or getgenv().SB2HiveDumpGen ~= dumpGen
 		dumpDone()
 		if tradeAborted() then
 			notify('Dump stopped')
@@ -2423,7 +2899,8 @@ local function handleOrder(order)
 		or t == 'hide_menu'
 	if tonumber(order.commanderId) == USER_ID and not allClients then
 		-- Still arm trade accept when workers are dumping to us.
-		if t == 'dump_items' or t == 'deposit_crystals' then
+		local payload = type(order.payload) == 'table' and order.payload or {}
+		if (t == 'dump_items' or t == 'deposit_crystals') and payload.on ~= false then
 			Hive._acceptHiveTrades = true
 			setupTradeListener()
 			Hive.status = 'commanding'
@@ -2468,20 +2945,27 @@ local function handleOrder(order)
 	end
 
 	if t == 'stop' then
-		Hive._abortTrade = true
+		abortHiveTrades()
 		stopFollow()
 		setCombatToggles(false, false)
 		Hive.status = 'idle'
 		notify('Order: stop')
-	elseif t == 'follow' then
-		startFollow('follow', order)
-		notify('Order: follow')
+	elseif t == 'follow' or t == 'goto_floor' then
+		hopToCommanderFloor(order)
 	elseif t == 'stack' then
 		startFollow('stack', order)
 		notify('Order: stack')
 	elseif t == 'rally' then
 		stopFollow()
 		rallyToCommander(order)
+	elseif t == 'goto_wp' then
+		task.spawn(function()
+			local okWp, whyWp = applyHiveWaypoint(order.payload)
+			notify(
+				okWp and ('Order: waypoint ' .. tostring(whyWp) .. ' ' .. tostring(order.payload and order.payload.name or ''))
+					or ('Waypoint skip: ' .. tostring(whyWp))
+			)
+		end)
 	elseif t == 'combat_on' then
 		setCombatToggles(true, true)
 		local payload = type(order.payload) == 'table' and order.payload or {}
@@ -2552,9 +3036,19 @@ local function handleOrder(order)
 		end)
 		notify('Order: hide menu')
 	elseif t == 'deposit_crystals' then
-		depositCrystals(order)
+		if type(order.payload) == 'table' and order.payload.on == false then
+			abortHiveTrades()
+			notify('Order: deposit off')
+		else
+			depositCrystals(order)
+		end
 	elseif t == 'dump_items' then
-		dumpAllItems(order)
+		if type(order.payload) == 'table' and order.payload.on == false then
+			abortHiveTrades()
+			notify('Order: dump off')
+		else
+			dumpAllItems(order)
+		end
 	else
 		notify('Unknown order: ' .. tostring(t))
 	end
@@ -2568,18 +3062,20 @@ function Hive.readOrder()
 	return readOrder()
 end
 
-function Hive.issue(orderType, payload)
+function Hive.issue(orderType, payload, quiet)
 	if not Hive._alive then
 		notify('Join hive first')
 		return nil
 	end
 	local order = writeOrder(orderType, payload, Hive.selectedCommanderId)
 	if order then
-		notify(('Issued %s → commander %s (#%s)'):format(
-			tostring(orderType),
-			tostring(order.commanderId),
-			tostring(order.seq)
-		))
+		if quiet ~= true then
+			notify(('Issued %s → commander %s (#%s)'):format(
+				tostring(orderType),
+				tostring(order.commanderId),
+				tostring(order.seq)
+			))
+		end
 	else
 		notify('Failed to write order (writefile?)')
 	end
@@ -2774,7 +3270,7 @@ function Hive.start()
 			if Hive._alive then
 				snapOnceToCommander({
 					commanderId = pending.commanderId,
-					payload = { radius = 5 },
+					payload = {},
 				})
 			end
 		end)
