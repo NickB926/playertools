@@ -163,10 +163,24 @@ function Library:Notify(text, duration)
 		return
 	end
 	holder.Position = UDim2.new(1, -396, 0, 16)
+	if not holder:FindFirstChildOfClass('UIListLayout') then
+		local lay = Instance.new('UIListLayout')
+		lay.SortOrder = Enum.SortOrder.LayoutOrder
+		lay.Padding = UDim.new(0, 8)
+		lay.Parent = holder
+	end
+	-- Cap stacked toasts so a notify storm cannot fill the screen.
+	local existing = {}
 	for _, ch in ipairs(holder:GetChildren()) do
-		if ch:IsA('GuiObject') then
-			ch:Destroy()
+		if ch:IsA('GuiObject') and ch.Name == 'Toast' then
+			existing[#existing + 1] = ch
 		end
+	end
+	while #existing >= 4 do
+		local oldest = table.remove(existing, 1)
+		pcall(function()
+			oldest:Destroy()
+		end)
 	end
 	local body = tostring(text):gsub('\r\n', '\n'):gsub('\r', '\n')
 	local rows = {}
@@ -387,6 +401,9 @@ local function makeShowPill(gui, title)
 end
 
 function Library:Unload()
+	if self.Config then
+		pcall(self.Config.Finish)
+	end
 	self.Unloaded = true
 	for _, c in ipairs(self._conns) do
 		pcall(function()
@@ -404,6 +421,493 @@ function Library:Unload()
 	table.clear(self.Options)
 	table.clear(self.Toggles)
 	table.clear(self.Tabs)
+	-- Anti-AFK and HideGameplayPaused stay armed across Unload so a script
+	-- reload does not bring the idle kick or pause banner back.
+end
+
+---------------------------------------------------------------------------
+-- Anti-AFK (Infinite Yield style) — built into every CreateWindow so games
+-- do not each reimplement mute-Idled + VirtualUser. No jump / keys / camera.
+---------------------------------------------------------------------------
+local AntiAfk = (function()
+	local api = {}
+	local FILE = 'Ataraxia/antiafk'
+	local remuteAt = 0
+	local vuPulseAt = 0
+	local rebindIdled
+
+	local function fileDefaultOn()
+		if type(isfile) == 'function' and type(readfile) == 'function' then
+			local ok, exists = pcall(isfile, FILE)
+			if ok and exists then
+				local rok, body = pcall(readfile, FILE)
+				if rok and tostring(body):lower():find('false', 1, true) then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	local function writeFile(on)
+		if type(writefile) ~= 'function' then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+				makefolder('Ataraxia')
+			end
+		end)
+		pcall(writefile, FILE, on and 'true' or 'false')
+	end
+
+	local function pulseVirtualUser(reason)
+		pcall(function()
+			local vu = game:GetService('VirtualUser')
+			vu:CaptureController()
+			vu:ClickButton2(Vector2.zero)
+		end)
+		getgenv().AtaraxiaAntiAfkLastPulse = os.clock()
+		getgenv().AtaraxiaAntiAfkLastReason = reason or 'pulse'
+	end
+
+	-- Disable every Idled listener. getconnections() proxies are never == to the
+	-- RBXScriptConnection from :Connect(), so we always re-bind ours afterward.
+	local function muteIdledKick()
+		if type(getconnections) ~= 'function' then
+			return
+		end
+		pcall(function()
+			for _, conn in ipairs(getconnections(LocalPlayer.Idled)) do
+				pcall(function()
+					if conn.Disable then
+						conn:Disable()
+					elseif conn.Disconnect then
+						conn:Disconnect()
+					end
+				end)
+			end
+		end)
+	end
+
+	local function onIdled()
+		if getgenv().AtaraxiaAntiAfkOn ~= true then
+			return
+		end
+		pulseVirtualUser('idled')
+		muteIdledKick()
+		rebindIdled()
+	end
+
+	rebindIdled = function()
+		local prev = getgenv().AtaraxiaAntiAfkConn
+		if prev then
+			pcall(function()
+				prev:Disconnect()
+			end)
+		end
+		getgenv().AtaraxiaAntiAfkConn = LocalPlayer.Idled:Connect(onIdled)
+	end
+
+	local function remuteAndRebind()
+		muteIdledKick()
+		rebindIdled()
+	end
+
+	function api.stop()
+		getgenv().AtaraxiaAntiAfkOn = false
+		local prev = getgenv().AtaraxiaAntiAfkConn
+		if prev then
+			pcall(function()
+				prev:Disconnect()
+			end)
+		end
+		getgenv().AtaraxiaAntiAfkConn = nil
+		local pulse = getgenv().AtaraxiaAntiAfkPulse
+		if pulse then
+			pcall(function()
+				pulse:Disconnect()
+			end)
+		end
+		getgenv().AtaraxiaAntiAfkPulse = nil
+		writeFile(false)
+	end
+
+	function api.start()
+		local pulse = getgenv().AtaraxiaAntiAfkPulse
+		if pulse then
+			pcall(function()
+				pulse:Disconnect()
+			end)
+		end
+		getgenv().AtaraxiaAntiAfkOn = true
+		writeFile(true)
+		remuteAndRebind()
+		getgenv().AtaraxiaAntiAfkPulse = RunService.Heartbeat:Connect(function()
+			if getgenv().AtaraxiaAntiAfkOn ~= true then
+				return
+			end
+			local now = os.clock()
+			-- Remute often: engine can re-bind Idled kick listeners.
+			if now - remuteAt >= 8 then
+				remuteAt = now
+				remuteAndRebind()
+			end
+			-- Backup VU click if Idled never fires (some clients stay quiet until kick).
+			if now - vuPulseAt >= 540 then
+				vuPulseAt = now
+				pulseVirtualUser('heartbeat')
+			end
+		end)
+		vuPulseAt = os.clock()
+		remuteAt = os.clock()
+	end
+
+	function api.isOn()
+		return getgenv().AtaraxiaAntiAfkOn == true
+	end
+
+	function api.ensure()
+		if fileDefaultOn() then
+			if not api.isOn() or not getgenv().AtaraxiaAntiAfkConn or not getgenv().AtaraxiaAntiAfkPulse then
+				api.start()
+			else
+				remuteAndRebind()
+			end
+		end
+	end
+
+	return api
+end)()
+
+function Library:SetAntiAfk(on)
+	if on == false then
+		AntiAfk.stop()
+	else
+		AntiAfk.start()
+	end
+	return AntiAfk.isOn()
+end
+
+function Library:IsAntiAfk()
+	return AntiAfk.isOn()
+end
+
+---------------------------------------------------------------------------
+-- Invisicam. Games reset DevCameraOcclusionMode, so this re-applies. Opt out:
+-- CreateWindow{ Invisicam = false }. Persists in Ataraxia/invisicam like Anti-AFK.
+---------------------------------------------------------------------------
+local Occlusion = (function()
+	local api = {}
+	local FILE = 'Ataraxia/invisicam'
+
+	local function fileDefaultOn()
+		if type(isfile) == 'function' and type(readfile) == 'function' then
+			local ok, exists = pcall(isfile, FILE)
+			if ok and exists then
+				local rok, body = pcall(readfile, FILE)
+				if rok and tostring(body):lower():find('false', 1, true) then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	local function writeFile(on)
+		if type(writefile) ~= 'function' then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+				makefolder('Ataraxia')
+			end
+		end)
+		pcall(writefile, FILE, on and 'true' or 'false')
+	end
+
+	local function savedMode()
+		if getgenv().AtaraxiaSavedOcclusion == nil then
+			pcall(function()
+				getgenv().AtaraxiaSavedOcclusion = LocalPlayer.DevCameraOcclusionMode
+			end)
+		end
+		return getgenv().AtaraxiaSavedOcclusion or Enum.DevCameraOcclusionMode.Zoom
+	end
+
+	local function apply(on)
+		pcall(function()
+			local want = on and Enum.DevCameraOcclusionMode.Invisicam or savedMode()
+			if LocalPlayer.DevCameraOcclusionMode ~= want then
+				LocalPlayer.DevCameraOcclusionMode = want
+			end
+		end)
+	end
+
+	function api.set(on)
+		local want = on == true
+		local was = getgenv().AtaraxiaInvisicamOn == true
+		getgenv().AtaraxiaInvisicamOn = want
+		apply(want)
+		if was ~= want then
+			writeFile(want)
+		end
+	end
+
+	function api.isOn()
+		return getgenv().AtaraxiaInvisicamOn == true
+	end
+
+	function api.tick()
+		if getgenv().AtaraxiaInvisicamOn == true then
+			apply(true)
+		end
+	end
+
+	function api.ensure()
+		if fileDefaultOn() then
+			getgenv().AtaraxiaInvisicamOn = true
+			apply(true)
+		end
+	end
+
+	return api
+end)()
+
+function Library:SetInvisicam(on)
+	if on == false then
+		Occlusion.set(false)
+	else
+		Occlusion.set(true)
+	end
+	return Occlusion.isOn()
+end
+
+function Library:IsInvisicam()
+	return Occlusion.isOn()
+end
+
+---------------------------------------------------------------------------
+-- Hide Roblox "Gameplay Paused". The engine stall is not switchable from Lua;
+-- this only keeps the CoreGui banner off. Opt out: CreateWindow{ HideGameplayPaused = false }.
+-- Persists in Ataraxia/nopause. Stays armed across Unload like Anti-AFK.
+---------------------------------------------------------------------------
+local NoPause = (function()
+	local api = {}
+	local FILE = 'Ataraxia/nopause'
+	local NAME = 'RobloxNetworkPauseNotification'
+
+	local function fileDefaultOn()
+		if type(isfile) == 'function' and type(readfile) == 'function' then
+			local ok, exists = pcall(isfile, FILE)
+			if ok and exists then
+				local rok, body = pcall(readfile, FILE)
+				if rok and tostring(body):lower():find('false', 1, true) then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	local function writeFile(on)
+		if type(writefile) ~= 'function' then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+				makefolder('Ataraxia')
+			end
+		end)
+		pcall(writefile, FILE, on and 'true' or 'false')
+	end
+
+	local function setEngineFlag(hide)
+		pcall(function()
+			GuiService:SetGameplayPausedNotificationEnabled(hide ~= true)
+		end)
+	end
+
+	local function silence(sg)
+		if not sg then
+			return
+		end
+		pcall(function()
+			if sg:IsA('LayerCollector') then
+				sg.Enabled = false
+			end
+			if sg:IsA('GuiObject') then
+				sg.Visible = false
+			end
+			for _, d in ipairs(sg:GetDescendants()) do
+				if d:IsA('GuiObject') then
+					d.Visible = false
+				end
+			end
+		end)
+	end
+
+	local function hookOverlay(sg)
+		if not sg then
+			return
+		end
+		silence(sg)
+		if sg:GetAttribute('AtaraxiaNoPause') == true then
+			return
+		end
+		pcall(function()
+			sg:SetAttribute('AtaraxiaNoPause', true)
+		end)
+		local hooks = getgenv().AtaraxiaNoPauseHooks
+		if type(hooks) ~= 'table' then
+			hooks = {}
+			getgenv().AtaraxiaNoPauseHooks = hooks
+		end
+		if sg:IsA('LayerCollector') then
+			hooks[#hooks + 1] = sg:GetPropertyChangedSignal('Enabled'):Connect(function()
+				if getgenv().AtaraxiaNoPauseOn == true and sg.Enabled then
+					silence(sg)
+				end
+			end)
+		end
+		hooks[#hooks + 1] = sg.DescendantAdded:Connect(function(d)
+			if getgenv().AtaraxiaNoPauseOn == true and d:IsA('GuiObject') then
+				pcall(function()
+					d.Visible = false
+				end)
+			end
+		end)
+	end
+
+	local function scan()
+		local ok, CoreGui = pcall(function()
+			return game:GetService('CoreGui')
+		end)
+		if not ok or not CoreGui then
+			return
+		end
+		pcall(function()
+			hookOverlay(CoreGui:FindFirstChild(NAME))
+		end)
+		pcall(function()
+			local rg = CoreGui:FindFirstChild('RobloxGui')
+			if not rg then
+				return
+			end
+			for _, child in ipairs(rg:GetChildren()) do
+				local n = child.Name
+				if n == 'NetworkPause' or n == 'CoreScripts/NetworkPause' then
+					hookOverlay(child)
+				end
+			end
+		end)
+	end
+
+	local function dropHooks()
+		local hooks = getgenv().AtaraxiaNoPauseHooks
+		if type(hooks) == 'table' then
+			for _, c in ipairs(hooks) do
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+		end
+		getgenv().AtaraxiaNoPauseHooks = {}
+	end
+
+	function api.stop()
+		getgenv().AtaraxiaNoPauseOn = false
+		local watch = getgenv().AtaraxiaNoPauseWatch
+		if watch then
+			pcall(function()
+				watch:Disconnect()
+			end)
+		end
+		getgenv().AtaraxiaNoPauseWatch = nil
+		local tick = getgenv().AtaraxiaNoPauseTick
+		if tick then
+			pcall(function()
+				tick:Disconnect()
+			end)
+		end
+		getgenv().AtaraxiaNoPauseTick = nil
+		dropHooks()
+		setEngineFlag(false)
+		pcall(function()
+			local sg = game:GetService('CoreGui'):FindFirstChild(NAME)
+			if sg and sg:IsA('LayerCollector') then
+				sg.Enabled = true
+			end
+		end)
+		writeFile(false)
+	end
+
+	function api.start()
+		getgenv().AtaraxiaNoPauseOn = true
+		writeFile(true)
+		setEngineFlag(true)
+		scan()
+		if not getgenv().AtaraxiaNoPauseWatch then
+			local ok, CoreGui = pcall(function()
+				return game:GetService('CoreGui')
+			end)
+			if ok and CoreGui then
+				getgenv().AtaraxiaNoPauseWatch = CoreGui.ChildAdded:Connect(function(ch)
+					if getgenv().AtaraxiaNoPauseOn ~= true then
+						return
+					end
+					if ch.Name == NAME or ch.Name == 'NetworkPause' then
+						hookOverlay(ch)
+					end
+					setEngineFlag(true)
+				end)
+			end
+		end
+		if not getgenv().AtaraxiaNoPauseTick then
+			getgenv().AtaraxiaNoPauseTick = RunService.Heartbeat:Connect(function()
+				if getgenv().AtaraxiaNoPauseOn ~= true then
+					return
+				end
+				local now = os.clock()
+				if now - (getgenv().AtaraxiaNoPauseScanAt or 0) < 0.35 then
+					return
+				end
+				getgenv().AtaraxiaNoPauseScanAt = now
+				setEngineFlag(true)
+				pcall(function()
+					local sg = game:GetService('CoreGui'):FindFirstChild(NAME)
+					if sg and sg:IsA('LayerCollector') and sg.Enabled then
+						silence(sg)
+					end
+				end)
+			end)
+		end
+	end
+
+	function api.isOn()
+		return getgenv().AtaraxiaNoPauseOn == true
+	end
+
+	function api.ensure()
+		if fileDefaultOn() then
+			api.start()
+		end
+	end
+
+	return api
+end)()
+
+function Library:SetHideGameplayPaused(on)
+	if on == false then
+		NoPause.stop()
+	else
+		NoPause.start()
+	end
+	return NoPause.isOn()
+end
+
+function Library:IsHideGameplayPaused()
+	return NoPause.isOn()
 end
 
 local function fireChanged(obj, value)
@@ -1361,8 +1865,544 @@ local function makeGroupbox(sideParent, title)
 	return box
 end
 
+---------------------------------------------------------------------------
+-- Account-based profiles.
+-- Named files live in Ataraxia/<game>/profiles/ and are a shared list every
+-- account can load. Autoload is Ataraxia/<game>/autoload/<account>.txt so a
+-- save on one alt does not boot that profile on another. Each game folder is
+-- its own set (Dungeon Lootr ≠ PlayerTools).
+---------------------------------------------------------------------------
+Library.Config = (function()
+	local HttpService = game:GetService('HttpService')
+	local KINDS = { Toggle = true, Slider = true, Dropdown = true, Input = true, KeyPicker = true }
+	local SKIP_PREFIX = 'ATA_'
+	local SAVE_DELAY = 1.5
+	local api = {}
+	local gameFolder = 'default'
+	local skip = {}
+	local suspended, dirty, saveAt = false, false, 0
+	local defaults = nil
+	local statusLabel = nil
+	local assignedName = nil
+
+	local function sanitize(s, fallback)
+		s = tostring(s or ''):gsub('^%s+', ''):gsub('%s+$', '')
+		s = s:gsub('[^%w%._ %-]', '')
+		s = s:gsub('%s+', ' ')
+		if s == '' then
+			return fallback or ''
+		end
+		if #s > 48 then
+			s = s:sub(1, 48)
+		end
+		return s
+	end
+
+	local function accountKey()
+		local name = string.lower(tostring(LocalPlayer.Name or 'unknown'))
+		name = name:gsub('[^%w_%-]', '_')
+		if name == '' then
+			name = 'unknown'
+		end
+		return name
+	end
+
+	local function rootDir()
+		return 'Ataraxia/' .. gameFolder
+	end
+
+	local function profileDir()
+		return rootDir() .. '/profiles'
+	end
+
+	local function autoloadDir()
+		return rootDir() .. '/autoload'
+	end
+
+	local function accountDir()
+		return rootDir() .. '/accounts'
+	end
+
+	local function profilePath(name)
+		return profileDir() .. '/' .. name .. '.json'
+	end
+
+	local function autoloadPath()
+		return autoloadDir() .. '/' .. accountKey() .. '.txt'
+	end
+
+	local function accountPath()
+		return accountDir() .. '/' .. accountKey() .. '.json'
+	end
+
+	local function ensureDirs()
+		if type(makefolder) ~= 'function' then
+			return
+		end
+		local function one(path)
+			pcall(function()
+				if type(isfolder) ~= 'function' or not isfolder(path) then
+					makefolder(path)
+				end
+			end)
+		end
+		one('Ataraxia')
+		one(rootDir())
+		one(profileDir())
+		one(autoloadDir())
+		one(accountDir())
+	end
+
+	local function persistable(idx, obj)
+		if type(idx) ~= 'string' or type(obj) ~= 'table' then
+			return false
+		end
+		if skip[idx] or idx:sub(1, #SKIP_PREFIX) == SKIP_PREFIX then
+			return false
+		end
+		return KINDS[obj.Type] == true and type(obj.SetValue) == 'function' and not obj.Destroyed
+	end
+
+	local function pack(v)
+		local t = type(v)
+		if t == 'boolean' or t == 'number' or t == 'string' then
+			return v
+		end
+		if t == 'table' then
+			local map = {}
+			for k, on in pairs(v) do
+				if type(k) == 'string' and on then
+					map[k] = true
+				end
+			end
+			return map
+		end
+		return nil
+	end
+
+	local function snapshot()
+		local out = {}
+		for idx, obj in pairs(Library.Options) do
+			if persistable(idx, obj) then
+				local v = pack(obj.Value)
+				if v ~= nil then
+					out[idx] = v
+				end
+			end
+		end
+		return out
+	end
+
+	local function writeJson(path, data)
+		if type(writefile) ~= 'function' then
+			return false
+		end
+		ensureDirs()
+		local ok, encoded = pcall(function()
+			return HttpService:JSONEncode(data)
+		end)
+		if not ok then
+			return false
+		end
+		return pcall(writefile, path, encoded)
+	end
+
+	local function readJson(path)
+		if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+			return nil
+		end
+		local ok, exists = pcall(isfile, path)
+		if not ok or not exists then
+			return nil
+		end
+		local rok, body = pcall(readfile, path)
+		if not rok then
+			return nil
+		end
+		local dok, decoded = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if dok and type(decoded) == 'table' then
+			return decoded
+		end
+		return nil
+	end
+
+	local function apply(data)
+		if type(data) ~= 'table' then
+			return 0
+		end
+		suspended = true
+		local notify = Library.Notify
+		Library.Notify = function() end
+		local n = 0
+		for idx, v in pairs(data) do
+			local obj = Library.Options[idx]
+			if persistable(idx, obj) then
+				local ok = pcall(function()
+					obj:SetValue(v)
+				end)
+				if ok then
+					n += 1
+				end
+			end
+		end
+		Library.Notify = notify
+		suspended = false
+		dirty = false
+		return n
+	end
+
+	local function setStatus()
+		if not statusLabel or not statusLabel.SetText then
+			return
+		end
+		local mine = api.GetAutoload()
+		local who = tostring(LocalPlayer.Name or '?')
+		if mine and mine ~= '' then
+			statusLabel:SetText(('This account (%s) autoloads  ·  %s'):format(who, mine))
+		else
+			statusLabel:SetText(('This account (%s)  ·  personal save, no named autoload'):format(who))
+		end
+	end
+
+	function api.SetFolder(name)
+		gameFolder = sanitize(name, 'default'):gsub(' ', '-'):lower()
+		if gameFolder == '' then
+			gameFolder = 'default'
+		end
+		ensureDirs()
+	end
+
+	function api.IgnoreIndexes(map)
+		if type(map) ~= 'table' then
+			return
+		end
+		for k, v in pairs(map) do
+			if v then
+				skip[tostring(k)] = true
+			end
+		end
+	end
+
+	function api.List()
+		local names = {}
+		local seen = {}
+		if type(listfiles) == 'function' then
+			local ok, files = pcall(listfiles, profileDir())
+			if ok and type(files) == 'table' then
+				for _, path in ipairs(files) do
+					local base = tostring(path):gsub('\\', '/'):match('([^/]+)%.json$')
+					if base and not seen[base] then
+						seen[base] = true
+						names[#names + 1] = base
+					end
+				end
+			end
+		end
+		table.sort(names, function(a, b)
+			return string.lower(a) < string.lower(b)
+		end)
+		return names
+	end
+
+	function api.GetAutoload()
+		if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+			return nil
+		end
+		local path = autoloadPath()
+		local ok, exists = pcall(isfile, path)
+		if not ok or not exists then
+			return nil
+		end
+		local rok, body = pcall(readfile, path)
+		if not rok then
+			return nil
+		end
+		local name = sanitize(body, '')
+		if name == '' or name == 'none' then
+			return nil
+		end
+		local pok, has = pcall(isfile, profilePath(name))
+		if pok and has then
+			return name
+		end
+		return nil
+	end
+
+	function api.SetAutoload(name)
+		ensureDirs()
+		name = sanitize(name, '')
+		if name == '' then
+			if type(delfile) == 'function' then
+				pcall(delfile, autoloadPath())
+			end
+			assignedName = nil
+			setStatus()
+			return true
+		end
+		if type(writefile) ~= 'function' then
+			return false
+		end
+		local ok = pcall(writefile, autoloadPath(), name)
+		if ok then
+			assignedName = name
+			setStatus()
+		end
+		return ok
+	end
+
+	function api.HasState()
+		if type(isfile) ~= 'function' then
+			return false
+		end
+		local a = api.GetAutoload()
+		if a then
+			return true
+		end
+		local ok, exists = pcall(isfile, accountPath())
+		return ok and exists == true
+	end
+
+	function api.SaveProfile(name)
+		name = sanitize(name, '')
+		if name == '' then
+			return false, 'Name a profile first'
+		end
+		ensureDirs()
+		if not writeJson(profilePath(name), snapshot()) then
+			return false, 'Write failed'
+		end
+		api.SetAutoload(name)
+		assignedName = name
+		dirty = false
+		api.RefreshUI()
+		return true
+	end
+
+	function api.LoadProfile(name)
+		name = sanitize(name, '')
+		if name == '' then
+			return 0
+		end
+		local data = readJson(profilePath(name))
+		if not data then
+			return 0
+		end
+		local n = apply(data)
+		api.SetAutoload(name)
+		assignedName = name
+		return n
+	end
+
+	function api.DeleteProfile(name)
+		name = sanitize(name, '')
+		if name == '' or type(delfile) ~= 'function' then
+			return false
+		end
+		pcall(delfile, profilePath(name))
+		if api.GetAutoload() == name then
+			api.SetAutoload(nil)
+		end
+		if assignedName == name then
+			assignedName = nil
+		end
+		api.RefreshUI()
+		return true
+	end
+
+	function api.SaveAccount()
+		ensureDirs()
+		if writeJson(accountPath(), snapshot()) then
+			dirty = false
+			return true
+		end
+		return false
+	end
+
+	function api.SaveCurrent()
+		local name = assignedName or api.GetAutoload()
+		if name and name ~= '' then
+			local ok = api.SaveProfile(name)
+			return ok
+		end
+		return api.SaveAccount()
+	end
+
+	function api.ImportTable(data)
+		return apply(data)
+	end
+
+	function api.ImportFile(path)
+		local data = readJson(path)
+		if not data then
+			return 0
+		end
+		return apply(data)
+	end
+
+	function api.LoadAutoload()
+		local name = api.GetAutoload()
+		if name then
+			assignedName = name
+			local n = 0
+			local data = readJson(profilePath(name))
+			if data then
+				n = apply(data)
+			end
+			setStatus()
+			api.RefreshUI()
+			return n
+		end
+		assignedName = nil
+		local data = readJson(accountPath())
+		local n = apply(data)
+		setStatus()
+		api.RefreshUI()
+		return n
+	end
+
+	function api.Reset()
+		if defaults then
+			apply(defaults)
+		end
+		api.SaveCurrent()
+	end
+
+	function api.Queue()
+		if suspended then
+			return
+		end
+		dirty = true
+		saveAt = os.clock() + SAVE_DELAY
+	end
+
+	function api.Tick()
+		if dirty and not suspended and os.clock() >= saveAt then
+			api.SaveCurrent()
+		end
+	end
+
+	function api.Hook()
+		defaults = defaults or snapshot()
+		for idx, obj in pairs(Library.Options) do
+			if persistable(idx, obj) and type(obj.OnChanged) == 'function' then
+				obj:OnChanged(api.Queue)
+			end
+		end
+	end
+
+	function api.Finish()
+		if dirty then
+			api.SaveCurrent()
+		end
+		suspended = true
+	end
+
+	function api.RefreshUI()
+		local list = Library.Options.ATA_ProfileList
+		if list and type(list.SetValues) == 'function' then
+			local names = api.List()
+			if #names == 0 then
+				names = { '(none saved)' }
+			end
+			pcall(function()
+				list:SetValues(names)
+				local cur = assignedName or api.GetAutoload() or names[1]
+				if cur then
+					list:SetValue(cur)
+				end
+			end)
+		end
+		setStatus()
+	end
+
+	function api.Build(box)
+		if not box then
+			return
+		end
+		statusLabel = box:AddLabel('Profiles  ·  this account')
+		box:AddDropdown('ATA_ProfileList', {
+			Text = 'Saved profiles',
+			Values = { '(none saved)' },
+			Default = '(none saved)',
+			Tooltip = 'Shared list for this game. Every account can load these. Autoload is per-account.',
+		})
+		box:AddInput('ATA_ProfileName', {
+			Text = 'Profile name',
+			Default = '',
+			Placeholder = 'e.g. frost farm',
+			Tooltip = 'Name used when you Save. Lives in Ataraxia/<game>/profiles/.',
+		})
+		box:AddButton('Save profile (this account autoloads it)', function()
+			local typed = Library.Options.ATA_ProfileName and tostring(Library.Options.ATA_ProfileName.Value or '') or ''
+			local picked = Library.Options.ATA_ProfileList and tostring(Library.Options.ATA_ProfileList.Value or '') or ''
+			local name = sanitize(typed, '')
+			if name == '' and picked ~= '' and picked ~= '(none saved)' then
+				name = sanitize(picked, '')
+			end
+			local ok, err = api.SaveProfile(name)
+			if ok then
+				Library:Notify(('Saved "%s"  ·  autoload for %s only'):format(name, LocalPlayer.Name))
+			else
+				Library:Notify(err or 'Save failed')
+			end
+		end)
+		box:AddButton('Load selected (this account)', function()
+			local picked = Library.Options.ATA_ProfileList and tostring(Library.Options.ATA_ProfileList.Value or '') or ''
+			picked = sanitize(picked, '')
+			if picked == '' or picked == '(none saved)' then
+				Library:Notify('Pick a profile first')
+				return
+			end
+			local n = api.LoadProfile(picked)
+			Library:Notify(n > 0 and ('Loaded "%s" for %s'):format(picked, LocalPlayer.Name) or 'Load failed')
+		end)
+		box:AddButton('Set selected as my autoload', function()
+			local picked = Library.Options.ATA_ProfileList and tostring(Library.Options.ATA_ProfileList.Value or '') or ''
+			picked = sanitize(picked, '')
+			if picked == '' or picked == '(none saved)' then
+				Library:Notify('Pick a profile first')
+				return
+			end
+			if api.SetAutoload(picked) then
+				assignedName = picked
+				Library:Notify(('Autoload "%s" for %s'):format(picked, LocalPlayer.Name))
+			end
+		end)
+		box:AddButton('Clear my autoload', function()
+			api.SetAutoload(nil)
+			api.SaveAccount()
+			Library:Notify(('Autoload cleared for %s'):format(LocalPlayer.Name))
+		end)
+		box:AddButton('Delete selected profile', function()
+			local picked = Library.Options.ATA_ProfileList and tostring(Library.Options.ATA_ProfileList.Value or '') or ''
+			picked = sanitize(picked, '')
+			if picked == '' or picked == '(none saved)' then
+				Library:Notify('Pick a profile first')
+				return
+			end
+			api.DeleteProfile(picked)
+			Library:Notify(('Deleted "%s"'):format(picked))
+		end)
+		box:AddLabel('Other accounts see the same list. They do not autoload until they Load / Set autoload.')
+		api.RefreshUI()
+	end
+
+	return api
+end)()
+
+function Library:SetFolder(name)
+	if self.Config then
+		self.Config.SetFolder(name)
+	end
+end
+
 function Library:CreateWindow(info)
 	info = info or {}
+	if type(info.Folder) == 'string' and info.Folder ~= '' then
+		self:SetFolder(info.Folder)
+	end
 	-- Floor size: scale-sized columns inside a ScrollingFrame collapse to ~0px otherwise.
 	local width = math.max(880, (info.Size and info.Size.X.Offset) or 880)
 	local height = math.max(560, (info.Size and info.Size.Y.Offset) or 560)
@@ -1455,14 +2495,65 @@ function Library:CreateWindow(info)
 		size2 = UDim2.new(1, -120, 0, 24),
 		pos = UDim2.fromOffset(16, 6),
 	})
-	-- Never put the long Nietzsche quote in the chrome — tiny Gotham drops glyphs ("gaze"→"gaes").
-	mkLabel(header, 'PlayerTools · custom chrome', {
-		font = Enum.Font.SourceSans,
-		size = 14,
-		color = C.muted,
-		size2 = UDim2.new(1, -120, 0, 16),
-		pos = UDim2.fromOffset(16, 30),
-	})
+	do
+		local sub = tostring(info.Footer or '')
+		if sub == '' then
+			sub = tostring(info.Title or 'Ataraxia') .. ' · custom chrome'
+		end
+		-- Never put a long quote in the chrome — tiny fonts drop glyphs.
+		if #sub > 48 then
+			sub = string.sub(sub, 1, 45) .. '…'
+		end
+		mkLabel(header, sub, {
+			font = Enum.Font.SourceSans,
+			size = 14,
+			color = C.muted,
+			size2 = UDim2.new(1, -120, 0, 16),
+			pos = UDim2.fromOffset(16, 30),
+		})
+	end
+
+	-- Per-script version (bottom-left): CreateWindow{ Version = "1.2.3" } or
+	-- {Folder}/version.json ("version" field). Each helper shows its own stamp.
+	do
+		local verText = nil
+		if type(info.Version) == 'string' and info.Version ~= '' then
+			verText = info.Version
+		else
+			local folder = tostring(info.Folder or '')
+			local path = nil
+			if folder ~= '' and type(isfile) == 'function' and isfile(folder .. '/version.json') then
+				path = folder .. '/version.json'
+			end
+			if path and type(readfile) == 'function' then
+				local ok, body = pcall(readfile, path)
+				if ok and type(body) == 'string' and body ~= '' then
+					local okJ, data = pcall(function()
+						return game:GetService('HttpService'):JSONDecode(body)
+					end)
+					if okJ and type(data) == 'table' and data.version ~= nil then
+						verText = tostring(data.version)
+					end
+				end
+			end
+		end
+		if verText and verText ~= '' then
+			if not string.match(verText, '^[vV]') then
+				verText = 'v' .. verText
+			end
+			local verLbl = mkLabel(main, verText, {
+				font = Enum.Font.SourceSans,
+				size = 12,
+				color = C.muted,
+				size2 = UDim2.fromOffset(160, 16),
+				pos = UDim2.new(0, 10, 1, -20),
+				z = 50,
+			})
+			verLbl.Name = 'ScriptVersion'
+			self.VersionLabel = verLbl
+			self.Version = verText
+		end
+	end
 
 	local function chrome(text, x, danger, fn)
 		local b = Instance.new('TextButton')
@@ -1689,6 +2780,22 @@ function Library:CreateWindow(info)
 
 	self.Toggled = true
 	self.Open = true
+	-- Built-in anti-AFK for every consumer of this library (opt out: CreateWindow{ AntiAfk = false }).
+	if info.AntiAfk ~= false then
+		pcall(AntiAfk.ensure)
+	end
+	if info.Invisicam ~= false then
+		pcall(Occlusion.ensure)
+	end
+	if info.HideGameplayPaused ~= false then
+		pcall(NoPause.ensure)
+	end
+	track(RunService.Heartbeat:Connect(function()
+		if Library.Config then
+			pcall(Library.Config.Tick)
+		end
+		pcall(Occlusion.tick)
+	end))
 	return Window
 end
 

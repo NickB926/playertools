@@ -9,9 +9,18 @@
 local plrs = game:GetService('Players')
 local lp = plrs.LocalPlayer
 
+-- Queueing happens before the destination is known, so the stub has to re-check
+-- the game once it lands. Without this, PlayerTools (and the IY it loads) follows
+-- you into every unrelated game forever: the stub sets SB2PlayerTools, which makes
+-- isBlocked() below think PlayerTools is legitimately in play, which re-arms again.
+-- Same allowlist PlayerTools_Obsidian uses: SB2 universe, or Wave Defense.
+-- Compared numerically because tostring() on a 15-digit PlaceId goes exponential.
+local GAME_GUARD = "local gid=tonumber(game.GameId); local pid=tonumber(game.PlaceId);"
+	.. "if gid~=212154879 and gid~=8460001097 and pid~=121252145396212 then return end;"
+
 -- Soft-first teleport stub (must stay a single expression string for queueteleport).
-local STUB =
-	"if isfile and isfile('PlayerTools/manual_unload') then local ok,b=pcall(readfile,'PlayerTools/manual_unload'); if ok and tostring(b)=='true' then return end end;"
+local STUB = GAME_GUARD
+	.. "if isfile and isfile('PlayerTools/manual_unload') then local ok,b=pcall(readfile,'PlayerTools/manual_unload'); if ok and tostring(b)=='true' then return end end;"
 	.. "if getgenv().SB2PlayerToolsManualUnload then return end;"
 	.. "getgenv().SB2MenuHopGraceUntil=os.clock()+25;"
 	.. "getgenv().SB2UiKeeperQuietUntil=os.clock()+25;"
@@ -83,13 +92,19 @@ local function isBlocked()
 			end
 		end
 	end
-	-- Always allow re-queue when autoexec is on (floor changes wipe the UI
-	-- without always firing a clean teleport rejoin).
-	if autoEnabled() then
-		return false
-	end
-	-- Don't start PlayerTools just because AutoFarm loaded Infinite Yield.
-	if not getgenv().SB2PlayerTools and not getgenv().SB2PlayerToolsArmTeleport then
+	-- This plugin sits in IY's global plugin list, so it also runs when IY is
+	-- loaded by hand in an unrelated game. Queueing there starts PlayerTools,
+	-- which re-launches IY, which reloads this plugin — a loop that follows you
+	-- across every teleport. Only arm where PlayerTools is actually in play.
+	-- Loading/Instance cover the window where PlayerTools launched IY but has
+	-- not finished building its UI yet, so floor hops still re-arm.
+	local g = getgenv()
+	if
+		not g.SB2PlayerTools
+		and not g.SB2PlayerToolsArmTeleport
+		and not g.SB2PlayerToolsLoading
+		and not g.SB2PlayerToolsInstance
+	then
 		return true
 	end
 	return false

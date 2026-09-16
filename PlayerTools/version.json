@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.18",
-    "message":  "Allow Wave Defense place 121252145396212",
+    "version":  "1.0.19",
+    "message":  "Ataraxia: library anti-AFK, account profiles, toast stacking, per-script version label",
     "files":  [
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",

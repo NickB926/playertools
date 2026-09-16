@@ -1472,6 +1472,7 @@ local ok, err = pcall(function()
 	end
 
 	-- Same as Infinite Yield `antiafk`: mute Roblox's Idled kick. No jump / key / camera.
+	-- Only Disable (don't Disconnect). Always Connect our handler *after* muting.
 	local function muteIdledKick()
 		if type(getconnections) ~= 'function' then
 			return
@@ -1481,11 +1482,6 @@ local ok, err = pcall(function()
 				pcall(function()
 					if conn.Disable then
 						conn:Disable()
-					end
-				end)
-				pcall(function()
-					if conn.Disconnect then
-						conn:Disconnect()
 					end
 				end)
 			end
@@ -3357,10 +3353,23 @@ local ok, err = pcall(function()
 			return
 		end
 		holder.Position = UDim2.new(1, -396, 0, 16)
+		if not holder:FindFirstChildOfClass('UIListLayout') then
+			local lay = Instance.new('UIListLayout')
+			lay.SortOrder = Enum.SortOrder.LayoutOrder
+			lay.Padding = UDim.new(0, 8)
+			lay.Parent = holder
+		end
+		local existing = {}
 		for _, ch in ipairs(holder:GetChildren()) do
-			if ch:IsA('GuiObject') then
-				ch:Destroy()
+			if ch:IsA('GuiObject') and ch.Name == 'Toast' then
+				existing[#existing + 1] = ch
 			end
+		end
+		while #existing >= 4 do
+			local oldest = table.remove(existing, 1)
+			pcall(function()
+				oldest:Destroy()
+			end)
 		end
 		local body = tostring(text):gsub('\r\n', '\n'):gsub('\r', '\n')
 		local rows = {}
@@ -3771,6 +3780,7 @@ local ok, err = pcall(function()
 	local windowInfo = {
 		Title = CONFIG.Title,
 		Footer = CONFIG.Footer,
+		Folder = 'PlayerTools',
 		Icon = windowIcon,
 		Size = windowSize,
 		Position = windowPosition,
@@ -5281,16 +5291,9 @@ local ok, err = pcall(function()
 		end
 
 		local label = name .. (info.online and '' or ' (offline)')
-		local gearLines = {
-			label .. ' — gear',
-			'Right: ' .. info.right,
-			'Left: ' .. info.left,
-			'Armor: ' .. info.armor,
-			'Accessory 1: ' .. info.accessory1,
-			'Accessory 2: ' .. info.accessory2,
-			'Companion: ' .. info.companion,
-		}
-		local statLines = {
+		-- One toast: Ataraxia/showBigToast clears the holder on each Notify, so the
+		-- deferred stats toast used to wipe the gear toast every click.
+		local lines = {
 			label .. ' — stats',
 			'Level ' .. tostring(info.level),
 			'Vel ' .. formatNumber(info.vel),
@@ -5299,15 +5302,19 @@ local ok, err = pcall(function()
 			'Speed buff: ' .. fmt(info.speedBuff),
 			'Walk speed: ' .. fmt(info.walkSpeed),
 			'Jump power: ' .. fmt(info.jumpPower),
+			'',
+			'— gear —',
+			'Right: ' .. info.right,
+			'Left: ' .. info.left,
+			'Armor: ' .. info.armor,
+			'Accessory 1: ' .. info.accessory1,
+			'Accessory 2: ' .. info.accessory2,
+			'Companion: ' .. info.companion,
 		}
 		if not info.loaded then
-			statLines[#statLines + 1] = '(character not loaded — regen/speed may be blank)'
+			lines[#lines + 1] = '(character not loaded — regen/speed may be blank)'
 		end
-		-- Two notifies so accessories aren't clipped by Obsidian's notify height.
-		Library:Notify(table.concat(gearLines, '\n'), 12, true)
-		task.defer(function()
-			Library:Notify(table.concat(statLines, '\n'), 10, true)
-		end)
+		Library:Notify(table.concat(lines, '\n'), 14, true)
 	end
 
 	local playerListDropdown = PlayersBox:AddDropdown('PlayerList', {
@@ -24205,7 +24212,9 @@ local ok, err = pcall(function()
 		Tooltip = 'Hides Roblox streaming "Gameplay paused" overlay. Does not stop streaming itself — only the full-screen notice.',
 	}):OnChanged(function(value)
 		getgenv().SB2HideGameplayPaused = value == true
-		if value then
+		if Library and type(Library.SetHideGameplayPaused) == 'function' then
+			Library:SetHideGameplayPaused(value == true)
+		elseif value then
 			if type(getgenv().SB2HideGameplayPausedUi) == 'function' then
 				getgenv().SB2HideGameplayPausedUi()
 			end

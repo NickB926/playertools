@@ -1864,6 +1864,7 @@ local ok, err = pcall(function()
 	local windowInfo = {
 		Title = CONFIG.Title,
 		Footer = CONFIG.Footer,
+		Folder = 'PlayerTools',
 		Icon = windowIcon,
 		Size = windowSize,
 		Position = windowPosition,
