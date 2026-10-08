@@ -1,7 +1,8 @@
 {
-    "version":  "1.0.21",
-    "message":  "Players: Boss kills (wiki Category:Boss filter) + All boss kills ranking",
+    "version":  "1.0.22",
+    "message":  "Ataraxia.lua auto-updates from GitHub before load (fixes stuck 1.0.9)",
     "files":  [
+                  "Ataraxia.lua",
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",
                   "PlayerTools/init.lua",
