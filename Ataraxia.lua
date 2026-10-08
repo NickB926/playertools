@@ -99,6 +99,60 @@ local okBoot, bootErr = xpcall(function()
 		error('loadstring/load unavailable')
 	end
 
+	-- Local Ataraxia.lua used to skip GitHub updates (stuck on old version.json).
+	-- Pull latest PlayerTools files before loading when remote differs.
+	do
+		local BASE = (type(g.SB2PlayerToolsUpdateBase) == 'string' and g.SB2PlayerToolsUpdateBase ~= ''
+			and g.SB2PlayerToolsUpdateBase:gsub('/+$', ''))
+			or 'https://raw.githubusercontent.com/NickB926/playertools/main'
+		local function httpGet(url)
+			local req = (syn and syn.request) or http_request or (http and http.request) or request
+			if type(req) == 'function' then
+				local ok, res = pcall(req, { Url = url, Method = 'GET' })
+				if ok and type(res) == 'table' then
+					local body = res.Body or res.body
+					local code = tonumber(res.StatusCode or res.Status or res.statusCode) or 0
+					if code >= 200 and code < 300 and type(body) == 'string' then
+						return body
+					end
+				end
+			end
+			local ok, body = pcall(function()
+				return game:HttpGet(url)
+			end)
+			if ok and type(body) == 'string' and body ~= '' then
+				return body
+			end
+			return nil
+		end
+		say('checking for PlayerTools updates…')
+		local updaterSrc = httpGet(BASE .. '/PlayerTools/Updater.lua')
+		if type(updaterSrc) == 'string' and updaterSrc ~= '' then
+			pcall(writefile, 'PlayerTools/Updater.lua', updaterSrc)
+			pcall(writefile, 'PlayerTools/update_url.txt', BASE)
+			g.SB2PlayerToolsUpdateBase = BASE
+			local ufn, uerr = compile(updaterSrc, 'PlayerTools/Updater.lua')
+			if ufn then
+				local Updater = ufn()
+				if type(Updater) == 'table' and type(Updater.apply) == 'function' then
+					local okUp, detail = Updater.apply({
+						notify = say,
+						quietWarn = true,
+					})
+					if okUp then
+						say('PlayerTools files ready (' .. tostring(detail) .. ')')
+					else
+						say('update issue: ' .. tostring(detail) .. ' — loading local files anyway')
+					end
+				end
+			else
+				say('Updater compile failed: ' .. tostring(uerr))
+			end
+		else
+			say('could not reach updater — loading local files')
+		end
+	end
+
 	local loaded = false
 	for _, path in ipairs({ 'PlayerTools/PlayerTools.lua', 'PlayerTools.lua' }) do
 		local exists = type(isfile) == 'function' and isfile(path)
