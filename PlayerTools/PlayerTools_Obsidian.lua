@@ -821,6 +821,9 @@ local unloadExisting = function()
 			'SB2SkillFxJanitorHbConn',
 			'SB2FarmFpsConn',
 			'SB2FarmFpsLightConn',
+			'SB2NoFogConn',
+			'SB2NoFogStartConn',
+			'SB2NoFogLightConn',
 			'SB2WsDeleteLogConn',
 			'SB2VoidProbeHbConn',
 			'SB2DiveFarmConn',
@@ -1086,6 +1089,7 @@ local ok, err = pcall(function()
 	-- Wave Defense is its own universe (GameId 8460001097), place 121252145396212.
 	local EXTRA_LAUNCH_PLACE_IDS = {
 		['121252145396212'] = true,
+		['2724077776'] = true, -- F1: Catacombs
 	}
 	local EXTRA_LAUNCH_GAME_IDS = {
 		[SB2_GAME_ID] = true,
@@ -2086,6 +2090,33 @@ local ok, err = pcall(function()
 			getgenv()[key] = nil
 		end
 
+		-- CCI used to push fog out. Farm FPS used to PIN FogEnd=400 (close fog).
+		local function clearFog()
+			pcall(function()
+				if Lighting.FogEnd < 1e8 or Lighting.FogStart < 1e8 then
+					Lighting.FogEnd = 9e9
+					Lighting.FogStart = 9e9
+				end
+			end)
+			pcall(function()
+				local kids = Lighting:GetChildren()
+				for i = 1, #kids do
+					local ch = kids[i]
+					if ch:IsA('Atmosphere') then
+						if ch.Density ~= 0 then
+							ch.Density = 0
+						end
+						if ch.Haze ~= 0 then
+							ch.Haze = 0
+						end
+						if ch.Glare ~= 0 then
+							ch.Glare = 0
+						end
+					end
+				end
+			end)
+		end
+
 		local function pinQuality()
 			-- Only touch settings when drifted — rewriting QualityLevel every N seconds
 			-- forces a render hitch (felt like a stutter every ~5–10s on the main).
@@ -2105,11 +2136,8 @@ local ok, err = pcall(function()
 				if Lighting.GlobalShadows ~= false then
 					Lighting.GlobalShadows = false
 				end
-				if Lighting.FogEnd ~= 400 then
-					Lighting.FogEnd = 400
-					Lighting.FogStart = 0
-				end
 			end)
+			clearFog()
 			pcall(function()
 				local kids = Lighting:GetChildren()
 				for i = 1, #kids do
@@ -2168,6 +2196,21 @@ local ok, err = pcall(function()
 		if getgenv().SB2FarmFpsOn ~= false then
 			startFarmFps()
 		end
+
+		-- Always strip fog (no CCI required). Game + maps keep putting Atmosphere / FogEnd back.
+		clearFog()
+		dropConn('SB2NoFogConn')
+		dropConn('SB2NoFogStartConn')
+		dropConn('SB2NoFogLightConn')
+		getgenv().SB2NoFogLightConn = Lighting.ChildAdded:Connect(function(ch)
+			if ch:IsA('Atmosphere') then
+				task.defer(clearFog)
+			end
+		end)
+		pcall(function()
+			getgenv().SB2NoFogConn = Lighting:GetPropertyChangedSignal('FogEnd'):Connect(clearFog)
+			getgenv().SB2NoFogStartConn = Lighting:GetPropertyChangedSignal('FogStart'):Connect(clearFog)
+		end)
 	end)()
 
 	local function getLiveCamera()
@@ -3468,6 +3511,9 @@ local ok, err = pcall(function()
 		local rawNotify = Library.Notify
 		if type(rawNotify) == 'function' then
 			Library.Notify = function(self, text, duration, force)
+				if type(Library.IsNotifyEnabled) == 'function' and Library:IsNotifyEnabled() ~= true then
+					return
+				end
 				local now = os.clock()
 				local dur = tonumber(duration) or 5
 				local important = force == true or dur >= 8
@@ -3786,6 +3832,12 @@ local ok, err = pcall(function()
 		Position = windowPosition,
 		ShowCustomCursor = false, -- Obsidian + crosshair on top of OS mouse
 		Resizable = true,
+		-- Library Settings (Script + Profiles). SaveManager stays the disk backend.
+		OnUnload = function()
+			if type(getgenv().SB2UnloadPlayerTools) == 'function' then
+				pcall(getgenv().SB2UnloadPlayerTools)
+			end
+		end,
 	}
 	local Window = Library:CreateWindow(windowInfo)
 	assert(Window, 'CreateWindow returned nil')
@@ -5008,19 +5060,53 @@ local ok, err = pcall(function()
 		return false
 	end
 
-	-- Wiki Hitboxes line from selected player's held RightWeapon.
-	local readSelectedHitboxLine = function()
-		local classMap = {
-			['1HSword'] = 'Longswords',
-			['SingleSword'] = 'Longswords',
-			['Longsword'] = 'Longswords',
-			['2HSword'] = 'Greatswords',
-			['Greatsword'] = 'Greatswords',
-			['Katana'] = 'Katanas',
-			['Rapier'] = 'Rapiers',
-			['Spear'] = 'Spears',
-			['Scythe'] = 'Scythes',
-		}
+	-- Own function so this chunk's locals do not blow the 200-register limit.
+	local function setupWeaponLengthTools()
+	local WEAPON_CLASS_MAP = {
+		['1HSword'] = 'Longswords',
+		['SingleSword'] = 'Longswords',
+		['Longsword'] = 'Longswords',
+		['2HSword'] = 'Greatswords',
+		['Greatsword'] = 'Greatswords',
+		['Katana'] = 'Katanas',
+		['Rapier'] = 'Rapiers',
+		['Spear'] = 'Spears',
+		['Scythe'] = 'Scythes',
+	}
+
+	local weaponWikiCategory = function(weaponName)
+		local database = game:GetService('ReplicatedStorage'):FindFirstChild('Database')
+		local itemsDb = database and database:FindFirstChild('Items')
+		local entry = itemsDb and itemsDb:FindFirstChild(weaponName)
+		local classVal
+		if entry then
+			local cls = entry:FindFirstChild('Class')
+			if cls and cls:IsA('ValueBase') then
+				classVal = cls.Value
+			else
+				local stats = entry:FindFirstChild('Stats')
+				cls = stats and stats:FindFirstChild('Class')
+				if cls and cls:IsA('ValueBase') then
+					classVal = cls.Value
+				end
+			end
+		end
+		local category = WEAPON_CLASS_MAP[tostring(classVal or '')]
+		if not category and classVal then
+			local lower = string.lower(tostring(classVal))
+			for key, wiki in pairs(WEAPON_CLASS_MAP) do
+				if string.lower(key) == lower or string.lower(wiki) == lower then
+					category = wiki
+					break
+				end
+			end
+		end
+		return category
+	end
+
+	-- Held RightWeapon.Tool. Blade.Size is the hitbox. The visible weapon is
+	-- other parts under Tool, named differently per item (Trident, Plane.041, …).
+	local resolveHeldWeapon = function()
 		local name = getSelectedProfileName()
 		if type(name) ~= 'string' or name == '' then
 			return nil, 'Select a player first'
@@ -5059,42 +5145,672 @@ local ok, err = pcall(function()
 			return nil, 'Weapon has no Name attribute'
 		end
 		local tool = weapon:FindFirstChild('Tool')
-		local blade = tool and tool:FindFirstChild('Blade')
+		if not tool then
+			return nil, weaponName .. ' has no Tool'
+		end
+		return {
+			name = weaponName,
+			tool = tool,
+			category = weaponWikiCategory(weaponName),
+		}, nil
+	end
+
+	local partLongest = function(part)
+		local size = part.Size
+		return math.max(size.X, size.Y, size.Z)
+	end
+
+	-- Keep the first 3 decimal digits and drop the rest. 7.283536 -> 7.283.
+	local formatStuds = function(n)
+		local neg = n < 0
+		local s = string.format('%.12f', math.abs(n))
+		local dot = string.find(s, '.', 1, true)
+		local whole = string.sub(s, 1, dot - 1)
+		local frac = string.sub(s, dot + 1, dot + 3)
+		frac = string.gsub(frac, '0+$', '')
+		if frac == '' then
+			frac = '0'
+		end
+		if neg then
+			whole = '-' .. whole
+		end
+		return whole .. '.' .. frac
+	end
+
+	local partAxis = function(part)
+		local size = part.Size
+		local len, letter, localAxis = size.X, 'X', Vector3.xAxis
+		if size.Y >= len then
+			len, letter, localAxis = size.Y, 'Y', Vector3.yAxis
+		end
+		if size.Z >= len then
+			len, letter, localAxis = size.Z, 'Z', Vector3.zAxis
+		end
+		return len, letter, part.CFrame:VectorToWorldSpace(localAxis)
+	end
+
+	-- Mesh corners plus beam ends, along the blade. Beams parented only to the
+	-- Blade are hitbox trails and are skipped. Rei Rei's metal meshes are
+	-- 2.38 studs, but the sword you see is the beam at about 7.8.
+	local visualSpanAlong = function(tool, axis)
+		local lo, hi = math.huge, -math.huge
+		local function consider(pos)
+			local dot = pos:Dot(axis)
+			if dot < lo then
+				lo = dot
+			end
+			if dot > hi then
+				hi = dot
+			end
+		end
+		local blade = tool:FindFirstChild('Blade')
+		for _, d in ipairs(tool:GetDescendants()) do
+			if d:IsA('BasePart') and d.Name ~= 'Blade' and d.Name ~= 'Handle' then
+				local half = d.Size * 0.5
+				local cf = d.CFrame
+				for _, x in ipairs({ -1, 1 }) do
+					for _, y in ipairs({ -1, 1 }) do
+						for _, z in ipairs({ -1, 1 }) do
+							consider((cf * CFrame.new(half.X * x, half.Y * y, half.Z * z)).Position)
+						end
+					end
+				end
+			elseif d:IsA('Beam') then
+				local a, b = d.Attachment0, d.Attachment1
+				if a and b and a.Parent and b.Parent then
+					local aOnBlade = a.Parent == blade or a.Parent.Name == 'Blade'
+					local bOnBlade = b.Parent == blade or b.Parent.Name == 'Blade'
+					if not (aOnBlade and bOnBlade) then
+						consider(a.WorldPosition)
+						consider(b.WorldPosition)
+					end
+				end
+			end
+		end
+		if lo == math.huge then
+			return nil, nil
+		end
+		return lo, hi
+	end
+
+	-- End-to-end of the visible weapon along the sword. Blade is the hitbox
+	-- and can stick out past the model on purpose, so it is not part of this
+	-- length. The direction is the blade's long axis.
+	local measureToolLength = function(tool)
+		local meshes = {}
+		local axisPart, axisLen, axisLetter, axis = nil, 0, 'X', nil
+		for _, d in ipairs(tool:GetDescendants()) do
+			if d:IsA('BasePart') and d.Name ~= 'Blade' and d.Name ~= 'Handle' then
+				meshes[#meshes + 1] = d
+				local len, letter, world = partAxis(d)
+				if len > axisLen then
+					axisPart, axisLen, axisLetter, axis = d, len, letter, world
+				end
+			end
+		end
+		local blade = tool:FindFirstChild('Blade')
+		local bladeLen = (blade and blade:IsA('BasePart')) and partLongest(blade) or nil
+		if blade and blade:IsA('BasePart') then
+			local _, letter, world = partAxis(blade)
+			if world and world.Magnitude > 1e-4 then
+				axis = world
+				axisLetter = letter
+				axisPart = blade
+			end
+		end
+		if #meshes == 0 or not axis or axis.Magnitude < 1e-4 then
+			return nil
+		end
+		axis = axis.Unit
+		local lo, hi = visualSpanAlong(tool, axis)
+		if not lo then
+			return nil
+		end
+		return hi - lo, axisPart and axisPart.Name, bladeLen, axisLetter
+	end
+
+	-- Wiki Hitboxes line from selected player's held RightWeapon (Blade only).
+	local readSelectedHitboxLine = function()
+		local held, err = resolveHeldWeapon()
+		if not held then
+			return nil, err
+		end
+		local blade = held.tool:FindFirstChild('Blade')
 		if not (blade and blade:IsA('BasePart')) then
 			return nil, 'No Tool.Blade on weapon'
 		end
-		local size = blade.Size
-		local length = math.max(size.X, size.Y, size.Z)
+		if type(held.category) ~= 'string' or held.category == '' then
+			return nil, held.name .. ' class not in Database.Items'
+		end
+		local length = partLongest(blade)
+		return ('|%s; %s; %s'):format(held.name, formatStuds(length), held.category), nil
+	end
+
+	local readSelectedWeaponLength = function()
+		local held, err = resolveHeldWeapon()
+		if not held then
+			return nil, err
+		end
+		local full, piece, bladeLen, axisLetter = measureToolLength(held.tool)
+		if type(full) ~= 'number' then
+			return nil, held.name .. ' has no parts on Tool'
+		end
+		if type(bladeLen) ~= 'number' then
+			return nil, held.name .. ' has no Tool.Blade'
+		end
+		if type(held.category) ~= 'string' or held.category == '' then
+			return nil, held.name .. ' class not in Database.Items'
+		end
+		local line = ('|%s; %s; %s; %s'):format(
+			held.name,
+			formatStuds(bladeLen),
+			held.category,
+			formatStuds(full)
+		)
+		return line, nil, piece, axisLetter
+	end
+
+	local weaponLengthPreview = { id = 0, conn = nil }
+
+	local selectedWeaponTools = function()
+		local plr = getSelectedPlayer()
+		local userId = plr and plr.UserId
+		if not userId then
+			local name = getSelectedProfileName()
+			local prefixed = type(name) == 'string' and string.match(name, '^[Rr]oblox_user_(%d+)$')
+			userId = prefixed and tonumber(prefixed)
+		end
+		if not userId then
+			return {}
+		end
+		local items = workspace:FindFirstChild('CharacterItems')
+		local holder = items and items:FindFirstChild(tostring(userId))
+		if not holder then
+			return {}
+		end
+		local tools = {}
+		for _, hand in ipairs({ 'RightWeapon', 'LeftWeapon' }) do
+			local weapon = holder:FindFirstChild(hand)
+			local tool = weapon and weapon:FindFirstChild('Tool')
+			if tool then
+				tools[#tools + 1] = tool
+			end
+		end
+		return tools
+	end
+
+	local stopWeaponLengthPreview = function()
+		weaponLengthPreview.id += 1
+		shared.WeaponLengthPreviewId = weaponLengthPreview.id
+		if weaponLengthPreview.conn then
+			pcall(function()
+				weaponLengthPreview.conn:Disconnect()
+			end)
+			weaponLengthPreview.conn = nil
+		end
+		local old = workspace:FindFirstChild('WeaponLengthPreview')
+		if old then
+			old:Destroy()
+		end
+	end
+
+	local startWeaponLengthPreview = function()
+		stopWeaponLengthPreview()
+		local myId = weaponLengthPreview.id
+		local folder = Instance.new('Folder')
+		folder.Name = 'WeaponLengthPreview'
+		folder.Parent = workspace
+
+		local function makeBar(color)
+			local function part(size, shape)
+				local p = Instance.new('Part')
+				p.Anchored = true
+				p.CanCollide = false
+				p.CanQuery = false
+				p.CanTouch = false
+				p.CastShadow = false
+				p.Material = Enum.Material.Neon
+				p.Color = color
+				p.Size = size
+				p.Shape = shape or Enum.PartType.Block
+				p.Parent = folder
+				return p
+			end
+			local bar = part(Vector3.new(0.16, 0.16, 1))
+			local capA = part(Vector3.new(0.42, 0.42, 0.42), Enum.PartType.Ball)
+			local capB = part(Vector3.new(0.42, 0.42, 0.42), Enum.PartType.Ball)
+			local witnessA = part(Vector3.new(0.07, 0.07, 1))
+			local witnessB = part(Vector3.new(0.07, 0.07, 1))
+			local tag = part(Vector3.new(0.2, 0.2, 0.2))
+			tag.Transparency = 1
+			local gui = Instance.new('BillboardGui')
+			gui.Size = UDim2.fromOffset(180, 36)
+			gui.StudsOffset = Vector3.new(0, 0.8, 0)
+			gui.AlwaysOnTop = true
+			gui.Enabled = false
+			gui.MaxDistance = 80
+			gui.Parent = tag
+			local label = Instance.new('TextLabel')
+			label.BackgroundTransparency = 0.35
+			label.BackgroundColor3 = Color3.new(0, 0, 0)
+			label.TextColor3 = color
+			label.TextStrokeColor3 = Color3.new(0, 0, 0)
+			label.TextStrokeTransparency = 0.2
+			label.Font = Enum.Font.GothamBold
+			label.TextSize = 16
+			label.TextWrapped = true
+			label.Size = UDim2.fromScale(1, 1)
+			label.Parent = gui
+			local corner = Instance.new('UICorner')
+			corner.CornerRadius = UDim.new(0, 6)
+			corner.Parent = label
+			return {
+				bar = bar,
+				capA = capA,
+				capB = capB,
+				witnessA = witnessA,
+				witnessB = witnessB,
+				tag = tag,
+				label = label,
+				gui = gui,
+			}
+		end
+
+		local function makeSlot()
+			local highlights = Instance.new('Folder')
+			highlights.Parent = folder
+			return {
+				visual = makeBar(Color3.fromRGB(80, 255, 120)),
+				hitbox = makeBar(Color3.fromRGB(255, 70, 70)),
+				highlights = highlights,
+				bound = nil,
+			}
+		end
+
+		local slots = { makeSlot(), makeSlot() }
+
+		local function hideBar(bar)
+			bar.bar.Transparency = 1
+			bar.capA.Transparency = 1
+			bar.capB.Transparency = 1
+			bar.witnessA.Transparency = 1
+			bar.witnessB.Transparency = 1
+			bar.label.Text = ''
+			bar.gui.Enabled = false
+		end
+
+		local function showSegment(part, a, b, thickness, transparency)
+			local delta = b - a
+			local len = delta.Magnitude
+			if len < 0.02 then
+				part.Transparency = 1
+				return
+			end
+			part.Transparency = transparency
+			part.Size = Vector3.new(thickness, thickness, len)
+			part.CFrame = CFrame.lookAt((a + b) * 0.5, b)
+		end
+
+		-- a/b are the real ends. The colored line sits beside them, and the
+		-- thin links show which points the number is measuring.
+		local function showBar(bar, a, b, text, gap)
+			local delta = b - a
+			local len = delta.Magnitude
+			if len < 0.05 then
+				hideBar(bar)
+				return
+			end
+			local axis = delta.Unit
+			local side = axis:Cross(Vector3.yAxis)
+			if side.Magnitude < 0.25 then
+				side = axis:Cross(Vector3.xAxis)
+			end
+			side = side.Unit * gap
+			local dimA, dimB = a + side, b + side
+			showSegment(bar.bar, dimA, dimB, 0.16, 0)
+			showSegment(bar.witnessA, a, dimA, 0.07, 0.15)
+			showSegment(bar.witnessB, b, dimB, 0.07, 0.15)
+			bar.capA.Transparency = 0
+			bar.capB.Transparency = 0
+			bar.capA.CFrame = CFrame.new(dimA)
+			bar.capB.CFrame = CFrame.new(dimB)
+			bar.tag.CFrame = CFrame.new((dimA + dimB) * 0.5)
+			bar.label.Text = text
+			bar.gui.Enabled = true
+		end
+
+		local function rangeOn(parts, axis)
+			local lo, hi = math.huge, -math.huge
+			for _, part in ipairs(parts) do
+				local half = part.Size * 0.5
+				local cf = part.CFrame
+				for _, x in ipairs({ -1, 1 }) do
+					for _, y in ipairs({ -1, 1 }) do
+						for _, z in ipairs({ -1, 1 }) do
+							local dot = (cf * CFrame.new(half.X * x, half.Y * y, half.Z * z)).Position:Dot(axis)
+							if dot < lo then
+								lo = dot
+							end
+							if dot > hi then
+								hi = dot
+							end
+						end
+					end
+				end
+			end
+			return lo, hi
+		end
+
+		local function bindHighlights(slot, tool, meshes, blade)
+			if slot.bound == tool then
+				return
+			end
+			slot.bound = tool
+			slot.highlights:ClearAllChildren()
+			-- One highlight on the blade. A highlight on every mesh goes past
+			-- Roblox's limit and draws a black box.
+			if blade then
+				local h = Instance.new('Highlight')
+				h.Adornee = blade
+				h.FillColor = Color3.fromRGB(90, 170, 255)
+				h.OutlineColor = Color3.fromRGB(90, 170, 255)
+				h.FillTransparency = 0.82
+				h.OutlineTransparency = 0
+				h.Parent = slot.highlights
+			end
+		end
+
+		local function drawTool(slot, tool)
+			if not tool then
+				hideBar(slot.visual)
+				hideBar(slot.hitbox)
+				slot.bound = nil
+				slot.highlights:ClearAllChildren()
+				return
+			end
+			local meshes = {}
+			local bestLen, axis, axisPart = 0, nil, nil
+			for _, d in ipairs(tool:GetDescendants()) do
+				if d:IsA('BasePart') and d.Name ~= 'Blade' and d.Name ~= 'Handle' then
+					meshes[#meshes + 1] = d
+					local len, _, world = partAxis(d)
+					if len > bestLen then
+						bestLen, axis, axisPart = len, world, d
+					end
+				end
+			end
+			local blade = tool:FindFirstChild('Blade')
+			if blade and blade:IsA('BasePart') then
+				local _, _, world = partAxis(blade)
+				if world and world.Magnitude > 1e-4 then
+					axis = world
+					axisPart = blade
+				end
+			end
+			if not axis or not axisPart then
+				hideBar(slot.visual)
+				hideBar(slot.hitbox)
+				return
+			end
+			axis = axis.Unit
+			bindHighlights(slot, tool, meshes, blade and blade:IsA('BasePart') and blade or nil)
+			local refD = axisPart.Position:Dot(axis)
+			local function at(d)
+				return axisPart.Position + axis * (d - refD)
+			end
+			local mlo, mhi = visualSpanAlong(tool, axis)
+			if not mlo then
+				hideBar(slot.visual)
+			else
+				showBar(
+					slot.visual,
+					at(mlo),
+					at(mhi),
+					'Weapon length\n' .. formatStuds(mhi - mlo) .. ' studs',
+					1.7
+				)
+			end
+			if blade and blade:IsA('BasePart') then
+				-- The red line follows the blue Blade box, not the sword mesh.
+				local bladeLen, _, bladeAxis = partAxis(blade)
+				bladeAxis = bladeAxis.Unit
+				local half = bladeLen * 0.5
+				local origin = blade.Position
+				showBar(
+					slot.hitbox,
+					origin - bladeAxis * half,
+					origin + bladeAxis * half,
+					'Hitbox length\n' .. formatStuds(bladeLen) .. ' studs',
+					-1.15
+				)
+			else
+				hideBar(slot.hitbox)
+			end
+		end
+
+		weaponLengthPreview.conn = game:GetService('RunService').Heartbeat:Connect(function()
+			if shared.WeaponLengthPreviewId ~= myId or not folder.Parent then
+				if weaponLengthPreview.conn then
+					weaponLengthPreview.conn:Disconnect()
+					weaponLengthPreview.conn = nil
+				end
+				return
+			end
+			local tools = selectedWeaponTools()
+			drawTool(slots[1], tools[1])
+			drawTool(slots[2], tools[2])
+		end)
+	end
+
+	stopWeaponLengthPreview()
+
+	local WEAPON_LENGTH_FILE = 'PlayerTools/weapon_lengths.json'
+	local weaponLengthCatalog = nil
+
+	local loadWeaponLengthCatalog = function()
+		if weaponLengthCatalog then
+			return weaponLengthCatalog
+		end
+		weaponLengthCatalog = {}
+		if type(readfile) ~= 'function' or type(isfile) ~= 'function' then
+			return weaponLengthCatalog
+		end
+		local okExists, exists = pcall(isfile, WEAPON_LENGTH_FILE)
+		if not (okExists and exists) then
+			return weaponLengthCatalog
+		end
+		local okRead, body = pcall(readfile, WEAPON_LENGTH_FILE)
+		if not (okRead and type(body) == 'string' and body ~= '') then
+			return weaponLengthCatalog
+		end
+		local okDec, data = pcall(function()
+			return game:GetService('HttpService'):JSONDecode(body)
+		end)
+		if okDec and type(data) == 'table' then
+			weaponLengthCatalog = data
+		end
+		return weaponLengthCatalog
+	end
+
+	local saveWeaponLengthCatalog = function()
+		if type(writefile) ~= 'function' then
+			return false
+		end
+		local okEnc, body = pcall(function()
+			return game:GetService('HttpService'):JSONEncode(weaponLengthCatalog or {})
+		end)
+		if not okEnc then
+			return false
+		end
+		local okWrite = pcall(writefile, WEAPON_LENGTH_FILE, body)
+		return okWrite
+	end
+
+	local catalogCount = function()
+		local n = 0
+		for _ in pairs(loadWeaponLengthCatalog()) do
+			n = n + 1
+		end
+		return n
+	end
+
+	-- First measurement of a weapon name sticks. Later copies are skipped.
+	local recordServerWeapons = function()
+		local catalog = loadWeaponLengthCatalog()
+		local items = workspace:FindFirstChild('CharacterItems')
+		if not items then
+			return 0, catalogCount()
+		end
+		local added = 0
+		local seenCount = 0
+		local seen = {}
+		for _, folder in ipairs(items:GetChildren()) do
+			for _, hand in ipairs({ 'RightWeapon', 'LeftWeapon' }) do
+				local weapon = folder:FindFirstChild(hand)
+				local weaponName = weapon and (weapon:GetAttribute('Name') or weapon:GetAttribute('ItemName'))
+				local tool = weapon and weapon:FindFirstChild('Tool')
+				if type(weaponName) == 'string' and weaponName ~= '' and tool and not seen[weaponName] then
+					seen[weaponName] = true
+					seenCount = seenCount + 1
+					if catalog[weaponName] == nil then
+						local full, _, bladeLen = measureToolLength(tool)
+						if type(full) == 'number' then
+							catalog[weaponName] = {
+								hitbox = type(bladeLen) == 'number' and formatStuds(bladeLen) or nil,
+								length = formatStuds(full),
+								category = weaponWikiCategory(weaponName),
+							}
+							added = added + 1
+						end
+					end
+				end
+			end
+		end
+		if added > 0 then
+			saveWeaponLengthCatalog()
+		end
+		return added, catalogCount(), seenCount
+	end
+
+	local recordedWeaponLines = function()
+		local catalog = loadWeaponLengthCatalog()
+		local names = {}
+		for name in pairs(catalog) do
+			names[#names + 1] = name
+		end
+		table.sort(names, function(a, b)
+			return string.lower(a) < string.lower(b)
+		end)
+		local lines = {}
+		for _, name in ipairs(names) do
+			local row = catalog[name]
+			if type(row) == 'table' and type(row.length) == 'string' then
+				if type(row.hitbox) == 'string' and type(row.category) == 'string' and row.category ~= '' then
+					lines[#lines + 1] = ('|%s; %s; %s; %s'):format(name, row.hitbox, row.category, row.length)
+				else
+					lines[#lines + 1] = ('|%s; %s'):format(name, row.length)
+				end
+			end
+		end
+		return lines
+	end
+
+	local blitzWeaponsRunning = false
+
+	local rememberMeasuredTool = function(weaponName, tool)
+		local catalog = loadWeaponLengthCatalog()
+		if catalog[weaponName] ~= nil then
+			return false
+		end
+		local full, _, bladeLen = measureToolLength(tool)
+		if type(full) ~= 'number' then
+			return false
+		end
+		catalog[weaponName] = {
+			hitbox = type(bladeLen) == 'number' and formatStuds(bladeLen) or nil,
+			length = formatStuds(full),
+			category = weaponWikiCategory(weaponName),
+		}
+		saveWeaponLengthCatalog()
+		return true
+	end
+
+	local myProfileFolder = function()
+		local profiles = game:GetService('ReplicatedStorage'):FindFirstChild('Profiles')
+		return profiles and Players.LocalPlayer and profiles:FindFirstChild(Players.LocalPlayer.Name)
+	end
+
+	local myInventoryItemById = function(id)
+		local profile = myProfileFolder()
+		local inv = profile and profile:FindFirstChild('Inventory')
+		if not inv or id == nil then
+			return nil
+		end
+		for _, item in ipairs(inv:GetChildren()) do
+			if item:IsA('ValueBase') and item.Value == id then
+				return item
+			end
+		end
+		return nil
+	end
+
+	local unrecordedInventoryWeapons = function()
+		local profile = myProfileFolder()
+		local inv = profile and profile:FindFirstChild('Inventory')
 		local database = game:GetService('ReplicatedStorage'):FindFirstChild('Database')
 		local itemsDb = database and database:FindFirstChild('Items')
-		local entry = itemsDb and itemsDb:FindFirstChild(weaponName)
-		local classVal
-		if entry then
-			local cls = entry:FindFirstChild('Class')
-			if cls and cls:IsA('ValueBase') then
-				classVal = cls.Value
-			else
-				local stats = entry:FindFirstChild('Stats')
-				cls = stats and stats:FindFirstChild('Class')
-				if cls and cls:IsA('ValueBase') then
-					classVal = cls.Value
+		local catalog = loadWeaponLengthCatalog()
+		local picked = {}
+		if not inv or not itemsDb then
+			return {}
+		end
+		for _, item in ipairs(inv:GetChildren()) do
+			if item:IsA('ValueBase') and not picked[item.Name] and catalog[item.Name] == nil then
+				local entry = itemsDb:FindFirstChild(item.Name)
+				local typ = entry and entry:FindFirstChild('Type')
+				if typ and typ.Value == 'Weapon' then
+					picked[item.Name] = item
 				end
 			end
 		end
-		local category = classMap[tostring(classVal or '')]
-		if not category and classVal then
-			local lower = string.lower(tostring(classVal))
-			for key, wiki in pairs(classMap) do
-				if string.lower(key) == lower or string.lower(wiki) == lower then
-					category = wiki
-					break
-				end
+		local list = {}
+		for _, item in pairs(picked) do
+			list[#list + 1] = item
+		end
+		table.sort(list, function(a, b)
+			return string.lower(a.Name) < string.lower(b.Name)
+		end)
+		return list
+	end
+
+	local equipMyWeapon = function(item)
+		local fn = game:GetService('ReplicatedStorage'):FindFirstChild('Function')
+		if not (fn and item) then
+			return false
+		end
+		local ok = pcall(function()
+			fn:InvokeServer('Equipment', { 'EquipWeapon', item, 'Right' })
+		end)
+		return ok
+	end
+
+	local waitForMyWeaponTool = function(weaponName, timeout)
+		local userId = Players.LocalPlayer and tostring(Players.LocalPlayer.UserId)
+		local t0 = os.clock()
+		while os.clock() - t0 < timeout do
+			if not blitzWeaponsRunning then
+				return nil
 			end
+			local items = workspace:FindFirstChild('CharacterItems')
+			local holder = userId and items and items:FindFirstChild(userId)
+			local weapon = holder and holder:FindFirstChild('RightWeapon')
+			local tool = weapon and weapon:GetAttribute('Name') == weaponName and weapon:FindFirstChild('Tool')
+			if tool then
+				return tool
+			end
+			task.wait(0.05)
 		end
-		if type(category) ~= 'string' or category == '' then
-			return nil, weaponName .. ' class not in Database.Items'
-		end
-		return ('|%s; %s; %s'):format(weaponName, string.format('%.3f', length), category), nil
+		return nil
 	end
 
 	local readPlayerMobKills = function(playerOrName)
@@ -5127,7 +5843,105 @@ local ok, err = pcall(function()
 		return total, rows, name
 	end
 
+	-- https://swordburst2.fandom.com/wiki/Category:Boss (+ name aliases for profile matching)
+	local BOSS_KILL_NAME_LIST = {
+		'Aeganatos, The Sunken Sovereign',
+		'Alpha Killer Bunny',
+		'Atheon',
+		'Azeis, Spirit of the Blossom',
+		'Basileus YanSafe',
+		'BOB',
+		'Bob',
+		'Borik the BeeKeeper',
+		'Corrupted Atheon',
+		'Count Dracula',
+		'Da, the Demeanor',
+		'Duality Reaper',
+		'Enraged Wendigo',
+		'Formaug the Jungle Giant',
+		'Grim the Overseer',
+		"Guardian's Vessel",
+		'Headless Horseman',
+		'Irath the Lion',
+		'Jolrock the Snow Protecter',
+		'Ka, the Mischief',
+		'Limor the Devourer',
+		'Mortis the Flaming Sear',
+		'Orc King',
+		'Pan Ku, Chaos-born',
+		'Panku',
+		"Ra'thae the Ice King",
+		'Ra, the Enlightener',
+		'Radioactive Experiment',
+		'Rahjin the Thief King',
+		'Ramseis, Chef of Souls',
+		'Rekindled Unborn',
+		"Sa'jun (Catacombs)",
+		"Sa'jun the Centurian Chieftain",
+		'Saurus, the All-Seeing',
+		'Saurus the All-Seeing',
+		'Smashroom the Mushroom Behemoth',
+		'Suspended Unborn',
+		'Terror Incarnate',
+		'Terror Incarnātus, The Eldritch Unbound',
+		'Terror Incarnatus, The Eldritch Unbound',
+		'Vyroth, The Frostflame',
+		'Wa, the Curious',
+		'Warlord',
+		'Hunter',
+		'Wintula the Punisher',
+		'Za, the Eldest',
+	}
+	local function normBossKillKey(s)
+		s = string.lower(tostring(s or ''))
+		s = string.gsub(s, '[%p%s]+', '')
+		return s
+	end
+	local BOSS_KILL_KEYS = {}
+	for _, bossName in ipairs(BOSS_KILL_NAME_LIST) do
+		local key = normBossKillKey(bossName)
+		if #key >= 5 then
+			BOSS_KILL_KEYS[key] = true
+		end
+	end
+	local function isBossKillName(mobName)
+		local key = normBossKillKey(mobName)
+		if key == '' then
+			return false
+		end
+		if BOSS_KILL_KEYS[key] then
+			return true
+		end
+		-- Profile names sometimes omit commas / titles; match long substrings only.
+		for bossKey in pairs(BOSS_KILL_KEYS) do
+			if #bossKey >= 8 and string.find(key, bossKey, 1, true) then
+				return true
+			end
+			if #key >= 8 and string.find(bossKey, key, 1, true) then
+				return true
+			end
+		end
+		return false
+	end
+
+	local readPlayerBossKills = function(playerOrName)
+		local total, rows, name = readPlayerMobKills(playerOrName)
+		if total == nil then
+			return nil
+		end
+		local bossRows = {}
+		local bossTotal = 0
+		for _, row in ipairs(rows) do
+			if isBossKillName(row.name) then
+				bossTotal += row.count
+				bossRows[#bossRows + 1] = row
+			end
+		end
+		return bossTotal, bossRows, name
+	end
+
 	local mobKillsBtn = nil
+	local bossKillsBtn = nil
 	local refreshMobKillsButton = function()
 		if not (mobKillsBtn and mobKillsBtn.Parent) then
 			return
@@ -5144,6 +5958,24 @@ local ok, err = pcall(function()
 			return
 		end
 		mobKillsBtn.Text = 'Mob kills: ' .. formatNumber(total)
+	end
+
+	local refreshBossKillsButton = function()
+		if not (bossKillsBtn and bossKillsBtn.Parent) then
+			return
+		end
+		local name = getSelectedProfileName()
+			or resolveProfileName(Options.PlayerList and Options.PlayerList.Value)
+		if not name then
+			bossKillsBtn.Text = 'Boss kills'
+			return
+		end
+		local total = readPlayerBossKills(name)
+		if type(total) ~= 'number' then
+			bossKillsBtn.Text = 'Boss kills'
+			return
+		end
+		bossKillsBtn.Text = 'Boss kills: ' .. formatNumber(total)
 	end
 
 	local showPlayerMobKills = function()
@@ -5231,6 +6063,92 @@ local ok, err = pcall(function()
 			local top = rankings[1]
 			local lines = {
 				('Highest: %s — %s kills'):format(top.name, formatNumber(top.total)),
+				('All profiles (%d):'):format(#rankings),
+			}
+			local limit = math.min(20, #rankings)
+			for i = 1, limit do
+				local row = rankings[i]
+				lines[#lines + 1] = ('#%d %s — %s'):format(i, row.name, formatNumber(row.total))
+			end
+			if #rankings > limit then
+				lines[#lines + 1] = ('… +%d more'):format(#rankings - limit)
+			end
+			local text = table.concat(lines, '\n')
+			copyTextToClipboard(text)
+			Library:Notify(text, 16, true)
+		end)
+	end
+
+	local showPlayerBossKills = function()
+		local name = getSelectedProfileName()
+		if not name then
+			Library:Notify('Select a player first', 8, true)
+			return
+		end
+		local total, rows = readPlayerBossKills(name)
+		if total == nil then
+			Library:Notify(name .. ' — boss kills unavailable', 8, true)
+			return
+		end
+		local lines = {
+			('BOSS TOTAL(%d)'):format(total),
+		}
+		local limit = math.min(15, #rows)
+		for i = 1, limit do
+			local row = rows[i]
+			lines[#lines + 1] = ('%s(%d)'):format(row.name, row.count)
+		end
+		if #rows == 0 then
+			lines[#lines + 1] = '(no boss kills yet)'
+		elseif #rows > limit then
+			lines[#lines + 1] = ('… +%d more'):format(#rows - limit)
+		end
+		local text = table.concat(lines, '\n')
+		local copied = copyTextToClipboard(text)
+		Library:Notify(name .. ' — boss kills\n' .. text, 14, true)
+		refreshBossKillsButton()
+		if copied then
+			task.defer(function()
+				Library:Notify('Copied boss kills to clipboard', 4)
+			end)
+		else
+			task.defer(function()
+				Library:Notify('Clipboard unavailable', 4)
+			end)
+		end
+	end
+
+	local showAllProfilesBossKills = function()
+		local folder = getProfilesFolder()
+		if not folder then
+			Library:Notify('Profiles folder unavailable', 8, true)
+			return
+		end
+		Library:Notify('Scanning all profile boss kills…', 3)
+		task.spawn(function()
+			local rankings = {}
+			for _, child in ipairs(folder:GetChildren()) do
+				if child:IsA('LocalScript') or child:IsA('ModuleScript') or child:IsA('Script') then
+					continue
+				end
+				local total = readPlayerBossKills(child.Name)
+				if type(total) == 'number' then
+					rankings[#rankings + 1] = { name = child.Name, total = total }
+				end
+			end
+			if #rankings == 0 then
+				Library:Notify('No profile boss kill data found', 8, true)
+				return
+			end
+			table.sort(rankings, function(a, b)
+				if a.total == b.total then
+					return a.name:lower() < b.name:lower()
+				end
+				return a.total > b.total
+			end)
+			local top = rankings[1]
+			local lines = {
+				('Highest bosses: %s — %s'):format(top.name, formatNumber(top.total)),
 				('All profiles (%d):'):format(#rankings),
 			}
 			local limit = math.min(20, #rankings)
@@ -5425,6 +6343,7 @@ local ok, err = pcall(function()
 			debug.setupvalue(RequiredServices.InventoryUI.GetInventoryData, 2, profile)
 		end
 		refreshMobKillsButton()
+		refreshBossKillsButton()
 	end)
 
 	PlayersBox:AddButton('Refresh profiles', refreshPlayerListDropdown)
@@ -5562,6 +6481,23 @@ local ok, err = pcall(function()
 		showAllProfilesMobKills()
 	end)
 
+	bossKillsBtn = PlayersBox:AddButton('Boss kills', function()
+		showPlayerBossKills()
+	end)
+	pcall(function()
+		bossKillsBtn.TextTruncate = Enum.TextTruncate.AtEnd
+	end)
+	task.defer(refreshBossKillsButton)
+	task.spawn(function()
+		while bossKillsBtn and bossKillsBtn.Parent do
+			refreshBossKillsButton()
+			task.wait(2)
+		end
+	end)
+	PlayersBox:AddButton('All boss kills', function()
+		showAllProfilesBossKills()
+	end)
+
 	PlayersBox:AddLabel('Wiki hitbox')
 	PlayersBox:AddButton('Copy hitbox', function()
 		local ok, line, err = pcall(readSelectedHitboxLine)
@@ -5579,6 +6515,190 @@ local ok, err = pcall(function()
 			Library:Notify('Clipboard unavailable')
 		end
 	end)
+	PlayersBox:AddButton('Copy weapon length', function()
+		local ok, line, err = pcall(readSelectedWeaponLength)
+		if not ok then
+			Library:Notify('Weapon length error: ' .. tostring(line))
+			return
+		end
+		if not line then
+			Library:Notify(err or 'Could not measure weapon')
+			return
+		end
+		if copyTextToClipboard(line) then
+			Library:Notify('Copied: ' .. line)
+		else
+			Library:Notify(line)
+		end
+	end)
+	PlayersBox:AddToggle('ShowWeaponLength', { Text = 'Show weapon length' }):OnChanged(function(value)
+		if not value then
+			-- Profile load can paint this off before CharacterItems exists.
+			-- Put it back when the saved profile wanted it on.
+			if getgenv().SB2ConfigLoading and getgenv().SB2ShowWeaponLengthWanted then
+				task.defer(function()
+					local t = Toggles.ShowWeaponLength
+					if t and t.Value ~= true then
+						local prev = getgenv().SB2ConfigLoading
+						getgenv().SB2ConfigLoading = true
+						pcall(function()
+							t:SetValue(true)
+						end)
+						getgenv().SB2ConfigLoading = prev
+					end
+				end)
+				return
+			end
+			getgenv().SB2ShowWeaponLengthWanted = false
+			stopWeaponLengthPreview()
+			return
+		end
+		getgenv().SB2ShowWeaponLengthWanted = true
+		startWeaponLengthPreview()
+		local name = getSelectedProfileName()
+		if name and not getgenv().SB2ConfigLoading then
+			Library:Notify('Weapon length on ' .. name .. ' (only you can see it)')
+		end
+	end)
+	local recordStatus = PlayersBox:AddLabel('Recorded: …')
+	local setRecordStatus = function(text)
+		if not recordStatus then
+			return
+		end
+		-- AddLabel only redraws through SetText. Writing .Text leaves the line stuck on "Recorded: …".
+		if type(recordStatus.SetText) == 'function' then
+			recordStatus:SetText(text)
+		else
+			recordStatus.Text = text
+		end
+	end
+	task.defer(function()
+		local ok, total = pcall(catalogCount)
+		setRecordStatus(ok and ('Recorded: ' .. tostring(total) .. ' weapons') or 'Recorded: 0 weapons')
+	end)
+	local recordLoopGen = 0
+	local startRecordLoop = function()
+		recordLoopGen = recordLoopGen + 1
+		local gen = recordLoopGen
+		task.spawn(function()
+			task.wait()
+			while gen == recordLoopGen and isToggleOn('RecordWeaponLengths') do
+				local ok, added, total, here = pcall(recordServerWeapons)
+				if not ok then
+					setRecordStatus('Record failed')
+					Library:Notify('Record failed: ' .. tostring(added))
+				else
+					setRecordStatus(('Here: %d  ·  saved: %d  ·  +%d'):format(here or 0, total or 0, added or 0))
+					if type(added) == 'number' and added > 0 then
+						Library:Notify(('Recorded %d new weapons (%d on list)'):format(added, total or 0))
+					end
+				end
+				task.wait(5)
+			end
+		end)
+	end
+	PlayersBox:AddToggle('RecordWeaponLengths', { Text = 'Record weapon lengths' }):OnChanged(function(value)
+		if not value then
+			if getgenv().SB2ConfigLoading and getgenv().SB2RecordWeaponLengthsWanted then
+				task.defer(function()
+					local t = Toggles.RecordWeaponLengths
+					if t and t.Value ~= true then
+						local prev = getgenv().SB2ConfigLoading
+						getgenv().SB2ConfigLoading = true
+						pcall(function()
+							t:SetValue(true)
+						end)
+						getgenv().SB2ConfigLoading = prev
+					end
+				end)
+				return
+			end
+			getgenv().SB2RecordWeaponLengthsWanted = false
+			recordLoopGen = recordLoopGen + 1
+			local ok, total = pcall(catalogCount)
+			setRecordStatus(ok and ('Recorded: ' .. tostring(total) .. ' weapons') or 'Recorded: 0 weapons')
+			return
+		end
+		getgenv().SB2RecordWeaponLengthsWanted = true
+		startRecordLoop()
+	end)
+	PlayersBox:AddButton('Copy recorded lengths', function()
+		local ok, lines = pcall(recordedWeaponLines)
+		if not ok then
+			Library:Notify('Copy failed: ' .. tostring(lines))
+			return
+		end
+		if type(lines) ~= 'table' or #lines == 0 then
+			Library:Notify('No weapon lengths recorded yet')
+			return
+		end
+		local text = table.concat(lines, '\n')
+		if copyTextToClipboard(text) then
+			Library:Notify(('Copied %d weapons'):format(#lines))
+		else
+			Library:Notify(text)
+		end
+	end)
+	local blitzStatus = PlayersBox:AddLabel('Blitz: idle')
+	PlayersBox:AddToggle('BlitzWeapons', { Text = 'Blitz my weapons' }):OnChanged(function(value)
+		if not value then
+			blitzWeaponsRunning = false
+			if blitzStatus then
+				blitzStatus.Text = 'Blitz: idle'
+			end
+			return
+		end
+		if blitzWeaponsRunning then
+			return
+		end
+		task.spawn(function()
+			local list = unrecordedInventoryWeapons()
+			if #list == 0 then
+				Library:Notify('Closet already measured. Nothing new to try on.')
+				if Toggles.BlitzWeapons then
+					Toggles.BlitzWeapons:SetValue(false)
+				end
+				return
+			end
+			local profile = myProfileFolder()
+			local previousId = profile and profile:FindFirstChild('Equip') and profile.Equip:FindFirstChild('Right') and profile.Equip.Right.Value
+			local previousItem = myInventoryItemById(previousId)
+			blitzWeaponsRunning = true
+			Library:Notify(('Hold onto your butt. Trying on %d weapons.'):format(#list))
+			local caught, missed = 0, 0
+			for i, item in ipairs(list) do
+				if not blitzWeaponsRunning or not isToggleOn('BlitzWeapons') then
+					break
+				end
+				if blitzStatus then
+					blitzStatus.Text = ('Blitz %d/%d · %s'):format(i, #list, item.Name)
+				end
+				if loadWeaponLengthCatalog()[item.Name] == nil then
+					local fired = equipMyWeapon(item)
+					local tool = fired and waitForMyWeaponTool(item.Name, 1.6) or nil
+					if tool and rememberMeasuredTool(item.Name, tool) then
+						caught = caught + 1
+					else
+						missed = missed + 1
+					end
+				end
+			end
+			blitzWeaponsRunning = false
+			if previousItem then
+				equipMyWeapon(previousItem)
+			end
+			Library:Notify(('Closet sprint done. Caught %d, missed %d. Your old weapon is back.'):format(caught, missed))
+			if Toggles.BlitzWeapons and isToggleOn('BlitzWeapons') then
+				Toggles.BlitzWeapons:SetValue(false)
+			end
+			if blitzStatus then
+				blitzStatus.Text = ('Blitz: caught %d, missed %d'):format(caught, missed)
+			end
+		end)
+	end)
+
+	end
+	setupWeaponLengthTools()
 
 	if RequiredServices
 		and RequiredServices.InventoryUI
@@ -5806,7 +6926,7 @@ local ok, err = pcall(function()
 			Finished = false,
 			ClearTextOnFocus = false,
 			AllowEmpty = true,
-			Tooltip = 'Type a username (or user id). Uses the same join as Locations → Friends, without treating private profiles as offline.',
+			Tooltip = 'Join their SB2 / Wave Defense server only. Refuses other games so you are not warped out of SB2.',
 		})
 
 		local function httpRequest(opts)
@@ -5934,6 +7054,7 @@ local ok, err = pcall(function()
 				end
 				presenceType = tonumber(row.userPresenceType or row.UserPresenceType) or presenceType
 				local placeId = tonumber(row.placeId or row.PlaceId or row.rootPlaceId or row.RootPlaceId)
+				local universeId = tonumber(row.universeId or row.UniverseId)
 				local jobId = row.gameId or row.GameId or row.instanceId or row.InstanceId
 				if type(jobId) == 'string' and jobId == '' then
 					jobId = nil
@@ -5941,11 +7062,11 @@ local ok, err = pcall(function()
 				-- Privacy often reports Offline (type 0) while they are in-game.
 				-- If we got a place + job, join anyway — same as in-game join.
 				if type(placeId) == 'number' and placeId > 0 and type(jobId) == 'string' then
-					return placeId, jobId, nil, presenceType
+					return placeId, jobId, nil, presenceType, universeId
 				end
 				lastErr = 'presence hid place/job'
 			end
-			return nil, nil, lastErr or 'presence lookup failed', presenceType
+			return nil, nil, lastErr or 'presence lookup failed', presenceType, nil
 		end
 
 		local function describeJoinUnavailable(displayName, presenceType, lookErr)
@@ -6063,6 +7184,88 @@ local ok, err = pcall(function()
 			return ran
 		end
 
+		local function universeIsSb2(universeId)
+			local key = idStr(universeId)
+			return key ~= '' and EXTRA_LAUNCH_GAME_IDS[key] == true
+		end
+
+		local function placeIdIsListedSb2(placeId)
+			placeId = tonumber(placeId)
+			if not placeId then
+				return false
+			end
+			if EXTRA_LAUNCH_PLACE_IDS[idStr(placeId)] then
+				return true
+			end
+			if type(getgenv().SB2IsSb2LocationPlace) == 'function' then
+				local ok, yes = pcall(getgenv().SB2IsSb2LocationPlace, placeId)
+				if ok and yes then
+					return true
+				end
+			end
+			local ids = getgenv().SB2LocationsPlaceIds
+			if type(ids) == 'table' and (ids[placeId] or ids[idStr(placeId)]) then
+				return true
+			end
+			return false
+		end
+
+		local function lookupUniverseForPlace(placeId)
+			placeId = tonumber(placeId)
+			if not placeId then
+				return nil
+			end
+			local urls = {
+				('https://apis.roblox.com/universes/v1/places/%.0f/universe'):format(placeId),
+				('https://apis.roproxy.com/universes/v1/places/%.0f/universe'):format(placeId),
+				('https://games.roblox.com/v1/games/multiget-place-details?placeIds=%.0f'):format(placeId),
+				('https://games.roproxy.com/v1/games/multiget-place-details?placeIds=%.0f'):format(placeId),
+			}
+			for _, url in ipairs(urls) do
+				local res = httpRequest({
+					Url = url,
+					Method = 'GET',
+					Headers = { Accept = 'application/json' },
+				})
+				if not res then
+					continue
+				end
+				local status = tonumber(res.StatusCode) or tonumber(res.Status) or 0
+				local rawBody = res.Body or res.body or ''
+				if status < 200 or status >= 300 or type(rawBody) ~= 'string' or rawBody == '' then
+					continue
+				end
+				local okDecode, data = pcall(function()
+					return HttpService:JSONDecode(rawBody)
+				end)
+				if not okDecode then
+					continue
+				end
+				if type(data) == 'table' then
+					local uni = tonumber(data.universeId or data.UniverseId)
+					if not uni and type(data[1]) == 'table' then
+						uni = tonumber(data[1].universeId or data[1].UniverseId)
+					end
+					if uni and uni > 0 then
+						return uni
+					end
+				end
+			end
+			return nil
+		end
+
+		-- Only SB2 (universe 212154879) and Wave Defense. Presence can point at
+		-- Brookhaven / whatever they actually launched — do not follow that.
+		local function isSb2JoinTarget(placeId, universeId)
+			if universeIsSb2(universeId) then
+				return true
+			end
+			if placeIdIsListedSb2(placeId) then
+				return true
+			end
+			return universeIsSb2(lookupUniverseForPlace(placeId))
+		end
+
 		local function tryNativeFriendTeleport(username)
 			username = trimName(username)
 			if username == '' then
@@ -6120,15 +7323,28 @@ local ok, err = pcall(function()
 			local placeId, jobId, tpErr = lookupViaTeleportService(userId)
 			local lookErr = tpErr
 			local presenceType = nil
+			local universeId = nil
 			if not (placeId and jobId) then
-				local pPlace, pJob, pErr, pType = lookupPlaceViaPresence(userId)
+				local pPlace, pJob, pErr, pType, pUni = lookupPlaceViaPresence(userId)
 				placeId, jobId = pPlace, pJob
 				presenceType = pType
+				universeId = pUni
 				lookErr = tpErr or pErr
 			end
 			if placeId and jobId then
 				if placeId == game.PlaceId and jobId == game.JobId then
 					Library:Notify(tostring(displayName) .. ' is already in this server')
+					return
+				end
+				if not isSb2JoinTarget(placeId, universeId) then
+					Library:Notify(
+						('%s is not in SB2 / Wave Defense (place %s) — not joining'):format(
+							tostring(displayName),
+							tostring(placeId)
+						),
+						8,
+						true
+					)
 					return
 				end
 				if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
@@ -17127,6 +18343,122 @@ local ok, err = pcall(function()
 			end)
 		end
 
+		-- Favorite / lock every copy of one weapon name.
+		local MarkBox = InvTab:AddLeftGroupbox('Favorite / lock')
+		assert(MarkBox, 'Favorite / lock groupbox nil')
+		do
+			local markBusy = false
+
+			local function myInventory()
+				local profiles = game:GetService('ReplicatedStorage'):FindFirstChild('Profiles')
+				local lp = game:GetService('Players').LocalPlayer
+				local prof = profiles and lp and profiles:FindFirstChild(lp.Name)
+				return prof and prof:FindFirstChild('Inventory')
+			end
+
+			local function typedWeaponName()
+				local opt = Options.InvMarkWeaponName
+				local raw = opt and opt.Value
+				if type(raw) ~= 'string' then
+					raw = tostring(raw or '')
+				end
+				raw = raw:gsub('^%s+', ''):gsub('%s+$', '')
+				if raw == '' then
+					return nil
+				end
+				local inv = myInventory()
+				if not inv then
+					return raw
+				end
+				local folded = string.lower(raw)
+				local found = nil
+				for _, item in ipairs(inv:GetChildren()) do
+					if item:IsA('ValueBase') then
+						if item.Name == raw then
+							return raw
+						end
+						if not found and string.lower(item.Name) == folded then
+							found = item.Name
+						end
+					end
+				end
+				return found or raw
+			end
+
+			MarkBox:AddLabel('Type the weapon name, then favorite or lock every copy you own.')
+			MarkBox:AddInput('InvMarkWeaponName', {
+				Text = 'Weapon name',
+				Default = '',
+				Placeholder = 'Type the name',
+				Finished = false,
+				ClearTextOnFocus = false,
+				AllowEmpty = true,
+				Tooltip = 'Exact inventory name. Capitalization does not have to match.',
+			})
+
+			local function markAll(action, attr)
+				if markBusy then
+					Library:Notify('Already marking items', 3)
+					return
+				end
+				local name = typedWeaponName()
+				if not name then
+					Library:Notify('Type a weapon name', 4)
+					return
+				end
+				local inv = myInventory()
+				if not inv then
+					Library:Notify('Inventory not loaded', 4)
+					return
+				end
+				local fn = game:GetService('ReplicatedStorage'):FindFirstChild('Function')
+				if not fn then
+					Library:Notify('Equipment remote missing', 4)
+					return
+				end
+				local pending = {}
+				local already = 0
+				for _, item in ipairs(inv:GetChildren()) do
+					if item:IsA('ValueBase') and item.Name == name then
+						if item:GetAttribute(attr) == true then
+							already += 1
+						else
+							pending[#pending + 1] = item
+						end
+					end
+				end
+				if #pending == 0 then
+					Library:Notify(already > 0 and string.format('All %d already %s', already, string.lower(action)) or 'You do not own that weapon', 4)
+					return
+				end
+				markBusy = true
+				task.spawn(function()
+					local done = 0
+					local failed = 0
+					for _, item in ipairs(pending) do
+						local ok = pcall(function()
+							fn:InvokeServer('Equipment', { action, item })
+						end)
+						if ok then
+							done += 1
+						else
+							failed += 1
+						end
+						task.wait(0.05)
+					end
+					markBusy = false
+					Library:Notify(string.format('%s %d %s (%d already, %d failed)', action, done, name, already, failed), 5)
+				end)
+			end
+
+			MarkBox:AddButton('Favorite all of this weapon', function()
+				markAll('Favorite', 'Favorited')
+			end)
+			MarkBox:AddButton('Lock all of this weapon', function()
+				markAll('Lock', 'Locked')
+			end)
+		end
+
 		-- Weapon visual modifier (held CharacterItems tools — client view only).
 		local WeaponModBox = InvTab:AddRightGroupbox('Weapon modifier')
 		assert(WeaponModBox, 'Weapon modifier groupbox nil')
@@ -22448,12 +23780,59 @@ local ok, err = pcall(function()
 			return abilities, prose
 		end
 
+		local function dumpWikiAura(name, folder)
+			local iconId = iconIdOf(folder)
+			if iconId then
+				return name .. '\n' .. iconId
+			end
+			return name .. '\n(missing icon)'
+		end
+
+		local function dumpWikiCompanion(name, folder)
+			local stats = readValueMap(folder:FindFirstChild('Stats'))
+			local rarity = wikiNormRarity(valueOf(folder, 'Rarity'))
+			local level = tonumber(valueOf(folder, 'Level')) or tonumber(stats.Level)
+			local buffs = readValueMap(folder:FindFirstChild('Buffs'))
+			local abilities = wikiBuffAbilityLines(buffs)
+			local fileName = name .. '.png'
+			local levelText = level and tostring(level) or '_'
+			local lines = {
+				'{{Item infobox|name={{PAGENAME}}|image=<gallery>',
+				fileName .. ' | Icon',
+				fileName .. ' | In-game',
+				'</gallery>|type=Companion|rarity=' .. rarity .. '|level=' .. (level and tostring(level) or ''),
+			}
+			if #abilities == 0 then
+				lines[#lines + 1] = '|abilities='
+			else
+				lines[#lines + 1] = '|abilities='
+				for _, line in ipairs(abilities) do
+					lines[#lines + 1] = line
+				end
+			end
+			lines[#lines + 1] = '|cost=None'
+			lines[#lines + 1] = '|obtain=[[]]'
+			lines[#lines + 1] = '|description=}}'
+			lines[#lines + 1] = '==Overview=='
+			lines[#lines + 1] = ("'''{{PAGENAME}}''' is a %s level %s Companion."):format(
+				wikiRarityTag(rarity),
+				levelText
+			)
+			return table.concat(lines, '\n')
+		end
+
 		local function dumpWikiItem(name)
 			local folder = getItemFolder(name)
 			if not folder then
 				return name .. '\n(not in Database.Items)'
 			end
 			local kind = itemKind(folder)
+			if kind == 'Aura' then
+				return dumpWikiAura(name, folder)
+			end
+			if kind == 'Companion' then
+				return dumpWikiCompanion(name, folder)
+			end
 			local stats = readValueMap(folder:FindFirstChild('Stats'))
 			local rarity = wikiNormRarity(valueOf(folder, 'Rarity'))
 			local level = tonumber(valueOf(folder, 'Level')) or tonumber(stats.Level)
@@ -22477,11 +23856,13 @@ local ok, err = pcall(function()
 				typeLabel = 'Shield'
 			elseif kind == 'Accessory' then
 				typeLabel = 'Accessory'
-			elseif kind == 'Aura' then
-				typeLabel = 'Aura'
+			elseif kind == 'Companion' then
+				typeLabel = 'Companion'
 			end
 			local overviewWord = wikiOverviewWeaponWord(folder, stats)
-			if kind ~= 'Weapon' then
+			if kind == 'Companion' then
+				overviewWord = 'level ' .. ((level and tostring(level)) or '_') .. ' Companion'
+			elseif kind ~= 'Weapon' then
 				overviewWord = typeLabel
 			end
 
@@ -23137,7 +24518,7 @@ local ok, err = pcall(function()
 					end
 				end
 				if id and tostring(id) ~= '' then
-					ids[#ids + 1] = tostring(id)
+					ids[#ids + 1] = ('%s: %s'):format(name, id)
 				else
 					missing += 1
 				end
@@ -23147,7 +24528,7 @@ local ok, err = pcall(function()
 				return
 			end
 			if copyText(table.concat(ids, '\n')) then
-				local msg = ('Copied %d IDs'):format(#ids)
+				local msg = ('Copied %d name:id lines'):format(#ids)
 				if missing > 0 then
 					msg = msg .. (' (%d missing)'):format(missing)
 				end
@@ -24129,8 +25510,40 @@ local ok, err = pcall(function()
 		end
 	end)()
 
-	local Settings = Window:AddTab('Settings', 'settings')
-	local Menu = Settings:AddLeftGroupbox('Script')
+	-- Reuse the library Settings tab (Script + Profiles). Do not add a second Script box.
+	local Settings = (Library.Tabs and Library.Tabs.Settings) or Window:AddTab('Settings', 'settings')
+	if not Library.Tabs.Settings then
+		Library.Tabs.Settings = Settings
+	end
+	local Menu = Settings.ScriptBox
+	if not Menu then
+		Menu = Settings:AddLeftGroupbox('Script')
+		Settings.ScriptBox = Menu
+	end
+	if not Settings.ProfileBox and Library.Config and type(Library.Config.Build) == 'function' then
+		Settings.ProfileBox = Settings:AddRightGroupbox('Profiles')
+		pcall(Library.Config.Build, Settings.ProfileBox)
+	end
+	if not Library.Toggles.ATA_Notifications and type(Library.AddNotifyToggle) == 'function' then
+		pcall(function()
+			Library:AddNotifyToggle(Menu)
+		end)
+	end
+	if not Library.Options.ATA_Theme and type(Library.ListThemes) == 'function' and type(Library.ApplyTheme) == 'function' then
+		pcall(function()
+			Menu:AddDropdown('ATA_Theme', {
+				Text = 'Theme',
+				Values = Library:ListThemes(),
+				Default = (type(Library.GetTheme) == 'function' and Library.GetTheme(Library)) or 'Default',
+				Tooltip = 'Ataraxia chrome colors. Saved in Ataraxia/theme.',
+			}):OnChanged(function(v)
+				local name = tostring(v or 'Default')
+				if name ~= '' then
+					Library:ApplyTheme(name, false)
+				end
+			end)
+		end)
+	end
 
 	pcall(function()
 		local home = Library.Tabs and Library.Tabs.Home
@@ -24264,6 +25677,44 @@ local ok, err = pcall(function()
 			getgenv().SB2AutoSkipLoad = value == true
 		end
 	end)
+	;(function()
+		local path = joinPath(CONFIG.ConfigFolder, 'cci')
+		local function fileOn()
+			if type(isfile) == 'function' and type(readfile) == 'function' then
+				local ok, exists = pcall(isfile, path)
+				if ok and exists then
+					local okRead, body = pcall(readfile, path)
+					if okRead and tostring(body) == 'false' then
+						return false
+					end
+				end
+			end
+			return true
+		end
+		local function writeFile(on)
+			if type(makefolder) ~= 'function' or type(writefile) ~= 'function' then
+				return
+			end
+			local folder = CONFIG.ConfigFolder
+			if folder ~= '' and folder ~= '.' and type(isfolder) == 'function' and not isfolder(folder) then
+				makefolder(folder)
+			end
+			pcall(writefile, path, on and 'true' or 'false')
+		end
+		Menu:AddToggle('CCI', {
+			Text = 'CCI (clear char items)',
+			Default = fileOn(),
+			Tooltip = 'IY plugin CCI.iy: strip CharacterItems VFX, hats, death FX, antilag, exposure. Off writes PlayerTools/cci=false so it stays off after rejoin.',
+		}):OnChanged(function(value)
+			writeFile(value == true)
+			getgenv().SB2CciOn = value == true
+			if type(getgenv().SB2SetCci) == 'function' then
+				pcall(getgenv().SB2SetCci, value == true, true)
+			elseif value then
+				Library:Notify('Install IY plugin CCI.iy first', 5)
+			end
+		end)
+	end)()
 	Menu:AddButton('Rejoin stuck loading now', function()
 		if LoadSkip.overlayUp() then
 			LoadSkip.rejoin('settings')
@@ -24290,7 +25741,7 @@ local ok, err = pcall(function()
 		end
 	end)
 
-	Menu:AddButton('Unload Script', function()
+	local function unloadPlayerTools()
 		if isToggleOn('ViewPlayer') then
 			Toggles.ViewPlayer:SetValue(false)
 		end
@@ -24341,7 +25792,9 @@ local ok, err = pcall(function()
 		getgenv().SB2PlayerToolsLoading = false
 		getgenv().SB2PlayerToolsArmedNotify = nil
 		Library:Notify('PlayerTools unloaded — will not auto-return until you run it again')
-	end)
+	end
+	getgenv().SB2UnloadPlayerTools = unloadPlayerTools
+	Menu:AddButton('Unload Script', unloadPlayerTools)
 
 	pcall(function()
 		local ThemeManager = compile(httpGet(CONFIG.UIRepo .. 'addons/ThemeManager.lua'))()
@@ -25744,7 +27197,10 @@ local ok, err = pcall(function()
 			SaveManager.LoadJSON = function(self, content, ...)
 				getgenv().SB2ConfigLoading = true
 				rememberSoloBlockFromJSON(content)
-				local okLoad, errLoad = origLoadJSON(self, content, ...)
+				local okP, okLoad, errLoad = pcall(origLoadJSON, self, content, ...)
+				if not okP then
+					okLoad, errLoad = false, okLoad
+				end
 				pcall(applyCombatPrefsFromSidecar)
 				-- Direct assert after Parser.Load — do not rely only on deferred apply.
 				if lastSoloBlock.SoloCombatResume == true then
@@ -25787,7 +27243,95 @@ local ok, err = pcall(function()
 			end
 		end
 
-		SaveManager:BuildConfigSection(Settings)
+		-- Profiles UI is the library right groupbox. SaveManager is disk-only (Obsidian
+		-- BuildConfigSection does not draw on Ataraxia).
+		pcall(function()
+			if not Library.Config or type(Library.Config.BindBackend) ~= 'function' then
+				return
+			end
+			local settingsDir = joinPath(CONFIG.ConfigFolder, 'settings')
+			Library.Config.BindBackend({
+				List = function()
+					local names = {}
+					if type(listfiles) ~= 'function' then
+						return names
+					end
+					local ok, files = pcall(listfiles, settingsDir)
+					if not ok or type(files) ~= 'table' then
+						return names
+					end
+					for _, path in ipairs(files) do
+						local base = tostring(path):gsub('\\', '/'):match('([^/]+)%.json$')
+						if base and base ~= 'autoload' then
+							names[#names + 1] = base
+						end
+					end
+					table.sort(names, function(a, b)
+						return string.lower(a) < string.lower(b)
+					end)
+					return names
+				end,
+				Save = function(name)
+					if type(SaveManager.Save) == 'function' then
+						return SaveManager:Save(name)
+					end
+					return false, 'Save unavailable'
+				end,
+				Load = function(name)
+					local path = autoloadConfigJsonPath(name)
+					local n = 0
+					if type(Library.Config.ImportFile) == 'function' then
+						n = tonumber(Library.Config.ImportFile(path)) or 0
+					end
+					if n <= 0 and type(SaveManager.Load) == 'function' then
+						local okLoad = pcall(function()
+							return SaveManager:Load(name)
+						end)
+						if okLoad then
+							n = 1
+						end
+					end
+					if type(readfile) == 'function' then
+						local okRead, body = pcall(readfile, path)
+						if okRead and type(body) == 'string' then
+							getgenv().SB2ConfigLoading = true
+							rememberSoloBlockFromJSON(body)
+						end
+					end
+					pcall(applyCombatPrefsFromSidecar)
+					scheduleSoloBlockApply()
+					return n
+				end,
+				GetAutoload = function()
+					local n = select(1, SaveManager:GetAutoloadConfig())
+					if n == nil or n == 'none' or n == '' then
+						return nil
+					end
+					return n
+				end,
+				SetAutoload = function(name)
+					if not name or name == '' or name == 'none' then
+						if type(SaveManager.DeleteAutoLoadConfig) == 'function' then
+							return SaveManager:DeleteAutoLoadConfig()
+						end
+						return true
+					end
+					return SaveManager:SaveAutoloadConfig(name)
+				end,
+				Delete = function(name)
+					if type(SaveManager.Delete) == 'function' then
+						return SaveManager:Delete(name)
+					end
+					if type(SaveManager.DeleteConfig) == 'function' then
+						return SaveManager:DeleteConfig(name)
+					end
+					if type(delfile) == 'function' then
+						return pcall(delfile, joinPath(settingsDir, tostring(name) .. '.json'))
+					end
+					return false
+				end,
+			})
+		end)
 		Settings:AddLabel('Autoload is per account. Profiles are shared — Set as autoload only changes this client.')
 		Settings:AddLabel('Autosave: toggles you flip are written to your autoload profile (debounced). No need to smash Overwrite after every change.')
 		Settings:AddLabel('Resume / Auto block also use sidecars. Farm height, flee depth, and skills save in combat_prefs.json (survive profile switch).')
@@ -25863,7 +27407,9 @@ local ok, err = pcall(function()
 				end)
 			end)
 		end
-		SaveManager:LoadAutoloadConfig()
+		pcall(function()
+			SaveManager:LoadAutoloadConfig()
+		end)
 
 		-- Hard guarantee: resolve autoload name, re-apply JSON (esp. Resume), even if
 		-- SaveManager skipped LoadJSON or painted Default=false after.
@@ -25903,8 +27449,10 @@ local ok, err = pcall(function()
 			if not okRead or type(body) ~= 'string' then
 				return false
 			end
-			-- Do NOT call LoadConfig/LoadJSON again — that re-races Default=false after
-			-- LoadAutoloadConfig already painted. Only remember + assert Resume/block.
+			-- Apply through Ataraxia Config (Obsidian Parser.Load needs RunChanged).
+			if Library.Config and type(Library.Config.ImportFile) == 'function' then
+				pcall(Library.Config.ImportFile, path)
+			end
 			getgenv().SB2ConfigLoading = true
 			rememberSoloBlockFromJSON(body)
 			scheduleSoloBlockApply()
