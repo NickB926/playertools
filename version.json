@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.19",
-    "message":  "Ataraxia: library anti-AFK, account profiles, toast stacking, per-script version label",
+    "version":  "1.0.21",
+    "message":  "Players: Boss kills (wiki Category:Boss filter) + All boss kills ranking",
     "files":  [
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",
