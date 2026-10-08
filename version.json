@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.22",
-    "message":  "Ataraxia.lua auto-updates from GitHub before load (fixes stuck 1.0.9)",
+    "version":  "1.0.23",
+    "message":  "Boss kills: full Locations/Mobs/Drops boss + miniboss list",
     "files":  [
                   "Ataraxia.lua",
                   "PlayerTools/launch.lua",
