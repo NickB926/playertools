@@ -24,6 +24,109 @@ local C = {
 	danger = Color3.fromRGB(255, 107, 107),
 }
 
+-- Built-in palettes. Default matches the classic Ataraxia chrome (unchanged).
+local THEME_FILE = 'Ataraxia/theme'
+local THEME_ORDER = { 'Default', 'Midnight', 'Slate', 'Warm', 'Contrast' }
+local THEMES = {
+	Default = {
+		bg0 = Color3.fromRGB(10, 10, 10),
+		bg1 = Color3.fromRGB(17, 17, 17),
+		bg2 = Color3.fromRGB(26, 26, 26),
+		bg3 = Color3.fromRGB(36, 36, 36),
+		line = Color3.fromRGB(48, 48, 48),
+		text = Color3.fromRGB(242, 242, 242),
+		muted = Color3.fromRGB(138, 138, 138),
+		accent = Color3.fromRGB(255, 255, 255),
+		danger = Color3.fromRGB(255, 107, 107),
+	},
+	Midnight = {
+		bg0 = Color3.fromRGB(8, 10, 16),
+		bg1 = Color3.fromRGB(14, 18, 28),
+		bg2 = Color3.fromRGB(22, 28, 40),
+		bg3 = Color3.fromRGB(32, 40, 56),
+		line = Color3.fromRGB(48, 58, 78),
+		text = Color3.fromRGB(236, 242, 255),
+		muted = Color3.fromRGB(130, 142, 168),
+		accent = Color3.fromRGB(210, 225, 255),
+		danger = Color3.fromRGB(255, 107, 107),
+	},
+	Slate = {
+		bg0 = Color3.fromRGB(12, 13, 14),
+		bg1 = Color3.fromRGB(20, 22, 24),
+		bg2 = Color3.fromRGB(30, 32, 36),
+		bg3 = Color3.fromRGB(42, 46, 52),
+		line = Color3.fromRGB(58, 62, 70),
+		text = Color3.fromRGB(236, 238, 240),
+		muted = Color3.fromRGB(140, 146, 154),
+		accent = Color3.fromRGB(220, 230, 240),
+		danger = Color3.fromRGB(255, 107, 107),
+	},
+	Warm = {
+		bg0 = Color3.fromRGB(12, 10, 9),
+		bg1 = Color3.fromRGB(20, 17, 15),
+		bg2 = Color3.fromRGB(30, 26, 22),
+		bg3 = Color3.fromRGB(42, 36, 30),
+		line = Color3.fromRGB(58, 50, 42),
+		text = Color3.fromRGB(245, 240, 232),
+		muted = Color3.fromRGB(150, 138, 124),
+		accent = Color3.fromRGB(255, 236, 210),
+		danger = Color3.fromRGB(255, 120, 100),
+	},
+	Contrast = {
+		bg0 = Color3.fromRGB(0, 0, 0),
+		bg1 = Color3.fromRGB(12, 12, 12),
+		bg2 = Color3.fromRGB(22, 22, 22),
+		bg3 = Color3.fromRGB(40, 40, 40),
+		line = Color3.fromRGB(80, 80, 80),
+		text = Color3.fromRGB(255, 255, 255),
+		muted = Color3.fromRGB(170, 170, 170),
+		accent = Color3.fromRGB(255, 255, 255),
+		danger = Color3.fromRGB(255, 80, 80),
+	},
+}
+
+local currentThemeName = 'Default'
+
+local function copyThemeIntoC(theme)
+	for k, v in pairs(theme) do
+		C[k] = v
+	end
+end
+
+local function readThemeFile()
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, THEME_FILE)
+		if ok and exists then
+			local rok, body = pcall(readfile, THEME_FILE)
+			if rok and type(body) == 'string' then
+				local name = tostring(body):gsub('%s+', '')
+				if THEMES[name] then
+					return name
+				end
+			end
+		end
+	end
+	return 'Default'
+end
+
+local function writeThemeFile(name)
+	if type(writefile) ~= 'function' then
+		return
+	end
+	pcall(function()
+		if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+			makefolder('Ataraxia')
+		end
+	end)
+	pcall(writefile, THEME_FILE, tostring(name or 'Default'))
+end
+
+do
+	local saved = readThemeFile()
+	currentThemeName = saved
+	copyThemeIntoC(THEMES[saved] or THEMES.Default)
+end
+
 local Library = {
 	Options = {},
 	Toggles = {},
@@ -130,6 +233,9 @@ end
 function Library:PlayTabAnimation() end
 
 function Library:Notify(text, duration)
+	if type(self.IsNotifyEnabled) == 'function' and self:IsNotifyEnabled() ~= true then
+		return
+	end
 	duration = tonumber(duration) or 5
 	-- Own ScreenGui: the in-window toast holder is 40px and clips multiline text.
 	local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass('PlayerGui')
@@ -908,6 +1014,236 @@ end
 
 function Library:IsHideGameplayPaused()
 	return NoPause.isOn()
+end
+
+---------------------------------------------------------------------------
+-- Notification mute. Library:Notify no-ops when off.
+-- Persists in Ataraxia/notifications (default on). Shared across games.
+---------------------------------------------------------------------------
+local NotifyPref = (function()
+	local api = {}
+	local FILE = 'Ataraxia/notifications'
+	local enabled = true
+
+	local function readFile()
+		if type(isfile) == 'function' and type(readfile) == 'function' then
+			local ok, exists = pcall(isfile, FILE)
+			if ok and exists then
+				local rok, body = pcall(readfile, FILE)
+				if rok and tostring(body):lower():find('false', 1, true) then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	local function writeFile(on)
+		if type(writefile) ~= 'function' then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+				makefolder('Ataraxia')
+			end
+		end)
+		pcall(writefile, FILE, on and 'true' or 'false')
+	end
+
+	enabled = readFile()
+
+	function api.isOn()
+		return enabled == true
+	end
+
+	function api.set(on)
+		enabled = on ~= false
+		writeFile(enabled)
+		return enabled
+	end
+
+	return api
+end)()
+
+function Library:SetNotifyEnabled(on)
+	return NotifyPref.set(on)
+end
+
+function Library:IsNotifyEnabled()
+	return NotifyPref.isOn()
+end
+
+function Library:AddNotifyToggle(box)
+	if not box or type(box.AddToggle) ~= 'function' then
+		return
+	end
+	return box:AddToggle('ATA_Notifications', {
+		Text = 'Show notifications',
+		Default = NotifyPref.isOn(),
+		Tooltip = 'Ataraxia toasts (Library:Notify). Off is saved in Ataraxia/notifications for every game.',
+	}):OnChanged(function(v)
+		Library:SetNotifyEnabled(v == true)
+	end)
+end
+
+function Library:ListThemes()
+	local out = {}
+	for i, name in ipairs(THEME_ORDER) do
+		out[i] = name
+	end
+	return out
+end
+
+function Library:GetTheme()
+	return currentThemeName
+end
+
+function Library:ApplyTheme(name, silent)
+	name = tostring(name or 'Default')
+	if not THEMES[name] then
+		name = 'Default'
+	end
+	local old = {}
+	for k, v in pairs(C) do
+		old[k] = v
+	end
+	currentThemeName = name
+	copyThemeIntoC(THEMES[name])
+	writeThemeFile(name)
+
+	local function remap(col)
+		if typeof(col) ~= 'Color3' then
+			return nil
+		end
+		for k, v in pairs(old) do
+			if col == v then
+				return C[k]
+			end
+		end
+		return nil
+	end
+
+	local gui = self.ScreenGui
+	if gui then
+		for _, d in ipairs(gui:GetDescendants()) do
+			if d:IsA('GuiObject') then
+				local nb = remap(d.BackgroundColor3)
+				if nb then
+					d.BackgroundColor3 = nb
+				end
+			end
+			if d:IsA('TextLabel') or d:IsA('TextButton') or d:IsA('TextBox') then
+				local nt = remap(d.TextColor3)
+				if nt then
+					d.TextColor3 = nt
+				end
+			end
+			if d:IsA('UIStroke') then
+				local ns = remap(d.Color)
+				if ns then
+					d.Color = ns
+				end
+			end
+			if d:IsA('ScrollingFrame') then
+				local ns = remap(d.ScrollBarImageColor3)
+				if ns then
+					d.ScrollBarImageColor3 = ns
+				end
+			end
+		end
+	end
+
+	for _, obj in pairs(self.Toggles or {}) do
+		if type(obj.Display) == 'function' then
+			pcall(function()
+				obj:Display()
+			end)
+		end
+	end
+
+	if not silent then
+		self:Notify('Theme · ' .. name)
+	end
+	return name
+end
+
+-- Default Settings tab: Script + Profiles (+ theme). Opt out: CreateWindow{ SettingsTab = false }.
+-- Optional: SettingsExtras(scriptBox, profileBox, tab), OnUnload().
+function Library:BuildSettingsTab(Window, info)
+	info = info or {}
+	if not Window or type(Window.AddTab) ~= 'function' then
+		return nil
+	end
+	if self.Tabs and self.Tabs.Settings then
+		return self.Tabs.Settings
+	end
+
+	local tab = Window:AddTab('Settings', 'settings')
+	-- Keep Settings at the bottom of the rail even if created early.
+	pcall(function()
+		local gui = self.ScreenGui
+		local rail = gui and gui:FindFirstChild('Main')
+		rail = rail and rail:FindFirstChild('Body')
+		rail = rail and rail:FindFirstChild('Rail')
+		rail = rail and rail:FindFirstChild('RailScroll')
+		local btn = rail and rail:FindFirstChild('Settings')
+		if btn then
+			btn.LayoutOrder = 9999
+		end
+	end)
+
+	local scriptBox = tab:AddLeftGroupbox('Script')
+	scriptBox:AddLabel('Home hides/shows this window (same as PlayerTools).')
+
+	local profileBox = tab:AddRightGroupbox('Profiles')
+
+	-- Script-specific rows (e.g. Auto inject) before shared chrome controls.
+	if type(info.SettingsExtras) == 'function' then
+		pcall(info.SettingsExtras, scriptBox, profileBox, tab)
+	end
+
+	self:AddNotifyToggle(scriptBox)
+
+	scriptBox:AddDropdown('ATA_Theme', {
+		Text = 'Theme',
+		Values = self:ListThemes(),
+		Default = self:GetTheme(),
+		Tooltip = 'Ataraxia chrome colors. Default is the classic look. Saved in Ataraxia/theme for every game.',
+	}):OnChanged(function(v)
+		local name = tostring(v or 'Default')
+		if name ~= '' and name ~= self:GetTheme() then
+			self:ApplyTheme(name, false)
+		end
+	end)
+
+	scriptBox:AddButton('Hide menu', function()
+		self:Toggle(false)
+	end)
+	scriptBox:AddButton('Unload', function()
+		if type(info.OnUnload) == 'function' then
+			pcall(info.OnUnload)
+		end
+		self:Unload()
+	end)
+	scriptBox:AddButton('Save current profile now', function()
+		local ok = false
+		if self.Config and type(self.Config.SaveCurrent) == 'function' then
+			ok = self.Config.SaveCurrent() == true
+		end
+		self:Notify(ok and 'Profile saved' or 'Profile save failed')
+	end)
+	scriptBox:AddButton('Reset settings to defaults', function()
+		if self.Config and type(self.Config.Reset) == 'function' then
+			self.Config.Reset()
+		end
+		self:Notify('Settings reset to defaults')
+	end)
+
+	if self.Config and type(self.Config.Build) == 'function' then
+		self.Config.Build(profileBox)
+	end
+
+	return tab
 end
 
 local function fireChanged(obj, value)
@@ -2626,25 +2962,96 @@ function Library:CreateWindow(info)
 	pages.Parent = body
 
 	local dragging, dragStart, startPos = false, nil, nil
+	local resizing, resizeStart, startSize = false, nil, nil
+	self.MainFrame = main
+	-- Floor only — window can grow from the grip, and shrink back down to this.
+	self.MinSize = Vector2.new(880, 560)
+	self.OriginalMinSize = self.MinSize
+
 	header.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			if input.Position.X >= header.AbsolutePosition.X + header.AbsoluteSize.X - 90 then
 				return
 			end
 			dragging = true
+			resizing = false
 			dragStart = input.Position
 			startPos = main.Position
 		end
 	end)
+
+	-- Bottom-right grip: drag to resize the window.
+	local grip = Instance.new('TextButton')
+	grip.Name = 'ResizeGrip'
+	grip.Size = UDim2.fromOffset(22, 22)
+	grip.Position = UDim2.new(1, -24, 1, -24)
+	grip.BackgroundColor3 = C.bg3
+	grip.BackgroundTransparency = 0.15
+	grip.BorderSizePixel = 0
+	grip.Text = ''
+	grip.AutoButtonColor = false
+	grip.ZIndex = 80
+	grip.Parent = main
+	corner(grip, 4)
+	hairline(grip, 4)
+	do
+		local tip = Instance.new('TextLabel')
+		tip.BackgroundTransparency = 1
+		tip.Size = UDim2.fromScale(1, 1)
+		tip.Text = '⋰'
+		tip.TextColor3 = C.muted
+		tip.Font = Enum.Font.SourceSansBold
+		tip.TextSize = 16
+		tip.ZIndex = 81
+		tip.Parent = grip
+	end
+	grip.MouseEnter:Connect(function()
+		grip.BackgroundTransparency = 0
+		grip.BackgroundColor3 = C.bg2 or C.bg3
+	end)
+	grip.MouseLeave:Connect(function()
+		if not resizing then
+			grip.BackgroundTransparency = 0.15
+			grip.BackgroundColor3 = C.bg3
+		end
+	end)
+	grip.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+			return
+		end
+		resizing = true
+		dragging = false
+		resizeStart = input.Position
+		startSize = main.AbsoluteSize
+	end)
+
 	track(UserInputService.InputChanged:Connect(function(input)
-		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+		if dragging then
 			local d = input.Position - dragStart
 			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		elseif resizing and resizeStart and startSize then
+			local d = input.Position - resizeStart
+			local min = Library.MinSize or Vector2.new(880, 560)
+			local cam = workspace.CurrentCamera
+			local view = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+			local newW = math.clamp(math.floor(startSize.X + d.X + 0.5), min.X, math.max(min.X, math.floor(view.X - 24)))
+			local newH = math.clamp(math.floor(startSize.Y + d.Y + 0.5), min.Y, math.max(min.Y, math.floor(view.Y - 24)))
+			main.Size = UDim2.fromOffset(newW, newH)
+			local tab = Library.ActiveTab
+			if tab and type(tab.RefreshSides) == 'function' then
+				pcall(tab.RefreshSides, tab)
+			end
 		end
 	end))
 	track(UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = false
+			resizing = false
+			grip.BackgroundTransparency = 0.15
+			grip.BackgroundColor3 = C.bg3
 		end
 	end))
 
@@ -2661,6 +3068,10 @@ function Library:CreateWindow(info)
 	local Window = {}
 	local tabOrder = 0
 	function Window:AddTab(name, _icon)
+		-- Same name = same tab. A second AddTab('Settings') must not spawn another rail button.
+		if type(name) == 'string' and Library.Tabs[name] then
+			return Library.Tabs[name]
+		end
 		tabOrder += 1
 		local btn = Instance.new('TextButton')
 		btn.Name = name
@@ -2789,6 +3200,12 @@ function Library:CreateWindow(info)
 	end
 	if info.HideGameplayPaused ~= false then
 		pcall(NoPause.ensure)
+	end
+	-- Default Settings tab (Script + Profiles + theme). Opt out: SettingsTab = false.
+	if info.SettingsTab ~= false then
+		pcall(function()
+			Library:BuildSettingsTab(Window, info)
+		end)
 	end
 	track(RunService.Heartbeat:Connect(function()
 		if Library.Config then
