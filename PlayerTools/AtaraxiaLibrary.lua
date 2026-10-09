@@ -132,8 +132,10 @@ local Library = {
 	Toggles = {},
 	Tabs = {},
 	ActiveTab = nil,
-	MinSize = Vector2.new(880, 560),
-	OriginalMinSize = Vector2.new(880, 560),
+	-- Default open size vs resize floor (resize may go smaller than default).
+	DefaultSize = Vector2.new(880, 560),
+	MinSize = Vector2.new(560, 360),
+	OriginalMinSize = Vector2.new(560, 360),
 	DPIScale = 1,
 	Toggled = true,
 	Open = true,
@@ -2739,11 +2741,18 @@ function Library:CreateWindow(info)
 	if type(info.Folder) == 'string' and info.Folder ~= '' then
 		self:SetFolder(info.Folder)
 	end
-	-- Floor size: scale-sized columns inside a ScrollingFrame collapse to ~0px otherwise.
-	local width = math.max(880, (info.Size and info.Size.X.Offset) or 880)
-	local height = math.max(560, (info.Size and info.Size.Y.Offset) or 560)
-	self.MinSize = Vector2.new(880, 560)
+	-- Open at DefaultSize; MinSize is the resize floor (smaller than default so the grip can shrink).
+	local defW = (self.DefaultSize and self.DefaultSize.X) or 880
+	local defH = (self.DefaultSize and self.DefaultSize.Y) or 560
+	local minW, minH = 560, 360
+	if typeof(info.MinSize) == 'Vector2' then
+		minW, minH = info.MinSize.X, info.MinSize.Y
+	end
+	local width = math.max(minW, (info.Size and info.Size.X.Offset) or defW)
+	local height = math.max(minH, (info.Size and info.Size.Y.Offset) or defH)
+	self.MinSize = Vector2.new(minW, minH)
 	self.OriginalMinSize = self.MinSize
+	self.DefaultSize = Vector2.new(defW, defH)
 
 	if self.ScreenGui then
 		pcall(function()
@@ -2964,8 +2973,8 @@ function Library:CreateWindow(info)
 	local dragging, dragStart, startPos = false, nil, nil
 	local resizing, resizeStart, startSize = false, nil, nil
 	self.MainFrame = main
-	-- Floor only — window can grow from the grip, and shrink back down to this.
-	self.MinSize = Vector2.new(880, 560)
+	-- Resize floor (below default open size). Keep OriginalMinSize in sync.
+	self.MinSize = self.MinSize or Vector2.new(560, 360)
 	self.OriginalMinSize = self.MinSize
 
 	header.InputBegan:Connect(function(input)
@@ -3034,7 +3043,7 @@ function Library:CreateWindow(info)
 			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 		elseif resizing and resizeStart and startSize then
 			local d = input.Position - resizeStart
-			local min = Library.MinSize or Vector2.new(880, 560)
+			local min = Library.MinSize or Vector2.new(560, 360)
 			local cam = workspace.CurrentCamera
 			local view = cam and cam.ViewportSize or Vector2.new(1920, 1080)
 			local newW = math.clamp(math.floor(startSize.X + d.X + 0.5), min.X, math.max(min.X, math.floor(view.X - 24)))
