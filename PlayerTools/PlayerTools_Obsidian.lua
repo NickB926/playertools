@@ -522,7 +522,7 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'wave-kill-tracer-v1'
+getgenv().SB2PlayerToolsLocalBuild = 'wave-kill-tracer-v2'
 pcall(function()
 	warn(('[PlayerTools] local build %s | %s'):format(
 		tostring(getgenv().SB2PlayerToolsLocalBuild),
@@ -17027,6 +17027,107 @@ local ok, err = pcall(function()
 		local WAVE_VIS_FOLDER = 'SB2WaveKillTargetVis'
 		local WAVE_VIS_COLOR = Color3.fromRGB(80, 255, 120)
 		local WAVE_VIS_OUTLINE = Color3.fromRGB(255, 220, 64)
+		local WAVE_KILL_HAS_DRAWING = typeof(Drawing) == 'table' and type(Drawing.new) == 'function'
+		local WAVE_CAM_NEAR = -0.2
+
+		local function waveKillDestroyDrawing(obj)
+			if not obj then
+				return
+			end
+			pcall(function()
+				obj.Visible = false
+			end)
+			pcall(function()
+				obj:Remove()
+			end)
+		end
+
+		local function waveKillCamObjectPos(worldPos)
+			local cam = workspace.CurrentCamera
+			if not cam then
+				return nil
+			end
+			return cam.CFrame:PointToObjectSpace(worldPos)
+		end
+
+		local function waveKillObjectToScreen(objPos)
+			local cam = workspace.CurrentCamera
+			if not cam or not objPos then
+				return nil
+			end
+			local world = cam.CFrame:PointToWorldSpace(objPos)
+			local v = cam:WorldToViewportPoint(world)
+			return Vector2.new(v.X, v.Y)
+		end
+
+		local function waveKillIsInFront(objPos)
+			return objPos ~= nil and objPos.Z < WAVE_CAM_NEAR
+		end
+
+		local function waveKillClipSegmentToNear(p0, p1)
+			if not p0 or not p1 then
+				return nil
+			end
+			local f0, f1 = waveKillIsInFront(p0), waveKillIsInFront(p1)
+			if f0 and f1 then
+				return p0, p1
+			end
+			if f0 == f1 then
+				if math.abs(p1.Z) < 1e-4 then
+					return nil
+				end
+				local t = WAVE_CAM_NEAR / p1.Z
+				if t <= 0 then
+					return nil
+				end
+				local onNear = p1 * t
+				local start = onNear * 0.15
+				if start.Z >= WAVE_CAM_NEAR then
+					start = Vector3.new(onNear.X, onNear.Y, WAVE_CAM_NEAR - 0.05)
+				end
+				return start, onNear
+			end
+			local denom = p1.Z - p0.Z
+			if math.abs(denom) < 1e-6 then
+				return nil
+			end
+			local t = (WAVE_CAM_NEAR - p0.Z) / denom
+			local hit = p0:Lerp(p1, t)
+			if f0 then
+				return p0, hit
+			end
+			return hit, p1
+		end
+
+		local function waveKillTracerScreenPoints(fromWorld, toWorld)
+			local cam = workspace.CurrentCamera
+			if not cam then
+				return nil
+			end
+			local p0 = waveKillCamObjectPos(fromWorld)
+			local p1 = waveKillCamObjectPos(toWorld)
+			if not p0 or not p1 then
+				return nil
+			end
+			if not waveKillIsInFront(p0) then
+				p0 = Vector3.new(0, 0, WAVE_CAM_NEAR - 0.5)
+			end
+			local c0, c1 = waveKillClipSegmentToNear(p0, p1)
+			if not c0 or not c1 then
+				return nil
+			end
+			return waveKillObjectToScreen(c0), waveKillObjectToScreen(c1)
+		end
+
+		local function waveKillTargetWorldPos(mob, anchor, cf)
+			if anchor then
+				return anchor.Position + Vector3.new(0, 2, 0)
+			end
+			if typeof(cf) == 'CFrame' then
+				return cf.Position + Vector3.new(0, 2, 0)
+			end
+			return nil
+		end
 
 		local function waveKillTargetFolder()
 			return workspace:FindFirstChild('Mobs')
@@ -17117,6 +17218,11 @@ local ok, err = pcall(function()
 		end
 
 		local function destroyWaveKillVis()
+			local kit = getgenv().SB2WaveKillVisKit
+			if kit then
+				waveKillDestroyDrawing(kit.drawLine)
+				waveKillDestroyDrawing(kit.drawText)
+			end
 			pcall(function()
 				local f = workspace:FindFirstChild(WAVE_VIS_FOLDER)
 				if f then
@@ -17235,6 +17341,21 @@ local ok, err = pcall(function()
 			chams.Enabled = false
 			chams.Parent = folder
 
+			local drawLine, drawText = nil, nil
+			if WAVE_KILL_HAS_DRAWING then
+				drawLine = Drawing.new('Line')
+				drawLine.Thickness = 1.5
+				drawLine.Color = WAVE_VIS_COLOR
+				drawLine.Transparency = 1
+				drawLine.Visible = false
+				drawText = Drawing.new('Text')
+				drawText.Size = 16
+				drawText.Center = true
+				drawText.Outline = true
+				drawText.Color = WAVE_VIS_OUTLINE
+				drawText.Visible = false
+			end
+
 			kit = {
 				folder = folder,
 				floater = floater,
@@ -17245,6 +17366,8 @@ local ok, err = pcall(function()
 				gui = gui,
 				label = label,
 				chams = chams,
+				drawLine = drawLine,
+				drawText = drawText,
 				playerAttPart = nil,
 			}
 			getgenv().SB2WaveKillVisKit = kit
@@ -17260,6 +17383,12 @@ local ok, err = pcall(function()
 			kit.chams.Enabled = false
 			kit.floater.Transparency = 1
 			kit.box.Transparency = 1
+			if kit.drawLine then
+				kit.drawLine.Visible = false
+			end
+			if kit.drawText then
+				kit.drawText.Visible = false
+			end
 			if kit.playerAttPart and kit.playerAttPart.Parent then
 				kit.attPlayer.Parent = kit.floater
 			end
@@ -17308,15 +17437,50 @@ local ok, err = pcall(function()
 			kit.chams.Enabled = true
 			kit.label.Text = ('KILL NEXT\n%s%s'):format(mob.Name, waveKillTargetVariantLabel(mob))
 			kit.gui.Enabled = true
+			local useScreenTracer = false
 			if myRoot and myRoot:IsA('BasePart') then
+				local fromWorld = myRoot.Position
+				local toWorld = waveKillTargetWorldPos(mob, anchor, cf)
+				if kit.drawLine and toWorld then
+					local a, b = waveKillTracerScreenPoints(fromWorld, toWorld)
+					if a and b then
+						kit.drawLine.Color = WAVE_VIS_COLOR
+						kit.drawLine.From = a
+						kit.drawLine.To = b
+						kit.drawLine.Visible = true
+						useScreenTracer = true
+						if kit.drawText then
+							kit.drawText.Text = ('KILL NEXT · %s%s'):format(
+								mob.Name,
+								waveKillTargetVariantLabel(mob)
+							)
+							kit.drawText.Position = b
+							kit.drawText.Color = WAVE_VIS_OUTLINE
+							kit.drawText.Visible = true
+						end
+					elseif kit.drawLine then
+						kit.drawLine.Visible = false
+					end
+				elseif kit.drawLine then
+					kit.drawLine.Visible = false
+				end
+				if kit.drawText and not useScreenTracer then
+					kit.drawText.Visible = false
+				end
 				if kit.playerAttPart ~= myRoot then
 					kit.attPlayer.Parent = myRoot
 					kit.playerAttPart = myRoot
 				end
 				kit.attMob.Parent = kit.floater
-				kit.beam.Enabled = true
+				kit.beam.Enabled = not useScreenTracer
 			else
 				kit.beam.Enabled = false
+				if kit.drawLine then
+					kit.drawLine.Visible = false
+				end
+				if kit.drawText then
+					kit.drawText.Visible = false
+				end
 			end
 		end
 
@@ -17371,7 +17535,7 @@ local ok, err = pcall(function()
 		WdBox:AddToggle('WaveKillTarget', {
 			Text = 'Highlight ordered kill (WD)',
 			Default = false,
-			Tooltip = 'Wave Defense special / phantom order: finds the mob under Workspace.Mobs whose game Highlight is on (skips SystemFrozen). Draws tracer-style beam, neon hitbox box, chams, and KILL NEXT label — for invisible phantoms.',
+			Tooltip = 'Wave Defense special / phantom order: finds the mob under Workspace.Mobs whose game Highlight is on (skips SystemFrozen). Screen tracer (IY Tracers-style Drawing line), 3D beam fallback, neon box, chams, and KILL NEXT label — for invisible phantoms.',
 		}):OnChanged(function(value)
 			getgenv().SB2WaveKillTargetOn = value == true
 			getgenv().SB2WaveKillTargetLastName = nil

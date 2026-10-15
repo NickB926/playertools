@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.25",
+    "version":  "1.0.26",
     "message":  "WD ordered-kill highlight, auto floor-circle dodge, updater skips GitHub downgrade",
     "files":  [
                   "PlayerTools/launch.lua",
