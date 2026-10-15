@@ -99,6 +99,140 @@ local okBoot, bootErr = xpcall(function()
 		error('loadstring/load unavailable')
 	end
 
+	-- Sync from GitHub only when remote version is newer than local (never downgrade).
+	do
+		local BASE = (type(g.SB2PlayerToolsUpdateBase) == 'string' and g.SB2PlayerToolsUpdateBase ~= ''
+			and g.SB2PlayerToolsUpdateBase:gsub('/+$', ''))
+			or 'https://raw.githubusercontent.com/NickB926/playertools/main'
+		local HttpService = game:GetService('HttpService')
+		local function parseVersionParts(ver)
+			ver = tostring(ver or ''):gsub('^%s*(.-)%s*$', '%1')
+			local major, minor, patch = ver:match('^(%d+)%.(%d+)%.(%d+)')
+			if not major then
+				return nil
+			end
+			return tonumber(major), tonumber(minor), tonumber(patch)
+		end
+		local function compareVersions(a, b)
+			local am, an, ap = parseVersionParts(a)
+			local bm, bn, bp = parseVersionParts(b)
+			if not am or not bm then
+				return tostring(a) == tostring(b) and 0 or nil
+			end
+			if am ~= bm then
+				return am > bm and 1 or -1
+			end
+			if an ~= bn then
+				return an > bn and 1 or -1
+			end
+			if ap ~= bp then
+				return ap > bp and 1 or -1
+			end
+			return 0
+		end
+		local function readLocalVersionString()
+			if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+				return ''
+			end
+			if not isfile('PlayerTools/version.json') then
+				return ''
+			end
+			local ok, body = pcall(readfile, 'PlayerTools/version.json')
+			if not ok or type(body) ~= 'string' or body == '' then
+				return ''
+			end
+			local okJson, data = pcall(function()
+				return HttpService:JSONDecode(body)
+			end)
+			if okJson and type(data) == 'table' then
+				return tostring(data.version or '')
+			end
+			return ''
+		end
+		local function httpGet(url)
+			local req = (syn and syn.request) or http_request or (http and http.request) or request
+			if type(req) == 'function' then
+				local ok, res = pcall(req, { Url = url, Method = 'GET' })
+				if ok and type(res) == 'table' then
+					local body = res.Body or res.body
+					local code = tonumber(res.StatusCode or res.Status or res.statusCode) or 0
+					if code >= 200 and code < 300 and type(body) == 'string' then
+						return body
+					end
+				end
+			end
+			local ok, body = pcall(function()
+				return game:HttpGet(url)
+			end)
+			if ok and type(body) == 'string' and body ~= '' then
+				return body
+			end
+			return nil
+		end
+		say('checking for PlayerTools updates…')
+		pcall(writefile, 'PlayerTools/update_url.txt', BASE)
+		g.SB2PlayerToolsUpdateBase = BASE
+
+		local localVer = readLocalVersionString()
+		local remoteVerBody = httpGet(BASE .. '/version.json')
+		local remoteVer = ''
+		if type(remoteVerBody) == 'string' and remoteVerBody ~= '' then
+			local okJson, data = pcall(function()
+				return HttpService:JSONDecode(remoteVerBody)
+			end)
+			if okJson and type(data) == 'table' then
+				remoteVer = tostring(data.version or '')
+			end
+		end
+
+		local cmp = compareVersions(remoteVer, localVer)
+		if localVer ~= '' and remoteVer ~= '' and cmp == -1 then
+			say(
+				('Skipping GitHub sync: local %s is newer than remote %s (no downgrade).'):format(
+					localVer,
+					remoteVer
+				)
+			)
+		elseif localVer ~= '' and remoteVer ~= '' and cmp == 0 then
+			say('PlayerTools already on ' .. localVer)
+		else
+		local updaterSrc = nil
+		if type(isfile) == 'function' and isfile('PlayerTools/Updater.lua') and type(readfile) == 'function' then
+			local okRead, body = pcall(readfile, 'PlayerTools/Updater.lua')
+			if okRead and type(body) == 'string' and body ~= '' then
+				updaterSrc = body
+			end
+		end
+		if not updaterSrc then
+			updaterSrc = httpGet(BASE .. '/PlayerTools/Updater.lua')
+			if type(updaterSrc) == 'string' and updaterSrc ~= '' then
+				pcall(writefile, 'PlayerTools/Updater.lua', updaterSrc)
+			end
+		end
+		if type(updaterSrc) == 'string' and updaterSrc ~= '' then
+			local ufn, uerr = compile(updaterSrc, 'PlayerTools/Updater.lua')
+			if ufn then
+				local Updater = ufn()
+				if type(Updater) == 'table' and type(Updater.apply) == 'function' then
+					local okUp, detail = Updater.apply({
+						notify = say,
+						quietWarn = true,
+					})
+					if okUp then
+						say('PlayerTools files ready (' .. tostring(detail) .. ')')
+					else
+						say('update issue: ' .. tostring(detail) .. ' — loading local files anyway')
+					end
+				end
+			else
+				say('Updater compile failed: ' .. tostring(uerr))
+			end
+		else
+			say('could not reach updater — loading local files')
+		end
+		end
+	end
+
 	local loaded = false
 	for _, path in ipairs({ 'PlayerTools/PlayerTools.lua', 'PlayerTools.lua' }) do
 		local exists = type(isfile) == 'function' and isfile(path)

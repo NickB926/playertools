@@ -136,6 +136,34 @@ function Updater.localVersion()
 	return data and tostring(data.version or '') or ''
 end
 
+local function parseVersionParts(ver)
+	ver = tostring(ver or ''):gsub('^%s*(.-)%s*$', '%1')
+	local major, minor, patch = ver:match('^(%d+)%.(%d+)%.(%d+)')
+	if not major then
+		return nil
+	end
+	return tonumber(major), tonumber(minor), tonumber(patch)
+end
+
+-- Returns 1 if a > b, -1 if a < b, 0 if equal or unparseable tie.
+function Updater.compareVersions(a, b)
+	local am, an, ap = parseVersionParts(a)
+	local bm, bn, bp = parseVersionParts(b)
+	if not am or not bm then
+		return tostring(a) == tostring(b) and 0 or nil
+	end
+	if am ~= bm then
+		return am > bm and 1 or -1
+	end
+	if an ~= bn then
+		return an > bn and 1 or -1
+	end
+	if ap ~= bp then
+		return ap > bp and 1 or -1
+	end
+	return 0
+end
+
 function Updater.check()
 	local remote, err = Updater.fetchRemoteVersion()
 	if not remote then
@@ -143,11 +171,16 @@ function Updater.check()
 	end
 	local localVer = Updater.localVersion()
 	local remoteVer = tostring(remote.version or '')
+	local cmp = Updater.compareVersions(remoteVer, localVer)
+	local needsUpdate = localVer == ''
+		or (remoteVer ~= '' and cmp == 1)
+		or (remoteVer ~= '' and localVer ~= remoteVer and cmp == nil)
 	return {
 		ok = true,
 		localVersion = localVer,
 		remoteVersion = remoteVer,
-		needsUpdate = localVer == '' or (remoteVer ~= '' and remoteVer ~= localVer),
+		needsUpdate = needsUpdate,
+		localNewer = cmp == -1,
 		files = type(remote.files) == 'table' and remote.files or {},
 		message = remote.message,
 	}
@@ -174,6 +207,15 @@ function Updater.apply(opts)
 		return false, info.error
 	end
 	if not info.needsUpdate and not opts.force then
+		if info.localNewer then
+			say(
+				('Local %s is newer than remote %s — keeping local files (no downgrade).'):format(
+					tostring(info.localVersion),
+					tostring(info.remoteVersion)
+				)
+			)
+			return true, 'local newer'
+		end
 		say('Already on ' .. tostring(info.remoteVersion))
 		return true, 'up to date'
 	end

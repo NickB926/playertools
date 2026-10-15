@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.21",
-    "message":  "Ataraxia: library anti-AFK, account profiles, toast stacking, per-script version label",
+    "version":  "1.0.25",
+    "message":  "WD ordered-kill highlight, auto floor-circle dodge, updater skips GitHub downgrade",
     "files":  [
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",

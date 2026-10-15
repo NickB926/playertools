@@ -522,7 +522,7 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'killaura-lite-v6'
+getgenv().SB2PlayerToolsLocalBuild = 'wave-kill-tracer-v1'
 pcall(function()
 	warn(('[PlayerTools] local build %s | %s'):format(
 		tostring(getgenv().SB2PlayerToolsLocalBuild),
@@ -817,6 +817,8 @@ local unloadExisting = function()
 		end
 		for _, key in ipairs({
 			'SB2AutoAttackConn',
+			'SB2AutoFloorDodgeConn',
+			'SB2WaveKillTargetConn',
 			'SB2CombatAnchorConn',
 			'SB2AutoSkillOnlyConn',
 			'SB2CameraRecoveryConn',
@@ -11208,9 +11210,11 @@ local ok, err = pcall(function()
 		local BossTab = Window:AddTab('Boss', 'swords')
 		local CombatBox = CombatTab:AddLeftGroupbox('Combat')
 		local FarmBox = FarmTab:AddLeftGroupbox('Event dive')
+		local WdBox = FarmTab:AddRightGroupbox('Wave Defense')
 		local BossBox = BossTab:AddLeftGroupbox('Boss route')
 		assert(CombatBox, 'Combat groupbox nil')
 		assert(FarmBox, 'Farm groupbox nil')
+		assert(WdBox, 'Wave Defense groupbox nil')
 		assert(BossBox, 'Boss groupbox nil')
 
 		CombatBox:AddToggle('AutoSkill', {
@@ -11780,6 +11784,103 @@ local ok, err = pcall(function()
 			-- NO Heartbeat soft-lock. Probe: Anchor heartbeat/scans were ~16fps.
 			-- HelperMob is one-shot; DescendantAdded covers new parts; push snap is optional via TP pin only.
 			getgenv().SB2CombatAnchorConn = nil
+		end)
+
+		local function startAutoFloorDodgeLoop()
+			getgenv().SB2AutoFloorDodgeOn = true
+			local prev = getgenv().SB2AutoFloorDodgeConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+				getgenv().SB2AutoFloorDodgeConn = nil
+			end
+			local lastStep = 0
+			getgenv().SB2AutoFloorDodgeConn = RunService.Heartbeat:Connect(function()
+				if getgenv().SB2AutoFloorDodgeOn ~= true or not isToggleOn('AutoFloorDodge') then
+					local conn = getgenv().SB2AutoFloorDodgeConn
+					if conn then
+						pcall(function()
+							conn:Disconnect()
+						end)
+						getgenv().SB2AutoFloorDodgeConn = nil
+					end
+					return
+				end
+				-- Event dive fight loop already sidesteps circles (same scanner).
+				if getgenv().SB2DiveFarmOn == true and isToggleOn('DiveFarm') then
+					return
+				end
+				if getgenv().SB2DiveUnderMap == true then
+					return
+				end
+				if (tonumber(getgenv().SB2CombatBootGraceUntil) or 0) > os.clock() then
+					return
+				end
+				if not isLocalAlive() then
+					return
+				end
+				local findGoal = getgenv().SB2FindFloorCircleDodgeGoal
+				if type(findGoal) ~= 'function' then
+					return
+				end
+				local model = getMyCharacterModel() or LocalPlayer.Character
+				local hrp = model and model:FindFirstChild('HumanoidRootPart')
+				if not hrp or not hrp:IsA('BasePart') then
+					return
+				end
+				local now = os.clock()
+				local goal = findGoal(hrp.Position, hrp.Position.Y, nil)
+				if not goal then
+					return
+				end
+				if now - lastStep < 0.28 then
+					return
+				end
+				local flatMove = Vector3.new(goal.X - hrp.Position.X, 0, goal.Z - hrp.Position.Z)
+				if flatMove.Magnitude < 4 then
+					return
+				end
+				lastStep = now
+				pcall(function()
+					hrp.Anchored = false
+					local dest = Vector3.new(goal.X, hrp.Position.Y, goal.Z)
+					local lv = hrp.CFrame.LookVector
+					local keep = Vector3.new(lv.X, 0, lv.Z)
+					if keep.Magnitude >= 0.08 then
+						hrp.CFrame = CFrame.lookAt(dest, dest + keep.Unit)
+					else
+						hrp.CFrame = CFrame.new(dest)
+					end
+					local v = hrp.AssemblyLinearVelocity
+					hrp.AssemblyLinearVelocity = Vector3.new(v.X * 0.15, v.Y, v.Z * 0.15)
+				end)
+			end)
+		end
+
+		CombatBox:AddToggle('AutoFloorDodge', {
+			Text = 'Auto dodge floor circles',
+			Default = false,
+			Tooltip = 'Sidestep red/purple floor telegraphs (SpellTelegraphs, workspace.Circle, etc.). Works in dungeons, bosses, and events — not only Event dive. Event dive uses the same detector when its farm loop is on.',
+		}):OnChanged(function(value)
+			getgenv().SB2AutoFloorDodgeOn = value == true
+			local prev = getgenv().SB2AutoFloorDodgeConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+				getgenv().SB2AutoFloorDodgeConn = nil
+			end
+			if not value then
+				return
+			end
+			startAutoFloorDodgeLoop()
+		end)
+		task.defer(function()
+			local t = Toggles.AutoFloorDodge
+			if type(t) == 'table' and t.Value == true and getgenv().SB2AutoFloorDodgeConn == nil then
+				startAutoFloorDodgeLoop()
+			end
 		end)
 
 		-- Soft reload: restore pose + combat toggles that teardown cleared.
@@ -14705,6 +14806,10 @@ local ok, err = pcall(function()
 			return best
 		end
 
+		getgenv().SB2FindFloorCircleDodgeGoal = function(hrpPos, fightY, cluster)
+			return diveAvoidFloorCircles(hrpPos, fightY, cluster)
+		end
+
 		local function detectBossNukeCharge(origin, stickMob)
 			local nearNuke = stickMob and isNukeBossMob(stickMob)
 			if not nearNuke then
@@ -16918,6 +17023,378 @@ local ok, err = pcall(function()
 			end
 		end)
 
+		local WAVE_KILL_HL = 'SB2WaveKillTargetHL'
+		local WAVE_VIS_FOLDER = 'SB2WaveKillTargetVis'
+		local WAVE_VIS_COLOR = Color3.fromRGB(80, 255, 120)
+		local WAVE_VIS_OUTLINE = Color3.fromRGB(255, 220, 64)
+
+		local function waveKillTargetFolder()
+			return workspace:FindFirstChild('Mobs')
+		end
+
+		local function waveKillMobIsQueuedTarget(mob)
+			if not mob or not mob:IsA('Model') then
+				return false
+			end
+			if mob:GetAttribute('SystemFrozen') == true then
+				return false
+			end
+			local hl = mob:FindFirstChild('Highlight')
+			return hl and hl:IsA('Highlight') and hl.Enabled == true
+		end
+
+		local function waveKillMobAnchorPart(mob)
+			if not mob then
+				return nil
+			end
+			local p = mob:FindFirstChild('HumanoidRootPart')
+				or mob:FindFirstChild('Hitbox')
+				or mob:FindFirstChild('Hurtbox')
+				or mob.PrimaryPart
+			if p and p:IsA('BasePart') then
+				return p
+			end
+			for _, ch in ipairs(mob:GetChildren()) do
+				if ch:IsA('BasePart') then
+					return ch
+				end
+			end
+			return nil
+		end
+
+		local function findWaveKillTargetMob(origin)
+			local folder = waveKillTargetFolder()
+			if not folder then
+				return nil
+			end
+			local me = origin
+			if typeof(me) ~= 'Vector3' then
+				local model = getMyCharacterModel() or LocalPlayer.Character
+				local hrp = model and model:FindFirstChild('HumanoidRootPart')
+				me = hrp and hrp.Position
+			end
+			local best, bestD = nil, nil
+			for _, mob in ipairs(folder:GetChildren()) do
+				if waveKillMobIsQueuedTarget(mob) then
+					if typeof(me) ~= 'Vector3' then
+						return mob
+					end
+					local root = waveKillMobAnchorPart(mob)
+					local pos = root and root.Position
+					if not pos then
+						local ok, bcf = pcall(function()
+							return mob:GetBoundingBox()
+						end)
+						if ok and typeof(bcf) == 'CFrame' then
+							pos = bcf.Position
+						end
+					end
+					if pos then
+						local dx = pos.X - me.X
+						local dz = pos.Z - me.Z
+						local d = dx * dx + dz * dz
+						if not bestD or d < bestD then
+							bestD = d
+							best = mob
+						end
+					elseif not best then
+						best = mob
+					end
+				end
+			end
+			return best
+		end
+
+		local function waveKillTargetVariantLabel(mob)
+			if not mob then
+				return ''
+			end
+			local v = mob:GetAttribute('Variant')
+			if v == nil or v == '' then
+				return ''
+			end
+			return ' [' .. tostring(v) .. ']'
+		end
+
+		local function destroyWaveKillVis()
+			pcall(function()
+				local f = workspace:FindFirstChild(WAVE_VIS_FOLDER)
+				if f then
+					f:Destroy()
+				end
+			end)
+			getgenv().SB2WaveKillVisKit = nil
+			getgenv().SB2WaveKillTargetTracked = nil
+		end
+
+		local function clearLegacyWaveKillHl(mob)
+			if not mob or not mob.Parent then
+				return
+			end
+			local hl = mob:FindFirstChild(WAVE_KILL_HL)
+			if hl then
+				pcall(function()
+					hl:Destroy()
+				end)
+			end
+		end
+
+		local function clearAllWaveKillTargetOverlays()
+			local folder = waveKillTargetFolder()
+			if folder then
+				for _, mob in ipairs(folder:GetChildren()) do
+					clearLegacyWaveKillHl(mob)
+				end
+			end
+			destroyWaveKillVis()
+		end
+
+		getgenv().SB2FindWaveKillTargetMob = findWaveKillTargetMob
+		getgenv().SB2ClearWaveKillTargetOverlays = clearAllWaveKillTargetOverlays
+
+		local function ensureWaveKillVisKit()
+			local kit = getgenv().SB2WaveKillVisKit
+			if kit and kit.folder and kit.folder.Parent then
+				return kit
+			end
+			local folder = Instance.new('Folder')
+			folder.Name = WAVE_VIS_FOLDER
+			folder.Parent = workspace
+
+			local floater = Instance.new('Part')
+			floater.Name = 'Floater'
+			floater.Anchored = true
+			floater.CanCollide = false
+			floater.CanQuery = false
+			floater.CanTouch = false
+			floater.CastShadow = false
+			floater.Material = Enum.Material.Neon
+			floater.Color = WAVE_VIS_OUTLINE
+			floater.Size = Vector3.new(6, 10, 6)
+			floater.Transparency = 0.55
+			floater.Parent = folder
+
+			local box = Instance.new('BoxHandleAdornment')
+			box.Name = 'HitboxBox'
+			box.Adornee = floater
+			box.AlwaysOnTop = true
+			box.ZIndex = 12
+			box.Color3 = WAVE_VIS_OUTLINE
+			box.Transparency = 0.25
+			box.Parent = floater
+
+			local attMob = Instance.new('Attachment')
+			attMob.Name = 'MobEnd'
+			attMob.Parent = floater
+
+			local attPlayer = Instance.new('Attachment')
+			attPlayer.Name = 'PlayerEnd'
+			attPlayer.Parent = floater
+
+			local beam = Instance.new('Beam')
+			beam.Name = 'Tracer'
+			beam.Attachment0 = attPlayer
+			beam.Attachment1 = attMob
+			beam.Color = ColorSequence.new(WAVE_VIS_COLOR)
+			beam.LightEmission = 1
+			beam.LightInfluence = 0
+			beam.FaceCamera = true
+			beam.Width0 = 0.35
+			beam.Width1 = 0.35
+			beam.Transparency = NumberSequence.new(0.15)
+			beam.Enabled = false
+			beam.Parent = folder
+
+			local gui = Instance.new('BillboardGui')
+			gui.Name = 'Tag'
+			gui.Size = UDim2.fromOffset(220, 44)
+			gui.StudsOffset = Vector3.new(0, 3.2, 0)
+			gui.AlwaysOnTop = true
+			gui.MaxDistance = 10000
+			gui.Enabled = false
+			gui.Parent = floater
+			local label = Instance.new('TextLabel')
+			label.BackgroundTransparency = 0.25
+			label.BackgroundColor3 = Color3.new(0, 0, 0)
+			label.TextColor3 = WAVE_VIS_COLOR
+			label.TextStrokeColor3 = Color3.new(0, 0, 0)
+			label.TextStrokeTransparency = 0.15
+			label.Font = Enum.Font.GothamBold
+			label.TextSize = 18
+			label.Size = UDim2.fromScale(1, 1)
+			label.Text = 'KILL NEXT'
+			label.Parent = gui
+
+			local chams = Instance.new('Highlight')
+			chams.Name = 'Chams'
+			chams.FillColor = WAVE_VIS_COLOR
+			chams.OutlineColor = WAVE_VIS_OUTLINE
+			chams.FillTransparency = 0.35
+			chams.OutlineTransparency = 0
+			chams.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			chams.Enabled = false
+			chams.Parent = folder
+
+			kit = {
+				folder = folder,
+				floater = floater,
+				box = box,
+				attPlayer = attPlayer,
+				attMob = attMob,
+				beam = beam,
+				gui = gui,
+				label = label,
+				chams = chams,
+				playerAttPart = nil,
+			}
+			getgenv().SB2WaveKillVisKit = kit
+			return kit
+		end
+
+		local function hideWaveKillVis(kit)
+			if not kit then
+				return
+			end
+			kit.beam.Enabled = false
+			kit.gui.Enabled = false
+			kit.chams.Enabled = false
+			kit.floater.Transparency = 1
+			kit.box.Transparency = 1
+			if kit.playerAttPart and kit.playerAttPart.Parent then
+				kit.attPlayer.Parent = kit.floater
+			end
+		end
+
+		local function updateWaveKillVis(mob)
+			if not mob or not mob.Parent then
+				hideWaveKillVis(getgenv().SB2WaveKillVisKit)
+				return
+			end
+			local kit = ensureWaveKillVisKit()
+			local myRoot = getMyBringPart()
+				or (function()
+					local model = getMyCharacterModel() or LocalPlayer.Character
+					return model
+						and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
+				end)()
+			local anchor = waveKillMobAnchorPart(mob)
+			local cf, size = nil, nil
+			if anchor then
+				cf = anchor.CFrame
+				size = anchor.Size
+			else
+				local ok, bcf, bsize = pcall(function()
+					return mob:GetBoundingBox()
+				end)
+				if ok and typeof(bcf) == 'CFrame' and typeof(bsize) == 'Vector3' then
+					cf, size = bcf, bsize
+				end
+			end
+			if not cf then
+				hideWaveKillVis(kit)
+				return
+			end
+			size = size or Vector3.new(6, 10, 6)
+			kit.floater.CFrame = cf
+			kit.floater.Size = Vector3.new(
+				math.clamp(size.X + 1.5, 4, 40),
+				math.clamp(size.Y + 2, 6, 50),
+				math.clamp(size.Z + 1.5, 4, 40)
+			)
+			kit.floater.Transparency = 0.5
+			kit.box.Size = kit.floater.Size
+			kit.box.Transparency = 0.2
+			kit.chams.Adornee = mob
+			kit.chams.Enabled = true
+			kit.label.Text = ('KILL NEXT\n%s%s'):format(mob.Name, waveKillTargetVariantLabel(mob))
+			kit.gui.Enabled = true
+			if myRoot and myRoot:IsA('BasePart') then
+				if kit.playerAttPart ~= myRoot then
+					kit.attPlayer.Parent = myRoot
+					kit.playerAttPart = myRoot
+				end
+				kit.attMob.Parent = kit.floater
+				kit.beam.Enabled = true
+			else
+				kit.beam.Enabled = false
+			end
+		end
+
+		local function startWaveKillTargetLoop()
+			getgenv().SB2WaveKillTargetOn = true
+			local prev = getgenv().SB2WaveKillTargetConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+				getgenv().SB2WaveKillTargetConn = nil
+			end
+			local lastScan = 0
+			getgenv().SB2WaveKillTargetConn = RunService.Heartbeat:Connect(function()
+				if getgenv().SB2WaveKillTargetOn ~= true or not isToggleOn('WaveKillTarget') then
+					local conn = getgenv().SB2WaveKillTargetConn
+					if conn then
+						pcall(function()
+							conn:Disconnect()
+						end)
+						getgenv().SB2WaveKillTargetConn = nil
+					end
+					clearAllWaveKillTargetOverlays()
+					return
+				end
+				local now = os.clock()
+				local target = getgenv().SB2WaveKillTargetTracked
+				if now - lastScan >= 0.12 then
+					lastScan = now
+					target = findWaveKillTargetMob()
+					local prevMob = getgenv().SB2WaveKillTargetTracked
+					if prevMob and prevMob ~= target then
+						clearLegacyWaveKillHl(prevMob)
+					end
+					getgenv().SB2WaveKillTargetTracked = target
+					if target and getgenv().SB2WaveKillTargetLastName ~= target.Name then
+						getgenv().SB2WaveKillTargetLastName = target.Name
+						Library:Notify(
+							('Wave kill target: %s%s'):format(target.Name, waveKillTargetVariantLabel(target)),
+							4
+						)
+					end
+				end
+				if target and target.Parent then
+					updateWaveKillVis(target)
+				else
+					hideWaveKillVis(getgenv().SB2WaveKillVisKit)
+				end
+			end)
+		end
+
+		WdBox:AddToggle('WaveKillTarget', {
+			Text = 'Highlight ordered kill (WD)',
+			Default = false,
+			Tooltip = 'Wave Defense special / phantom order: finds the mob under Workspace.Mobs whose game Highlight is on (skips SystemFrozen). Draws tracer-style beam, neon hitbox box, chams, and KILL NEXT label — for invisible phantoms.',
+		}):OnChanged(function(value)
+			getgenv().SB2WaveKillTargetOn = value == true
+			getgenv().SB2WaveKillTargetLastName = nil
+			local prev = getgenv().SB2WaveKillTargetConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+				getgenv().SB2WaveKillTargetConn = nil
+			end
+			if not value then
+				clearAllWaveKillTargetOverlays()
+				return
+			end
+			startWaveKillTargetLoop()
+		end)
+		task.defer(function()
+			local t = Toggles.WaveKillTarget
+			if type(t) == 'table' and t.Value == true and getgenv().SB2WaveKillTargetConn == nil then
+				startWaveKillTargetLoop()
+			end
+		end)
+
 		-- Apply dive height/flee ASAP (SaveManager persist helpers may not exist yet).
 		task.defer(function()
 			pcall(function()
@@ -17054,6 +17531,8 @@ local ok, err = pcall(function()
 		-- Anyone else joining → kill combat so you don't look blatant / get Secure API'd.
 		local function stopCombatRuntime(unanchor)
 			getgenv().SB2AutoAttackOn = false
+			getgenv().SB2AutoFloorDodgeOn = false
+			getgenv().SB2WaveKillTargetOn = false
 			getgenv().SB2CombatAnchorOn = false
 			local aa = getgenv().SB2AutoAttackConn
 			if aa then
@@ -17061,6 +17540,23 @@ local ok, err = pcall(function()
 					aa:Disconnect()
 				end)
 				getgenv().SB2AutoAttackConn = nil
+			end
+			local dodge = getgenv().SB2AutoFloorDodgeConn
+			if dodge then
+				pcall(function()
+					dodge:Disconnect()
+				end)
+				getgenv().SB2AutoFloorDodgeConn = nil
+			end
+			local wkt = getgenv().SB2WaveKillTargetConn
+			if wkt then
+				pcall(function()
+					wkt:Disconnect()
+				end)
+				getgenv().SB2WaveKillTargetConn = nil
+			end
+			if type(getgenv().SB2ClearWaveKillTargetOverlays) == 'function' then
+				pcall(getgenv().SB2ClearWaveKillTargetOverlays)
 			end
 			local anc = getgenv().SB2CombatAnchorConn
 			if anc then
