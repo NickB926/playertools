@@ -94,12 +94,37 @@ Write-Utf8NoBom (Join-Path $repoRoot 'version.json') $verJson
 Write-Utf8NoBom (Join-Path $ptSrc 'version.json') $verJson
 Write-Utf8NoBom (Join-Path $ptDst 'version.json') $verJson
 
-# Keep package.json version in sync for npm style
+# Keep package.json version in sync (regex only — never ConvertTo-Json the whole file;
+# a corrupted description field once grew to 140MB+ and broke GitHub push).
 $pkgPath = Join-Path $repoRoot 'package.json'
+$pkgTemplate = @"
+{
+  "name": "playertools",
+  "version": "{VERSION}",
+  "private": true,
+  "description": "Swordburst 2 PlayerTools — GitHub raw update feed (Neuublue-style)",
+  "scripts": {
+    "publish:updates": "powershell -ExecutionPolicy Bypass -File ./Publish-PlayerTools.ps1",
+    "publish:updates:skip-bump": "powershell -ExecutionPolicy Bypass -File ./Publish-PlayerTools.ps1 -SkipVersionBump"
+  }
+}
+"@
 if (Test-Path $pkgPath) {
-  $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
-  $pkg.version = $ver.version
-  Write-Utf8NoBom $pkgPath (($pkg | ConvertTo-Json -Depth 5) + [Environment]::NewLine)
+  $pkgRaw = [System.IO.File]::ReadAllText($pkgPath)
+  if ($pkgRaw.Length -gt 8192 -or $pkgRaw -notmatch '"version"\s*:') {
+    Write-Host '==> Replacing bloated or invalid package.json with minimal template'
+    Write-Utf8NoBom $pkgPath ($pkgTemplate.Replace('{VERSION}', $ver.version))
+  } else {
+    $updated = [regex]::Replace(
+      $pkgRaw,
+      '"version"\s*:\s*"[^"]*"',
+      ('"version": "' + $ver.version + '"'),
+      1
+    )
+    Write-Utf8NoBom $pkgPath ($updated.TrimEnd() + [Environment]::NewLine)
+  }
+} else {
+  Write-Utf8NoBom $pkgPath ($pkgTemplate.Replace('{VERSION}', $ver.version))
 }
 
 Set-Location $repoRoot

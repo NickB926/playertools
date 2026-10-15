@@ -5,7 +5,7 @@
 	Custom titles: local UIGradient / UIStroke / Icon / optional loops (client-only).
 ]]
 
-getgenv().SB2TitlingBuild = 'titling-specialalias-v6'
+getgenv().SB2TitlingBuild = 'titling-nameplate-fix-v8'
 
 return function(env)
 	local WikiTab = env.WikiTab or env.ItemsTab
@@ -81,6 +81,16 @@ return function(env)
 		'Community Staff - Blue',
 		'Community Staff - Red',
 	}
+	local DEV_USER_TO_VARIANT = {
+		[478848349] = 'Dev - Gold',
+		[1801714748] = 'Dev - Green',
+		[309775741] = 'Dev - Blue',
+	}
+	local STAFF_INDEX_TO_VARIANT = {
+		'Community Staff - Purple',
+		'Community Staff - Blue',
+		'Community Staff - Red',
+	}
 	-- Bare entries have no color context — use the variants above.
 	local VARIANT_BASE_HIDDEN = {
 		Dev = true,
@@ -124,6 +134,25 @@ return function(env)
 	-- Deferred CreateSmoke can respawn that frame briefly after a Tag swap.
 	local TITLE_PURGE_GEN_ATTR = 'SB2TitlePurgeGen'
 
+	local function gradientLooksPlainWhite(grad)
+		if not grad or not grad:IsA('UIGradient') then
+			return true
+		end
+		local ok, kps = pcall(function()
+			return grad.Color.Keypoints
+		end)
+		if not ok or type(kps) ~= 'table' or #kps == 0 then
+			return true
+		end
+		for _, kp in ipairs(kps) do
+			local c = kp.Value
+			if typeof(c) == 'Color3' and (c.R < 0.9 or c.G < 0.9 or c.B < 0.9) then
+				return false
+			end
+		end
+		return true
+	end
+
 	local function bumpTitlePurgeGen(host)
 		if not host then
 			return 0
@@ -144,7 +173,11 @@ return function(env)
 		if tag:FindFirstChild('Symbol') or tostring(tag.Text):find('Plasmatic', 1, true) then
 			return true
 		end
-		if tag:FindFirstChildWhichIsA('UIGradient') or tag:FindFirstChildWhichIsA('UIStroke') then
+		local grad = tag:FindFirstChildWhichIsA('UIGradient')
+		if grad and not gradientLooksPlainWhite(grad) then
+			return true
+		end
+		if tag:FindFirstChildWhichIsA('UIStroke') then
 			return true
 		end
 		for _, ch in ipairs(tag:GetChildren()) do
@@ -292,6 +325,9 @@ return function(env)
 		fresh.TextColor3 = Color3.new(1, 1, 1)
 		fresh.RichText = false
 		fresh.ZIndex = 1
+		fresh.TextTransparency = 0
+		fresh.MaxVisibleGraphemes = -1
+		fresh.Visible = true
 
 		local order = oldLabel.LayoutOrder
 		pcall(function()
@@ -720,6 +756,50 @@ return function(env)
 		return nil
 	end
 
+	local function readStaffIndex(playerName)
+		local prof = getProfilesFolder() and getProfilesFolder():FindFirstChild(playerName)
+		local plr = Players:FindFirstChild(playerName)
+		local idx = prof and prof:GetAttribute('CommunityStaffIndex')
+		if type(idx) == 'number' then
+			return idx
+		end
+		if plr then
+			idx = plr:GetAttribute('CommunityStaffIndex')
+			if type(idx) == 'number' then
+				return idx
+			end
+		end
+		local iv = prof and prof:FindFirstChild('CommunityStaffIndex')
+		if iv and iv:IsA('IntValue') then
+			return iv.Value
+		end
+		return 1
+	end
+
+	local function resolveEquippedTitleDisplay(playerName)
+		local prof = getProfilesFolder() and getProfilesFolder():FindFirstChild(playerName)
+		if not prof then
+			return nil
+		end
+		local cur = prof:FindFirstChild('CurrentTag')
+		if not cur or not cur:IsA('ValueBase') then
+			return nil
+		end
+		local base = tostring(cur.Value or ''):gsub('^%s+', ''):gsub('%s+$', '')
+		if base == '' then
+			return nil
+		end
+		if base == 'Community Staff' then
+			local idx = math.clamp(math.floor(readStaffIndex(playerName)), 1, 3)
+			return STAFF_INDEX_TO_VARIANT[idx]
+		end
+		if base == 'Dev' then
+			local uid = resolveUserId(playerName) or LocalPlayer.UserId
+			return DEV_USER_TO_VARIANT[uid] or 'Dev - Gold'
+		end
+		return base
+	end
+
 	local function clearKnownTags(label, knownSet)
 		if not label then
 			return
@@ -874,12 +954,93 @@ return function(env)
 		return false
 	end
 
+	local function labelHasEffectiveTitleFx(label, baseTitleName)
+		if not label then
+			return false
+		end
+		local grad = label:FindFirstChildWhichIsA('UIGradient')
+		if grad and not gradientLooksPlainWhite(grad) then
+			return true
+		end
+		for _, child in ipairs(label:GetChildren()) do
+			if (child:IsA('ImageLabel') or child:IsA('ImageButton')) and child.Name ~= 'UIPadding' then
+				if child.Image ~= '' and (child.ImageTransparency or 0) < 0.95 then
+					return true
+				end
+			end
+		end
+		if tagUsesBehideSibling(label, baseTitleName) then
+			local host = label.Parent
+			if host then
+				for _, ch in ipairs(host:GetChildren()) do
+					if ch ~= label and (ch.Name == 'BehideFrame' or ch.Name:match('^Behide') or ch.Name == 'Smoke') then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	local titlingLockPlayer
+	local titlingPlayerLocked
+	local ensureNameplateTagText
+	local startCustomTitleAnim
+	local boostGameTitleAnim
+
+	titlingLockPlayer = function(playerName, seconds)
+		if type(playerName) ~= 'string' or playerName == '' then
+			return
+		end
+		getgenv().SB2TitlingApplyLock = getgenv().SB2TitlingApplyLock or {}
+		getgenv().SB2TitlingApplyLock[playerName] = os.clock() + (tonumber(seconds) or 5)
+	end
+
+	titlingPlayerLocked = function(playerName)
+		if type(playerName) ~= 'string' or playerName == '' then
+			return false
+		end
+		local untilAt = getgenv().SB2TitlingApplyLock and getgenv().SB2TitlingApplyLock[playerName]
+		return type(untilAt) == 'number' and os.clock() < untilAt
+	end
+
+	ensureNameplateTagText = function(label, tagName)
+		if not label or type(tagName) ~= 'string' or tagName == '' then
+			return
+		end
+		local t = tostring(label.Text or '')
+		if t == '' or t == '[]' or t:match('^%s*$') then
+			label.Text = '[' .. tagName .. ']'
+		end
+		label.TextTransparency = 0
+		label.MaxVisibleGraphemes = -1
+		label.Visible = true
+	end
+
+	local function finishGameTitleApply(label, tagName, modScript, displayName, variant, host)
+		ensureNameplateTagText(label, tagName)
+		if host then
+			tidyNameplateHost(host)
+		end
+		if boostGameTitleAnim then
+			boostGameTitleAnim(label, tagName, modScript)
+		end
+		local how = 'game module'
+		if variant then
+			how = how .. ' (' .. displayName .. ')'
+		end
+		return true, how, label
+	end
+
 	local function applyTitleToLabel(label, tagName, knownSet, userId, previewPlayerName)
 		if not label or type(tagName) ~= 'string' or tagName == '' then
 			return false, 'missing label/tag', nil
 		end
 		if VARIANT_BASE_HIDDEN[tagName] then
 			return false, 'Pick a color variant (e.g. Dev - Gold, Community Staff - Purple)', nil
+		end
+		if type(previewPlayerName) == 'string' and previewPlayerName ~= '' then
+			titlingLockPlayer(previewPlayerName, 5)
 		end
 		local displayName = tagName
 		local baseName, effectUserId, variant =
@@ -894,15 +1055,17 @@ return function(env)
 		local modScript = findTitleStyleModule(tagName)
 		if not modScript then
 			label.Text = '[' .. tagName .. ']'
+			ensureNameplateTagText(label, tagName)
 			return true, 'text-only (no SpecialAlias module)', label
 		end
 
 		label.Text = '[' .. tagName .. ']'
 		label.TextColor3 = Color3.new(1, 1, 1)
-		local okInvoke = invokeTitleModule(modScript, label, effectUserId or userId, variant)
+		ensureNameplateTagText(label, tagName)
 		pcall(function()
 			CollectionService:AddTag(label, tagName)
 		end)
+		local okInvoke = invokeTitleModule(modScript, label, effectUserId or userId, variant)
 		local host = label.Parent
 		if host then
 			-- Cancel deferred purges from resetNameplateTag (they were deleting BehideFrame/Smoke).
@@ -912,25 +1075,28 @@ return function(env)
 			end
 			tidyNameplateHost(host)
 		end
+		ensureNameplateTagText(label, tagName)
 		if okInvoke then
-			for _ = 1, 12 do
-				if labelHasTitleFx(label) or (host and hostHasLiveGameTitleFx(host)) then
-					local how = 'game module'
-					if variant then
-						how = how .. ' (' .. displayName .. ')'
-					end
-					return true, how, label
+			for _ = 1, 20 do
+				if labelHasEffectiveTitleFx(label, tagName) then
+					return finishGameTitleApply(label, tagName, modScript, displayName, variant, host)
 				end
 				task.wait(0.08)
 			end
 		end
 
 		local cloned = cloneModuleTitleDecor(modScript, label)
-		if cloned > 0 and labelHasTitleFx(label) then
-			return true, 'cloned-assets', label
+		ensureNameplateTagText(label, tagName)
+		if cloned > 0 and labelHasEffectiveTitleFx(label, tagName) then
+			return finishGameTitleApply(label, tagName, modScript, displayName, variant, host)
 		end
 
-		if variant and (tagName == 'Community Staff' or tagName == 'Dev') then
+		local needsFallback = not labelHasEffectiveTitleFx(label, tagName)
+		if needsFallback then
+			if labelHasTitleFx(label) then
+				stripTitleDecor(label)
+			end
+			ensureNameplateTagText(label, tagName)
 			local okFb, howFb, labFb = applySampledTitleFallback(label, displayName, tagName, variant)
 			if okFb then
 				if host then
@@ -946,6 +1112,7 @@ return function(env)
 		if tagName == 'Community Staff' and not variant then
 			return true, 'Community Staff needs Purple/Blue/Red variant', label
 		end
+		ensureNameplateTagText(label, tagName)
 		return true, 'text-only', label
 	end
 
@@ -982,77 +1149,35 @@ return function(env)
 		return ''
 	end
 
-	local function applyCustomToLabel(label, cfg)
+	startCustomTitleAnim = function(label, cfg, grad, icon)
 		if not label or type(cfg) ~= 'table' then
-			return false, 'missing', nil
+			return
 		end
-		label = resetNameplateTag(label)
-		if not label then
-			return false, 'could not reset nameplate tag', nil
+		grad = grad or label:FindFirstChildWhichIsA('UIGradient')
+		if not grad then
+			return
 		end
-
-		local text = tostring(cfg.text or 'Custom')
-		if text == '' then
-			text = 'Custom'
+		icon = icon
+		if not icon then
+			for _, ch in ipairs(label:GetChildren()) do
+				if ch:IsA('ImageLabel') or ch:IsA('ImageButton') then
+					if ch.Name == 'Icon' or ch.Name == 'Symbol' or ch.Image ~= '' then
+						icon = ch
+						break
+					end
+				end
+			end
 		end
-		if cfg.brackets ~= false then
-			label.Text = '[' .. text .. ']'
-		else
-			label.Text = text
-		end
-		label.TextColor3 = Color3.new(1, 1, 1)
-
+		local anim = tostring(cfg.anim or 'None')
 		local c1 = cfg.c1 or Color3.fromRGB(255, 215, 0)
 		local c2 = cfg.c2 or Color3.fromRGB(255, 215, 0)
 		local c3 = cfg.c3 or Color3.fromRGB(255, 154, 65)
-		local strokeCol = cfg.stroke or Color3.fromRGB(40, 40, 60)
-		local thickness = tonumber(cfg.thickness) or 1.5
-		local anim = tostring(cfg.anim or 'None')
-		local iconAsset = normalizeAsset(cfg.icon or '')
 		local sparkAsset = normalizeAsset(cfg.spark or '')
 		if sparkAsset == '' then
 			sparkAsset = DEFAULT_SPARK_IMAGE
 		end
 
-		local grad = Instance.new('UIGradient')
-		grad.Name = 'Gradient'
-		grad.Color = ColorSequence.new({
-			ColorSequenceKeypoint.new(0, c1),
-			ColorSequenceKeypoint.new(0.5, c2),
-			ColorSequenceKeypoint.new(1, c3),
-		})
-		grad.Parent = label
-
-		local stroke = Instance.new('UIStroke')
-		stroke.Name = 'UIStroke'
-		stroke.Color = strokeCol
-		stroke.Thickness = thickness
-		stroke.Parent = label
-
-		local icon
-		if iconAsset ~= '' then
-			icon = Instance.new('ImageLabel')
-			icon.Name = 'Icon'
-			icon.BackgroundTransparency = 1
-			icon.Image = iconAsset
-			icon.AnchorPoint = Vector2.new(0.5, 0.5)
-			icon.Position = UDim2.fromScale(0.9, 0.5)
-			icon.Size = UDim2.fromScale(0.1, 1)
-			icon.ZIndex = 2
-			icon.Parent = label
-			local ig = Instance.new('UIGradient')
-			ig.Color = ColorSequence.new({
-				ColorSequenceKeypoint.new(0, c1),
-				ColorSequenceKeypoint.new(1, c2),
-			})
-			ig.Parent = icon
-		end
-
-		local host = label.Parent
-		if host then
-			bumpTitlePurgeGen(host)
-		end
-
+		stopCustomFx(label)
 		local fx = { token = 1, conns = {} }
 		activeFx[label] = fx
 		local token = fx.token
@@ -1147,7 +1272,6 @@ return function(env)
 			end)
 		end
 
-		-- Cursed One style: briefly corrupt many characters to "_" then restore.
 		if wantGlitch then
 			task.defer(function()
 				while alive() do
@@ -1170,8 +1294,11 @@ return function(env)
 								end
 							end
 							if #eligible > 0 then
-								local n = math.clamp(math.random(math.max(3, math.floor(#eligible * 0.45)), math.max(4, math.floor(#eligible * 0.85))), 1, #eligible)
-								-- shuffle pick
+								local n = math.clamp(
+									math.random(math.max(3, math.floor(#eligible * 0.45)), math.max(4, math.floor(#eligible * 0.85))),
+									1,
+									#eligible
+								)
 								for i = #eligible, 2, -1 do
 									local j = math.random(1, i)
 									eligible[i], eligible[j] = eligible[j], eligible[i]
@@ -1195,6 +1322,86 @@ return function(env)
 				end
 			end)
 		end
+	end
+
+	local function applyCustomToLabel(label, cfg)
+		if not label or type(cfg) ~= 'table' then
+			return false, 'missing', nil
+		end
+		label = resetNameplateTag(label)
+		if not label then
+			return false, 'could not reset nameplate tag', nil
+		end
+
+		local text = tostring(cfg.text or 'Custom')
+		if text == '' then
+			text = 'Custom'
+		end
+		if cfg.brackets ~= false then
+			label.Text = '[' .. text .. ']'
+		else
+			label.Text = text
+		end
+		label.TextColor3 = Color3.new(1, 1, 1)
+
+		local c1 = cfg.c1 or Color3.fromRGB(255, 215, 0)
+		local c2 = cfg.c2 or Color3.fromRGB(255, 215, 0)
+		local c3 = cfg.c3 or Color3.fromRGB(255, 154, 65)
+		local strokeCol = cfg.stroke or Color3.fromRGB(40, 40, 60)
+		local thickness = tonumber(cfg.thickness) or 1.5
+		local anim = tostring(cfg.anim or 'None')
+		local iconAsset = normalizeAsset(cfg.icon or '')
+		local sparkAsset = normalizeAsset(cfg.spark or '')
+		if sparkAsset == '' then
+			sparkAsset = DEFAULT_SPARK_IMAGE
+		end
+
+		local grad = Instance.new('UIGradient')
+		grad.Name = 'Gradient'
+		grad.Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, c1),
+			ColorSequenceKeypoint.new(0.5, c2),
+			ColorSequenceKeypoint.new(1, c3),
+		})
+		grad.Parent = label
+
+		local stroke = Instance.new('UIStroke')
+		stroke.Name = 'UIStroke'
+		stroke.Color = strokeCol
+		stroke.Thickness = thickness
+		stroke.Parent = label
+
+		local icon
+		if iconAsset ~= '' then
+			icon = Instance.new('ImageLabel')
+			icon.Name = 'Icon'
+			icon.BackgroundTransparency = 1
+			icon.Image = iconAsset
+			icon.AnchorPoint = Vector2.new(0.5, 0.5)
+			icon.Position = UDim2.fromScale(0.9, 0.5)
+			icon.Size = UDim2.fromScale(0.1, 1)
+			icon.ZIndex = 2
+			icon.Parent = label
+			local ig = Instance.new('UIGradient')
+			ig.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, c1),
+				ColorSequenceKeypoint.new(1, c2),
+			})
+			ig.Parent = icon
+		end
+
+		local host = label.Parent
+		if host then
+			bumpTitlePurgeGen(host)
+		end
+
+		startCustomTitleAnim(label, {
+			anim = anim,
+			spark = sparkAsset,
+			c1 = c1,
+			c2 = c2,
+			c3 = c3,
+		}, grad, icon)
 
 		return true, 'custom', label
 	end
@@ -1575,6 +1782,26 @@ return function(env)
 		}
 	end
 
+	boostGameTitleAnim = function(label, tagName, modScript)
+		if not label or activeFx[label] or not modScript then
+			return
+		end
+		local grad = label:FindFirstChildWhichIsA('UIGradient')
+		if not grad or gradientLooksPlainWhite(grad) then
+			return
+		end
+		local hint = inferModuleAnimHint(modScript, tagName)
+		if not hint or hint == 'None' then
+			return
+		end
+		local cfg = sampleTitleFromLabel(label)
+		if not cfg then
+			return
+		end
+		cfg.anim = hint
+		startCustomTitleAnim(label, cfg, grad, nil)
+	end
+
 	local function extractAssetIdsFromModule(modScript)
 		local ids = {}
 		local seen = {}
@@ -1932,6 +2159,76 @@ return function(env)
 		return saveStore(store)
 	end
 
+	local autoFixAt = {}
+	local autoFixHookGen = {}
+
+	local function titlingAutoFixEnabled()
+		local t = Toggles and Toggles.TitlingAutoFixNameplate
+		if type(t) == 'table' and t.Value ~= nil then
+			return t.Value == true
+		end
+		return getgenv().SB2TitlingAutoFixNameplate ~= false
+	end
+
+	local function tryAutoFixNameplate(playerName)
+		if not titlingAutoFixEnabled() then
+			return
+		end
+		if titlingPlayerLocked and titlingPlayerLocked(playerName) then
+			return
+		end
+		if type(playerName) ~= 'string' or playerName == '' then
+			return
+		end
+		local now = os.clock()
+		if (now - (autoFixAt[playerName] or 0)) < 0.35 then
+			return
+		end
+		autoFixAt[playerName] = now
+		local titleName = resolveEquippedTitleDisplay(playerName)
+		if not titleName then
+			return
+		end
+		local char = resolveCharacter(playerName)
+		local label = getNameplateTag(char)
+		if not label then
+			return
+		end
+		local baseName = resolveTitleSelection(titleName, resolveUserId(playerName), playerName)
+		if labelHasEffectiveTitleFx(label, baseName) then
+			return
+		end
+		local _, knownSet = listTitleNames()
+		applyTitleToLabel(label, titleName, knownSet, resolveUserId(playerName), playerName)
+	end
+
+	getgenv().SB2TryFixNameplateTitle = tryAutoFixNameplate
+
+	local function hookNameplateCharacter(char)
+		if not char or not char:IsA('Model') then
+			return
+		end
+		task.spawn(function()
+			local np = char:WaitForChild('Nameplate', 12)
+			if not np then
+				return
+			end
+			tryAutoFixNameplate(char.Name)
+			autoFixHookGen[char] = (autoFixHookGen[char] or 0) + 1
+			local gen = autoFixHookGen[char]
+			np.DescendantAdded:Connect(function(inst)
+				if autoFixHookGen[char] ~= gen then
+					return
+				end
+				if inst:IsA('TextLabel') and inst.Name == 'Tag' then
+					task.defer(function()
+						tryAutoFixNameplate(char.Name)
+					end)
+				end
+			end)
+		end)
+	end
+
 	-- Existing title preview
 	local playerDrop = TitlingBox:AddDropdown('TitlingPlayer', {
 		Text = 'Player',
@@ -1950,6 +2247,20 @@ return function(env)
 	})
 
 	local statusLabel = TitlingBox:AddLabel('Pick a player + title, then Apply preview')
+
+	TitlingBox:AddToggle('TitlingAutoFixNameplate', {
+		Text = 'Auto-fix equipped title on nameplate',
+		Default = true,
+		Tooltip = 'When the game leaves a plain white gradient on Nameplate.Tag (common for Dev / Community Staff), re-apply proper colors from your equipped CurrentTag.',
+	}):OnChanged(function(on)
+		getgenv().SB2TitlingAutoFixNameplate = on == true
+		if on then
+			for _, plr in ipairs(Players:GetPlayers()) do
+				tryAutoFixNameplate(plr.Name)
+			end
+		end
+	end)
+	getgenv().SB2TitlingAutoFixNameplate = true
 
 	local function setStatus(text)
 		pcall(function()
@@ -2023,6 +2334,7 @@ return function(env)
 			return
 		end
 		snapshotPlate(playerName, label)
+		titlingLockPlayer(playerName, 5)
 		local _, knownSet = listTitleNames()
 		local ok, how = applyTitleToLabel(
 			label,
@@ -2278,6 +2590,7 @@ return function(env)
 			return
 		end
 		snapshotPlate(playerName, label)
+		titlingLockPlayer(playerName, 5)
 		local cfg = gatherCustomCfg()
 		local useGame = cfg.renderMode == RENDER_GAME
 			and type(cfg.gameTitleKey) == 'string'
@@ -2407,6 +2720,29 @@ return function(env)
 	task.delay(2, function()
 		refreshTitles()
 	end)
+
+	local charsFolder = workspace:FindFirstChild('Characters')
+	if charsFolder then
+		for _, ch in ipairs(charsFolder:GetChildren()) do
+			hookNameplateCharacter(ch)
+		end
+		charsFolder.ChildAdded:Connect(hookNameplateCharacter)
+	end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr.Character then
+			hookNameplateCharacter(plr.Character)
+		end
+		plr.CharacterAdded:Connect(hookNameplateCharacter)
+	end
+	Players.PlayerAdded:Connect(function(plr)
+		plr.CharacterAdded:Connect(hookNameplateCharacter)
+	end)
+	task.defer(function()
+		for _, plr in ipairs(Players:GetPlayers()) do
+			tryAutoFixNameplate(plr.Name)
+		end
+	end)
+
 	getgenv().SB2TitlingDraftToken = (getgenv().SB2TitlingDraftToken or 0) + 1
 	local draftToken = getgenv().SB2TitlingDraftToken
 	task.spawn(function()

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.26",
-    "message":  "WD ordered-kill highlight, auto floor-circle dodge, updater skips GitHub downgrade",
+    "version":  "1.0.28",
+    "message":  "Wave Defense panel loads WD highlight module at UI build (wd-panel-fix-v1)",
     "files":  [
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",
@@ -14,6 +14,8 @@
                   "PlayerTools/AtaraxiaLibrary.lua",
                   "PlayerTools/TagWiki.lua",
                   "PlayerTools/Titling.lua",
+                  "PlayerTools/WaveKillTarget.lua",
+                  "PlayerTools/AutoFloorDodge.lua",
                   "PlayerTools/PillDock.lua",
                   "PlayerTools/AutoBlock.iy",
                   "PlayerTools/ServerHop.iy",
