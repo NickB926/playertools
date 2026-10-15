@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Funeral Crescent
+|image=<gallery>
+Funeral Crescent.png | Icon
+Funeral Crescent in-game.png | In-game
+</gallery>
+|type=Scythe (Scythe)
+|rarity=Tribute
+|level=460
+|dmg=Clean: 58,720
+Max: 117,440
+|crit=40%
+|obtain=[[]]
+|abilities=+30% Health Regeneration
++50% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Tribute}} level 460 Scythe, dropped by [[???]] in [[]]. It has a 40% critical chance and does 58,720 damage. When [[Upgrading|upgraded]] to +20, it does 117,440 damage. In addition, it grants the user a +30% health regeneration buff and +50% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Tributes]]

@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Deepwarden’s Hook
+|image=<gallery>
+Deepwarden’s Hook.png | Icon
+Deepwarden’s Hook in-game.png | In-game
+</gallery>
+|type=Longsword (Longsword)
+|rarity=Legendary
+|level=265
+|dmg=Clean: 9,052
+Max: 18,104
+|crit=25%
+|obtain=[[]]
+|abilities=+22% Health Regeneration
++22% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 265 Longsword, dropped by [[???]] in [[]]. It has a 25% critical chance and does 9,052 damage. When [[Upgrading|upgraded]] to +20, it does 18,104 damage. In addition, it grants the user a +22% health regeneration buff and +22% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

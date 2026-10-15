@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Cinder Fang
+|image=<gallery>
+Cinder Fang.png | Icon
+Cinder Fang in-game.png | In-game
+</gallery>
+|type=Longsword (Longsword)
+|rarity=Legendary
+|level=400
+|dmg=Clean: 25,000
+Max: 50,000
+|crit=20%
+|obtain=[[]]
+|abilities=+26% Health Regeneration
++18% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 400 Longsword, dropped by [[???]] in [[]]. It has a 20% critical chance and does 25,000 damage. When [[Upgrading|upgraded]] to +20, it does 50,000 damage. In addition, it grants the user a +26% health regeneration buff and +18% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

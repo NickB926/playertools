@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Vaelith’s Needle
+|image=<gallery>
+Vaelith’s Needle.png | Icon
+Vaelith’s Needle in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Legendary
+|level=150
+|dmg=Clean: 2,490
+Max: 4,980
+|crit=20%
+|obtain=[[]]
+|abilities=+10% Health Regeneration
++30% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 150 Rapier, dropped by [[???]] in [[]]. It has a 20% critical chance and does 2,490 damage. When [[Upgrading|upgraded]] to +20, it does 4,980 damage. In addition, it grants the user a +10% health regeneration buff and +30% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

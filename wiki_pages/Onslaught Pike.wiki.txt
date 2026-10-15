@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Onslaught Pike
+|image=<gallery>
+Onslaught Pike.png | Icon
+Onslaught Pike in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Legendary
+|level=150
+|dmg=Clean: 2,300
+Max: 4,600
+|crit=14%
+|obtain=[[]]
+|abilities=+10% Health Regeneration
++10% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 150 Rapier, dropped by [[???]] in [[]]. It has a 14% critical chance and does 2,300 damage. When [[Upgrading|upgraded]] to +20, it does 4,600 damage. In addition, it grants the user a +10% health regeneration buff and +10% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

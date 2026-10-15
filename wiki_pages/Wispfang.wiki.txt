@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Wispfang
+|image=<gallery>
+Wispfang.png | Icon
+Wispfang in-game.png | In-game
+</gallery>
+|type=Katana (Katana)
+|rarity=Tribute
+|level=300
+|dmg=Clean: 14,600
+Max: 29,200
+|crit=36%
+|obtain=[[]]
+|abilities=+40% Health Regeneration
++30% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Tribute}} level 300 Katana, dropped by [[???]] in [[]]. It has a 36% critical chance and does 14,600 damage. When [[Upgrading|upgraded]] to +20, it does 29,200 damage. In addition, it grants the user a +40% health regeneration buff and +30% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Tributes]]

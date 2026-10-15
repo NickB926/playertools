@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Soulharvest
+|image=<gallery>
+Soulharvest.png | Icon
+Soulharvest in-game.png | In-game
+</gallery>
+|type=Scythe (Scythe)
+|rarity=Legendary
+|level=275
+|dmg=Clean: 9,200
+Max: 18,400
+|crit=21%
+|obtain=[[]]
+|abilities=+20% Health Regeneration
++20% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 275 Scythe, dropped by [[???]] in [[]]. It has a 21% critical chance and does 9,200 damage. When [[Upgrading|upgraded]] to +20, it does 18,400 damage. In addition, it grants the user a +20% health regeneration buff and +20% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

@@ -1,0 +1,19 @@
+{{Item infobox
+|name=Warden Platemail
+|image=<gallery>
+Warden Platemail.png | Icon
+Warden Platemail in-game.png | In-game
+</gallery>
+|type=Armor
+|rarity=Legendary
+|level=250
+|def=Clean: 92,614
+Max: 129,660
+|obtain=[[]]
+|abilities=+20% Health Regeneration
++20% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 250 armor, dropped by [[???]] in [[]]. At base, it provides the player with 92,614 defenses, and when [[Upgrading|upgraded]] to +20, it provides the player with 129,660 defense. In addition, it grants the user a +20% health regeneration buff and +20% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

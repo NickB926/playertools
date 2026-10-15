@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Bred
+|image=<gallery>
+Bred.png | Icon
+Bred in-game.png | In-game
+</gallery>
+|type=Limited Bred (Longsword)
+|rarity=Legendary
+|level=1
+|dmg=Clean: 1
+Max: 2
+|crit=30%
+|obtain=[[]]
+|abilities=+25% Health Regeneration
++25% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 1 Longsword, dropped by [[???]] in [[]]. It has a 30% critical chance and does 1 damage. When [[Upgrading|upgraded]] to +20, it does 2 damage. In addition, it grants the user a +25% health regeneration buff and +25% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

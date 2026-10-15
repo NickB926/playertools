@@ -1,0 +1,19 @@
+{{Item infobox
+|name=Riftborn Armor
+|image=<gallery>
+Riftborn Armor.png | Icon
+Riftborn Armor in-game.png | In-game
+</gallery>
+|type=Armor
+|rarity=Legendary
+|level=150
+|def=Clean: 18,000
+Max: 25,200
+|obtain=[[]]
+|abilities=+25% Health Regeneration
++10% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 150 armor, dropped by [[???]] in [[]]. At base, it provides the player with 18,000 defenses, and when [[Upgrading|upgraded]] to +20, it provides the player with 25,200 defense. In addition, it grants the user a +25% health regeneration buff and +10% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

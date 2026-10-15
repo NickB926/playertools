@@ -1,0 +1,20 @@
+{{ItemID}}
+{{Item infobox
+|name=Void Piercer
+|image=<gallery>
+Void Piercer.png | Icon
+voidpiercer.png | In-game
+</gallery>
+|type=Spear
+|rarity=Legendary
+|level=250
+|dmg=Clean: 7,600
+Max: 15,200
+|crit=24%
+|abilities=+18% Stamina Regeneration
++16% Health Regeneration
+|cost=[[File:ShopVelIcon.png|20px]] 100,000,000
+|obtain=[[Helmfirth Expert Shop]]
+}}
+== Overview ==
+'''Void Piercer''' is a {{Legendary}} level 250 spear, purchasable from the [[Helmfirth Expert Shop]] in [[Helmfirth]]. It has a 24% critical chance and does 7,600 damage. When [[Upgrading|upgraded]] to +20, it does 15,200 damage. In addition, it grants the user a +16% health regeneration buff and +18% stamina regeneration buff.

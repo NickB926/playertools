@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Nightwatch Reaper
+|image=<gallery>
+Nightwatch Reaper.png | Icon
+Nightwatch Reaper in-game.png | In-game
+</gallery>
+|type=Scythe (Scythe)
+|rarity=Tribute
+|level=200
+|dmg=Clean: 4,450
+Max: 8,900
+|crit=40%
+|obtain=[[]]
+|abilities=+25% Health Regeneration
++25% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Tribute}} level 200 Scythe, dropped by [[???]] in [[]]. It has a 40% critical chance and does 4,450 damage. When [[Upgrading|upgraded]] to +20, it does 8,900 damage. In addition, it grants the user a +25% health regeneration buff and +25% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Tributes]]

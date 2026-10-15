@@ -1,0 +1,20 @@
+{{ItemID}}
+{{Item infobox
+|name=Fracture Void
+|image=<gallery>
+Fracture Void.png | Icon
+fracturevoid.png | In-game
+</gallery>
+|type=Katana
+|rarity=Legendary
+|level=380
+|dmg=Clean: 29,000
+Max: 58,000
+|crit=35%
+|abilities=+50% Stamina Regeneration
++45% Health Regeneration
+|cost=[[File:ShopVelIcon.png|20px]] 350,000,000
+|obtain=[[Helmfirth Expert Shop]]
+}}
+== Overview ==
+'''Fracture Void''' is a {{Legendary}} level 380 katana, purchasable from the [[Helmfirth Expert Shop]] in [[Helmfirth]]. It has a 35% critical chance and does 29,000 damage. When [[Upgrading|upgraded]] to +20, it does 58,000 damage. In addition, it grants the user a +45% health regeneration buff and +50% stamina regeneration buff.

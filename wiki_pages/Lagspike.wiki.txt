@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Lagspike
+|image=<gallery>
+Lagspike.png | Icon
+Lagspike in-game.png | In-game
+</gallery>
+|type=Greatsword (Greatsword)
+|rarity=Legendary
+|level=225
+|dmg=Clean: 4,569
+Max: 9,138
+|crit=21%
+|obtain=[[]]
+|abilities=+10% Health Regeneration
++10% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 225 Greatsword, dropped by [[???]] in [[]]. It has a 21% critical chance and does 4,569 damage. When [[Upgrading|upgraded]] to +20, it does 9,138 damage. In addition, it grants the user a +10% health regeneration buff and +10% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

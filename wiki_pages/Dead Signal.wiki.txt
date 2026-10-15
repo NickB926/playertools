@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Dead Signal
+|image=<gallery>
+Dead Signal.png | Icon
+Dead Signal in-game.png | In-game
+</gallery>
+|type=Spear (Spear)
+|rarity=Legendary
+|level=175
+|dmg=Clean: 3,145
+Max: 6,290
+|crit=24%
+|obtain=[[]]
+|abilities=+10% Health Regeneration
++10% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 175 Spear, dropped by [[???]] in [[]]. It has a 24% critical chance and does 3,145 damage. When [[Upgrading|upgraded]] to +20, it does 6,290 damage. In addition, it grants the user a +10% health regeneration buff and +10% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

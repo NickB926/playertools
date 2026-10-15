@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Tempest Crescent
+|image=<gallery>
+Tempest Crescent.png | Icon
+Tempest Crescent in-game.png | In-game
+</gallery>
+|type=Scythe (Scythe)
+|rarity=Legendary
+|level=325
+|dmg=Clean: 15,915
+Max: 31,830
+|crit=21%
+|obtain=[[]]
+|abilities=+20% Health Regeneration
++25% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 325 Scythe, dropped by [[???]] in [[]]. It has a 21% critical chance and does 15,915 damage. When [[Upgrading|upgraded]] to +20, it does 31,830 damage. In addition, it grants the user a +20% health regeneration buff and +25% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

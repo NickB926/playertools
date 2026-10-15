@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Hollow Pyre
+|image=<gallery>
+Hollow Pyre.png | Icon
+Hollow Pyre in-game.png | In-game
+</gallery>
+|type=Greatsword (Greatsword)
+|rarity=Legendary
+|level=425
+|dmg=Clean: 33,700
+Max: 67,400
+|crit=26%
+|obtain=[[]]
+|abilities=+20% Health Regeneration
++24% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 425 Greatsword, dropped by [[???]] in [[]]. It has a 26% critical chance and does 33,700 damage. When [[Upgrading|upgraded]] to +20, it does 67,400 damage. In addition, it grants the user a +20% health regeneration buff and +24% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

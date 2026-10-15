@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Cinderbrand
+|image=<gallery>
+Cinderbrand.png | Icon
+Cinderbrand in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Legendary
+|level=100
+|dmg=Clean: 1,335
+Max: 2,670
+|crit=24%
+|obtain=[[]]
+|abilities=+8% Health Regeneration
++10% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 100 Rapier, dropped by [[???]] in [[]]. It has a 24% critical chance and does 1,335 damage. When [[Upgrading|upgraded]] to +20, it does 2,670 damage. In addition, it grants the user a +8% health regeneration buff and +10% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

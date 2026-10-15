@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Astral Breach
+|image=<gallery>
+Astral Breach.png | Icon
+Astral Breach in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Tribute
+|level=400
+|dmg=Clean: 31,000
+Max: 62,000
+|crit=14%
+|obtain=[[]]
+|abilities=+40% Health Regeneration
++42% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Tribute}} level 400 Rapier, dropped by [[???]] in [[]]. It has a 14% critical chance and does 31,000 damage. When [[Upgrading|upgraded]] to +20, it does 62,000 damage. In addition, it grants the user a +40% health regeneration buff and +42% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Tributes]]

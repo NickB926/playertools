@@ -521,6 +521,15 @@ local CONFIG = {
 	UIRepo = 'https://raw.githubusercontent.com/deividcomsono/Obsidian/main/',
 }
 
+-- Shown in console on full load (confirms workspace read the synced file, not stale copy).
+getgenv().SB2PlayerToolsLocalBuild = 'killaura-lite-v6'
+pcall(function()
+	warn(('[PlayerTools] local build %s | %s'):format(
+		tostring(getgenv().SB2PlayerToolsLocalBuild),
+		tostring(scriptPath)
+	))
+end)
+
 local joinPath = function(folder, name)
 	if not folder or folder == '' or folder == '.' then
 		return name
@@ -1118,8 +1127,32 @@ local ok, err = pcall(function()
 		warn('[PlayerTools] ' .. msg)
 		return
 	end
+	local function readWorkspaceNextPlaceId()
+		local raw = workspace:GetAttribute('NextPlaceId')
+		if raw == nil then
+			local ch = workspace:FindFirstChild('NextPlaceId')
+			if ch and ch:IsA('ValueBase') then
+				raw = ch.Value
+			end
+		end
+		if raw == nil then
+			for _, attrName in ipairs({ 'EventPlaceId', 'TargetPlaceId', 'DungeonPlaceId' }) do
+				raw = workspace:GetAttribute(attrName)
+				if raw ~= nil then
+					break
+				end
+			end
+		end
+		return tonumber(raw)
+	end
+	getgenv().SB2ReadNextPlaceId = readWorkspaceNextPlaceId
+	local wdMode = workspace:GetAttribute('WaveDefenseMode')
+	local nextPlace = readWorkspaceNextPlaceId()
 	getgenv().SB2WaveDefensePlace = idStr(game.PlaceId) == '121252145396212'
 		or idStr(game.GameId) == '8460001097'
+		or (type(wdMode) == 'string' and wdMode ~= '')
+		or nextPlace == 540240728
+		or workspace:FindFirstChild('NextPlaceId') ~= nil
 
 	-- Launch allowlist = ReplicatedStorage.Database.Locations (dynamic: events/future floors
 	-- included automatically). Login hub is not a Locations playable place.
@@ -3085,9 +3118,17 @@ local ok, err = pcall(function()
 			if cam.CameraSubject ~= subject then
 				cam.CameraSubject = subject
 			end
+			if diveCameraQuiet() then
+				return
+			end
+			local now = os.clock()
+			if (now - (tonumber(getgenv().SB2LastCamFixAt) or 0)) < 0.85 then
+				return
+			end
+			getgenv().SB2LastCamFixAt = now
 			-- Repark void cam at origin only — never snap while the user is zoomed/panned out.
 			if hrp and (cam.CFrame.Position - hrp.Position).Magnitude > 60 then
-				if cam.CFrame.Position.Magnitude < 100 or cam.CameraSubject == nil then
+				if cam.CFrame.Position.Magnitude < 40 or cam.CameraSubject == nil then
 					local look = hrp.CFrame.LookVector
 					local flat = Vector3.new(look.X, 0, look.Z)
 					if flat.Magnitude < 0.05 then
@@ -3106,6 +3147,19 @@ local ok, err = pcall(function()
 	getgenv().SB2LockReplicationFocus = lockReplicationFocus
 	getgenv().SB2RequestStreamAround = requestStreamAround
 
+	local function diveCameraQuiet()
+		if getgenv().SB2DiveUnderMap == true then
+			return true
+		end
+		if getgenv().SB2DiveFarmOn == true then
+			return true
+		end
+		if type(isToggleOn) == 'function' and isToggleOn('DiveFarm') then
+			return true
+		end
+		return false
+	end
+
 	local function cameraLooksBroken(cam, char)
 		if not cam then
 			return true
@@ -3114,13 +3168,17 @@ local ok, err = pcall(function()
 		if not inGameplayWorld() then
 			return false
 		end
+		local cp = cam.CFrame.Position
 		if cam.CameraType == Enum.CameraType.Fixed or cam.CameraType == Enum.CameraType.Scriptable then
 			return true
 		end
 		-- Default void cam parked near origin with no subject.
-		local cp = cam.CFrame.Position
 		if cam.CameraSubject == nil and cp.Magnitude < 40 then
 			return true
+		end
+		-- Event dive / under-map heal: body far below camera is normal — do not fight Roblox follow.
+		if diveCameraQuiet() then
+			return false
 		end
 		if not char or not char.Parent then
 			return false
@@ -3130,16 +3188,23 @@ local ok, err = pcall(function()
 		if subject == nil or subject == char then
 			return true -- nil / Model subject = classic SB2 void cam
 		end
-		-- Always prefer your Humanoid while alive and farming.
 		if hum and subject ~= hum then
+			if subject:IsA('BasePart') and subject:IsDescendantOf(char) then
+				return false
+			end
 			return true
 		end
 		local hrp = char:FindFirstChild('HumanoidRootPart')
 		if hrp then
-			local dist = (cam.CFrame.Position - hrp.Position).Magnitude
-			-- Normal scroll zoom exceeds 60 studs — only void when cam is parked at origin.
-			if dist > 60 and cp.Magnitude < 100 then
-				return true
+			local floorY = tonumber(getgenv().SB2DiveFloorRefY)
+			local underMap = getgenv().SB2DiveUnderMap == true
+				or (type(floorY) == 'number' and hrp.Position.Y < floorY - 20)
+			if not underMap then
+				local dist = (cam.CFrame.Position - hrp.Position).Magnitude
+				-- Only treat as void when cam is stuck at world origin, not zoom/follow offset.
+				if dist > 60 and cp.Magnitude < 40 then
+					return true
+				end
 			end
 		end
 		return false
@@ -3829,6 +3894,7 @@ local ok, err = pcall(function()
 		Folder = 'PlayerTools',
 		Icon = windowIcon,
 		Size = windowSize,
+		MinSize = minSize,
 		Position = windowPosition,
 		ShowCustomCursor = false, -- Obsidian + crosshair on top of OS mouse
 		Resizable = true,
@@ -4109,11 +4175,14 @@ local ok, err = pcall(function()
 			return
 		end
 		if Library.Backend == 'Ataraxia' then
+			-- Default open size (unchanged). MinSize must stay below this so the grip can shrink.
 			local w = math.max(880, windowSize.X.Offset)
 			local h = math.max(560, windowSize.Y.Offset)
 			main.Size = UDim2.fromOffset(w, h)
-			Library.MinSize = Vector2.new(880, 560)
-			Library.OriginalMinSize = Library.MinSize
+			Library.DefaultSize = Vector2.new(w, h)
+			local floor = minSize * (Library.DPIScale or 1)
+			Library.MinSize = floor
+			Library.OriginalMinSize = floor
 			return
 		end
 		main.Size = windowSize
@@ -5754,6 +5823,14 @@ local ok, err = pcall(function()
 		return nil
 	end
 
+	local blitzSkipWeaponName = function(name)
+		if type(name) ~= 'string' then
+			return false
+		end
+		local lower = string.lower(name)
+		return lower == 'fist' or lower == 'unarmed'
+	end
+
 	local unrecordedInventoryWeapons = function()
 		local profile = myProfileFolder()
 		local inv = profile and profile:FindFirstChild('Inventory')
@@ -5766,6 +5843,9 @@ local ok, err = pcall(function()
 		end
 		for _, item in ipairs(inv:GetChildren()) do
 			if item:IsA('ValueBase') and not picked[item.Name] and catalog[item.Name] == nil then
+				if blitzSkipWeaponName(item.Name) then
+					continue
+				end
 				local entry = itemsDb:FindFirstChild(item.Name)
 				local typ = entry and entry:FindFirstChild('Type')
 				if typ and typ.Value == 'Weapon' then
@@ -6723,6 +6803,9 @@ local ok, err = pcall(function()
 				if not blitzWeaponsRunning or not isToggleOn('BlitzWeapons') then
 					break
 				end
+				if blitzSkipWeaponName(item.Name) then
+					continue
+				end
 				if blitzStatus then
 					blitzStatus.Text = ('Blitz %d/%d · %s'):format(i, #list, item.Name)
 				end
@@ -7502,6 +7585,84 @@ local ok, err = pcall(function()
 			end
 			startJoin(target)
 		end)
+
+		-- Must match SERVER_HOP_UI_VER in ServerHop.iy (server list on floor click).
+		local SERVER_HOP_PT_VER = 7
+
+		local function teardownServerHopUi()
+			pcall(function()
+				local gui = getgenv().SB2ServerHopGui
+				if gui and gui.Destroy then
+					gui:Destroy()
+				end
+			end)
+			getgenv().SB2ServerHopGui = nil
+			getgenv().SB2ServerHopToggleGui = nil
+			getgenv().SB2ServerHopOpenGui = nil
+			getgenv().SB2ServerHopShowServers = nil
+			getgenv().SB2ServerHopBrowseFloor = nil
+			getgenv().SB2ServerHopBrowseCurrentFloor = nil
+			getgenv().SB2ServerHopRefillFloors = nil
+			getgenv().SB2ServerHopOpenServerBrowser = nil
+		end
+
+		local function ensureServerHopPlugin()
+			local ver = tonumber(getgenv().SB2ServerHopUiVer) or 0
+			local hasBrowse = type(getgenv().SB2ServerHopBrowseFloor) == 'function'
+			if ver >= SERVER_HOP_PT_VER and hasBrowse and type(getgenv().SB2ServerHopOpenGui) == 'function' then
+				return true
+			end
+			-- Old IY-only hop UI often registers ToggleGui without server browse — reload from disk.
+			teardownServerHopUi()
+			for _, path in ipairs({ 'PlayerTools/ServerHop.iy', 'ServerHop.iy' }) do
+				if type(isfile) == 'function' and isfile(path) and type(readfile) == 'function' then
+					local okRead, src = pcall(readfile, path)
+					if okRead and type(src) == 'string' and #src > 200 then
+						local fn, err = (loadstring or load)(src, path)
+						if fn then
+							local okRun, res = pcall(fn)
+							if okRun
+								and type(getgenv().SB2ServerHopOpenGui) == 'function'
+								and type(getgenv().SB2ServerHopBrowseFloor) == 'function'
+							then
+								return true
+							end
+							if not okRun then
+								warn('[PlayerTools] ServerHop load: ' .. tostring(res))
+							end
+						else
+							warn('[PlayerTools] ServerHop compile: ' .. tostring(err))
+						end
+					end
+				end
+			end
+			return false
+		end
+
+		JoinBox:AddButton('Browse floor servers', function()
+			if not ensureServerHopPlugin() then
+				Library:Notify('ServerHop.iy missing — keep PlayerTools/ServerHop.iy in workspace', 7, true)
+				return
+			end
+			if type(getgenv().SB2ServerHopOpenGui) == 'function' then
+				pcall(getgenv().SB2ServerHopOpenGui)
+			elseif type(getgenv().SB2ServerHopToggleGui) == 'function' then
+				pcall(getgenv().SB2ServerHopToggleGui)
+			end
+			Library:Notify('Click a floor — watch for “Loading servers” toast', 6)
+		end)
+
+		JoinBox:AddButton('Servers on this floor', function()
+			if not ensureServerHopPlugin() then
+				Library:Notify('ServerHop.iy missing — keep PlayerTools/ServerHop.iy in workspace', 7, true)
+				return
+			end
+			if type(getgenv().SB2ServerHopBrowseCurrentFloor) == 'function' then
+				pcall(getgenv().SB2ServerHopBrowseCurrentFloor)
+				return
+			end
+			Library:Notify('Reload PlayerTools — ServerHop browse API missing', 6, true)
+		end)
 	end
 
 	-- Walkspeed (local character). Default comes from the same place View stats reads
@@ -7616,6 +7777,211 @@ local ok, err = pcall(function()
 					end
 				end)
 			end)
+		end)
+	end
+
+	-- Local character scale (Model:ScaleTo + Humanoid body scales when available).
+	do
+		local MIN_CHAR_SCALE = 0.35
+		local MAX_CHAR_SCALE = 1.5
+		local ScaleBox = PlayersTab:AddLeftGroupbox('Character size')
+		assert(ScaleBox, 'Character size groupbox nil')
+
+		local function resolveCharForScale()
+			return getMyCharacterModel() or LocalPlayer.Character
+		end
+
+		local function clearScaleBaselines()
+			getgenv().SB2HumanoidScaleBase = nil
+			getgenv().SB2CharacterScaleModelId = nil
+		end
+
+		local function captureHumanoidBaselines(hum)
+			if not hum then
+				return
+			end
+			local model = hum.Parent
+			local modelId = model and model:GetFullName() or ''
+			if getgenv().SB2CharacterScaleModelId ~= modelId then
+				clearScaleBaselines()
+				getgenv().SB2CharacterScaleModelId = modelId
+			end
+			if type(getgenv().SB2HumanoidScaleBase) == 'table' then
+				return
+			end
+			local base = {}
+			for _, prop in ipairs({ 'BodyHeightScale', 'BodyWidthScale', 'BodyDepthScale', 'HeadScale' }) do
+				local v = hum[prop]
+				if type(v) == 'number' then
+					base[prop] = v
+				end
+			end
+			if type(hum.HipHeight) == 'number' then
+				base.HipHeight = hum.HipHeight
+			end
+			getgenv().SB2HumanoidScaleBase = base
+		end
+
+		local function applyHumanoidScale(hum, scale)
+			if not hum then
+				return
+			end
+			captureHumanoidBaselines(hum)
+			local base = getgenv().SB2HumanoidScaleBase
+			if type(base) ~= 'table' then
+				return
+			end
+			for _, prop in ipairs({ 'BodyHeightScale', 'BodyWidthScale', 'BodyDepthScale', 'HeadScale' }) do
+				local b = base[prop]
+				if type(b) == 'number' and type(hum[prop]) == 'number' then
+					pcall(function()
+						hum[prop] = b * scale
+					end)
+				end
+			end
+			if type(base.HipHeight) == 'number' then
+				pcall(function()
+					hum.HipHeight = base.HipHeight * scale
+				end)
+			end
+		end
+
+		local function resetCharacterScaleVisual()
+			local model = resolveCharForScale()
+			local hum = model and model:FindFirstChildOfClass('Humanoid')
+			local base = getgenv().SB2HumanoidScaleBase
+			pcall(function()
+				if model and typeof(model.ScaleTo) == 'function' then
+					model:ScaleTo(1)
+				end
+			end)
+			if hum and type(base) == 'table' then
+				for key, val in pairs(base) do
+					if type(val) == 'number' and type(hum[key]) == 'number' then
+						pcall(function()
+							hum[key] = val
+						end)
+					end
+				end
+			end
+			clearScaleBaselines()
+		end
+
+		local function applyCharacterScale(scale, pin)
+			scale = math.clamp(tonumber(scale) or 1, MIN_CHAR_SCALE, MAX_CHAR_SCALE)
+			if math.abs(scale - 1) <= 0.02 then
+				resetCharacterScaleVisual()
+				getgenv().SB2CharacterScaleWant = nil
+				return true
+			end
+
+			local model = resolveCharForScale()
+			if not model then
+				return false
+			end
+			local hum = model:FindFirstChildOfClass('Humanoid')
+
+			pcall(function()
+				if typeof(model.ScaleTo) == 'function' then
+					model:ScaleTo(scale)
+				end
+			end)
+			applyHumanoidScale(hum, scale)
+
+			if pin ~= false then
+				getgenv().SB2CharacterScaleWant = scale
+			else
+				getgenv().SB2CharacterScaleWant = nil
+			end
+			return true
+		end
+
+		ScaleBox:AddSlider('CharacterScale', {
+			Text = 'Scale',
+			Default = 1,
+			Min = MIN_CHAR_SCALE,
+			Max = MAX_CHAR_SCALE,
+			Rounding = 2,
+			Compact = true,
+			Tooltip = 'Shrink or grow your character (local). SB2 may snap back — this re-applies while pinned.',
+		}):OnChanged(function(value)
+			applyCharacterScale(value, true)
+		end)
+
+		ScaleBox:AddButton('Normal size (1.0)', function()
+			if Options.CharacterScale and type(Options.CharacterScale.SetValue) == 'function' then
+				pcall(function()
+					Options.CharacterScale:SetValue(1)
+				end)
+			end
+			resetCharacterScaleVisual()
+			getgenv().SB2CharacterScaleWant = nil
+			Library:Notify('Character scale reset')
+		end)
+
+		getgenv().SB2CharacterScaleWant = nil
+		local scaleGen = (tonumber(getgenv().SB2CharacterScaleGen) or 0) + 1
+		getgenv().SB2CharacterScaleGen = scaleGen
+		task.spawn(function()
+			while getgenv().SB2CharacterScaleGen == scaleGen do
+				if getgenv().SB2PlayerToolsManualUnload == true then
+					break
+				end
+				local want = tonumber(getgenv().SB2CharacterScaleWant)
+				if want then
+					local model = resolveCharForScale()
+					if model then
+						pcall(function()
+							if typeof(model.GetScale) == 'function' and typeof(model.ScaleTo) == 'function' then
+								local cur = model:GetScale()
+								if math.abs(cur - want) > 0.04 then
+									model:ScaleTo(want)
+								end
+							end
+						end)
+						local hum = model:FindFirstChildOfClass('Humanoid')
+						if hum then
+							applyHumanoidScale(hum, want)
+						end
+					end
+				end
+				task.wait(0.2)
+			end
+		end)
+
+		pcall(function()
+			safeConnect(LocalPlayer.CharacterAdded, function()
+				clearScaleBaselines()
+				task.defer(function()
+					local want = tonumber(getgenv().SB2CharacterScaleWant)
+					if want then
+						applyCharacterScale(want, true)
+					end
+				end)
+			end)
+		end)
+
+		-- SB2 body lives under workspace.Characters — re-apply when that model respawns.
+		task.spawn(function()
+			local lastName = nil
+			while getgenv().SB2CharacterScaleGen == scaleGen do
+				if getgenv().SB2PlayerToolsManualUnload == true then
+					break
+				end
+				local model = resolveCharForScale()
+				local name = model and model.Name
+				if name and name ~= lastName then
+					lastName = name
+					clearScaleBaselines()
+					local want = tonumber(getgenv().SB2CharacterScaleWant)
+					if want then
+						task.defer(function()
+							applyCharacterScale(want, true)
+						end)
+					end
+				end
+				task.wait(0.35)
+			end
 		end)
 	end
 
@@ -7969,12 +8335,35 @@ local ok, err = pcall(function()
 			if isToggleOn('ViewPlayer') or isToggleOn('ViewPlayerStream') then
 				return
 			end
+			if getgenv().SB2CheaterScannerSpectating == true then
+				return
+			end
 			-- Leave title / PLAY-menu cinematic cams alone (forcing Custom = black screen).
 			if not inGameplayWorld() then
 				return
 			end
 			local cam = getLiveCamera()
 			local char = getMyCharacterModel() or LocalPlayer.Character
+			if diveCameraQuiet() then
+				if cam and char then
+					pcall(function()
+						if cam.CameraType == Enum.CameraType.Fixed or cam.CameraType == Enum.CameraType.Scriptable then
+							local hum = char:FindFirstChildOfClass('Humanoid')
+							if hum then
+								cam.CameraType = Enum.CameraType.Custom
+								cam.CameraSubject = hum
+							end
+						elseif cam.CameraSubject == nil then
+							local hum = char:FindFirstChildOfClass('Humanoid')
+							if hum then
+								cam.CameraType = Enum.CameraType.Custom
+								cam.CameraSubject = hum
+							end
+						end
+					end)
+				end
+				return
+			end
 			lockReplicationFocus(char)
 			pinHighAir(char)
 			if cameraLooksBroken(cam, char) then
@@ -8033,6 +8422,9 @@ local ok, err = pcall(function()
 				return
 			end
 			local function onCamProp()
+				if diveCameraQuiet() then
+					return
+				end
 				if cameraLooksBroken(cam, getMyCharacterModel() or LocalPlayer.Character) then
 					hardenCamera()
 				end
@@ -8052,7 +8444,8 @@ local ok, err = pcall(function()
 		local lastHardenAt = 0
 		local function hardenCameraStepped()
 			local now = os.clock()
-			if (now - lastHardenAt) < 0.25 then
+			local gap = diveCameraQuiet() and 0.9 or 0.25
+			if (now - lastHardenAt) < gap then
 				return
 			end
 			lastHardenAt = now
@@ -8092,33 +8485,114 @@ local ok, err = pcall(function()
 		local SKILL_HIT_RANGE = 10000
 		-- Server rejects aura damage past ~melee/skill reach on elites/bosses even when
 		-- the instance is streamed. Prefer real/attack CF within these XZ radii.
-		local AURA_DAMAGE_RANGE = 260
-		local BOSS_DAMAGE_RANGE = 420
-		local AUTO_ATTACK_INTERVAL = 0.08
-		local AUTO_ATTACK_DELAY = 0.04
-		local HIT_LIVES_ATTACK_INTERVAL = 0.05
-		local HIT_LIVES_ATTACK_DELAY = 0.05
-		local HIT_LIVES_MIN_DELAY = 0.05
-		-- Killaura: hit many streamed mobs per tick (14 left most of a pack untouched).
-		local MAX_ATTACKS_PER_TICK = 48
-		-- Dump extra swings into bosses/elites per tick (1/tick felt like "not hitting").
-		local BOSS_HITS_PER_TICK = 10
-		local BOSS_ATTACK_DELAY = 0.02
-		-- Wave Defense packs huge waves. 48 mobs × 4 remotes × 12 Hz melted the server.
-		if getgenv().SB2WaveDefensePlace == true then
-			AURA_DAMAGE_RANGE = 72
-			BOSS_DAMAGE_RANGE = 96
-			AUTO_ATTACK_RANGE = 72
-			SKILL_HIT_RANGE = 96
-			AUTO_ATTACK_INTERVAL = 0.22
-			AUTO_ATTACK_DELAY = 0.12
-			HIT_LIVES_ATTACK_INTERVAL = 0.16
-			HIT_LIVES_ATTACK_DELAY = 0.12
-			HIT_LIVES_MIN_DELAY = 0.12
-			MAX_ATTACKS_PER_TICK = 6
-			BOSS_HITS_PER_TICK = 2
-			BOSS_ATTACK_DELAY = 0.08
+		-- Killaura load profiles. Aggressive = old defaults (48×~12 Hz) — melts FPS + server.
+		if getgenv().SB2CombatLiteLoad == nil then
+			getgenv().SB2CombatLiteLoad = false
 		end
+		local function syncCombatLiteLoadFromToggle()
+			local t = Toggles and Toggles.CombatLiteLoad
+			if type(t) == 'table' then
+				getgenv().SB2CombatLiteLoad = t.Value == true
+			end
+		end
+		getgenv().SB2SyncCombatLiteLoad = syncCombatLiteLoadFromToggle
+		local function combatLiteLoadEnabled()
+			local t = Toggles and Toggles.CombatLiteLoad
+			if type(t) == 'table' then
+				return t.Value == true
+			end
+			return getgenv().SB2CombatLiteLoad == true
+		end
+		getgenv().SB2CombatLiteLoadEnabled = combatLiteLoadEnabled
+		local WD_HUB_PLACE = '121252145396212'
+		local function isWdHubKillauraCap()
+			return idStr(game.PlaceId) == WD_HUB_PLACE or idStr(game.GameId) == '8460001097'
+		end
+		getgenv().SB2IsWdHubKillauraCap = isWdHubKillauraCap
+		local KILLAURA_WD = {
+			auraRange = 72,
+			bossRange = 96,
+			autoAttackRange = 72,
+			skillHitRange = 96,
+			interval = 0.22,
+			delay = 0.12,
+			hitLivesInterval = 0.16,
+			hitLivesDelay = 0.12,
+			hitLivesMinDelay = 0.12,
+			maxAttacks = 6,
+			bossHits = 2,
+			bossDelay = 0.08,
+			mobCacheGap = 0.35,
+			diveMobCacheGap = 0.14,
+			attackRemoteCap = 6,
+		}
+		-- Default killaura: normal rates, not 48-hit aggressive.
+		local KILLAURA_STANDARD = {
+			auraRange = 260,
+			bossRange = 420,
+			autoAttackRange = AUTO_ATTACK_RANGE,
+			skillHitRange = SKILL_HIT_RANGE,
+			interval = 0.18,
+			delay = 0.1,
+			hitLivesInterval = 0.14,
+			hitLivesDelay = 0.1,
+			hitLivesMinDelay = 0.1,
+			maxAttacks = 8,
+			bossHits = 3,
+			bossDelay = 0.06,
+			mobCacheGap = 0.55,
+			diveMobCacheGap = 0.22,
+			attackRemoteCap = 8,
+		}
+		-- Lite toggle ON: extra throttle (fewer remotes / tick).
+		local KILLAURA_THROTTLE = {
+			auraRange = 200,
+			bossRange = 300,
+			autoAttackRange = AUTO_ATTACK_RANGE,
+			skillHitRange = SKILL_HIT_RANGE,
+			interval = 0.26,
+			delay = 0.14,
+			hitLivesInterval = 0.2,
+			hitLivesDelay = 0.14,
+			hitLivesMinDelay = 0.14,
+			maxAttacks = 5,
+			bossHits = 2,
+			bossDelay = 0.1,
+			mobCacheGap = 0.65,
+			diveMobCacheGap = 0.28,
+			attackRemoteCap = 5,
+		}
+		local KILLAURA_AGGRESSIVE = {
+			auraRange = 260,
+			bossRange = 420,
+			autoAttackRange = AUTO_ATTACK_RANGE,
+			skillHitRange = SKILL_HIT_RANGE,
+			interval = 0.08,
+			delay = 0.04,
+			hitLivesInterval = 0.05,
+			hitLivesDelay = 0.05,
+			hitLivesMinDelay = 0.05,
+			maxAttacks = 48,
+			bossHits = 10,
+			bossDelay = 0.02,
+			mobCacheGap = 0.35,
+			diveMobCacheGap = 0.14,
+			attackRemoteCap = 10,
+		}
+		local function getKillauraProfile()
+			-- Event instances set SB2WaveDefensePlace — only cap on the WD hub place.
+			if isWdHubKillauraCap() then
+				return KILLAURA_WD
+			end
+			if combatLiteLoadEnabled() then
+				return KILLAURA_THROTTLE
+			end
+			if getgenv().SB2CombatAggressiveKillaura == true then
+				return KILLAURA_AGGRESSIVE
+			end
+			return KILLAURA_STANDARD
+		end
+		getgenv().SB2GetKillauraProfile = getKillauraProfile
 		-- Gap between any UseSkill casts (weapon + support).
 		local SKILL_CAST_GAP = 0.5
 		local lastAnySkillCastAt = 0
@@ -8263,7 +8737,8 @@ local ok, err = pcall(function()
 			local now = os.clock()
 			local diving = getgenv().SB2DiveFarmOn == true
 				or (type(isToggleOn) == 'function' and isToggleOn('DiveFarm'))
-			local cap = diving and 6 or 10
+			local prof = getKillauraProfile()
+			local cap = prof.attackRemoteCap or (diving and 6 or 10)
 			if now - (tonumber(getgenv()._SB2AtkRemoteSec) or 0) >= 1 then
 				getgenv()._SB2AtkRemoteSec = now
 				getgenv()._SB2AtkRemoteN = 0
@@ -8394,6 +8869,61 @@ local ok, err = pcall(function()
 			return false
 		end
 
+		local function isRewardChestMob(mob)
+			if not mob then
+				return false
+			end
+			local lower = string.lower(tostring(mob.Name or ''))
+			if string.find(lower, 'reward', 1, true) and string.find(lower, 'chest', 1, true) then
+				return true
+			end
+			if string.find(lower, 'rewardchest', 1, true) then
+				return true
+			end
+			return mob:GetAttribute('RewardChest') == true or mob:GetAttribute('Reward') == true
+		end
+
+		local function isPhantomMob(mob)
+			if not mob then
+				return false
+			end
+			if mob:GetAttribute('Phantom') == true or mob:GetAttribute('IsPhantom') == true then
+				return true
+			end
+			local lower = string.lower(tostring(mob.Name or ''))
+			return string.find(lower, 'phantom', 1, true) ~= nil
+		end
+
+		-- Killaura targets (not event-dive vacuum): reward chests + phantoms before Entity streams in.
+		local function isKillauraTargetMob(mob)
+			if shouldSkipMob(mob) or not mob or not mob.Parent then
+				return false
+			end
+			if isRewardChestMob(mob) then
+				return getMobRoot(mob) ~= nil
+			end
+			local lower = string.lower(tostring(mob.Name or ''))
+			if (string.find(lower, 'chest', 1, true) or string.find(lower, 'crate', 1, true))
+				and not isRewardChestMob(mob)
+			then
+				return false
+			end
+			if mob:GetAttribute('Died') == true then
+				return false
+			end
+			local entity = mob:FindFirstChild('Entity')
+			if not entity then
+				if isPhantomMob(mob) then
+					return getMobRoot(mob) ~= nil
+				end
+				return false
+			end
+			if entity:GetAttribute('Died') == true then
+				return false
+			end
+			return not isDeadMob(mob)
+		end
+
 		local setCharacterNoclip = function(enabled)
 			-- PlayerTools combat is stand-still killaura — never flip collision.
 			-- (Noclip restore mid-fight was dropping people through floors / void-killing.)
@@ -8418,8 +8948,44 @@ local ok, err = pcall(function()
 			if className == 'SingleSword' then
 				return '1HSword'
 			end
+			if className == 'DualWield' or className == 'DualSword' then
+				return 'Dual'
+			end
 			return className
 		end
+
+		-- Weapon skills that should list/cast while holding any matching blade class.
+		local SKILL_HELD_CLASS_ALIASES = {
+			['Cursed Three Fold Slash'] = {
+				'1HSword',
+				'2HSword',
+				'Dual',
+				'Scythe',
+				'Cursed',
+				'Katana',
+			},
+		}
+
+		local function skillMatchesHeldWeapon(skillName, info, held)
+			if type(held) ~= 'table' or next(held) == nil then
+				return true
+			end
+			info = info or getSkillInfo(skillName)
+			if info.class and held[info.class] then
+				return true
+			end
+			local aliases = SKILL_HELD_CLASS_ALIASES[skillName]
+			if aliases then
+				for _, cls in ipairs(aliases) do
+					local norm = normalizeWeaponClass(cls)
+					if (norm and held[norm]) or held[cls] then
+						return true
+					end
+				end
+			end
+			return false
+		end
+		getgenv().SB2SkillMatchesHeldWeapon = skillMatchesHeldWeapon
 
 		local getInventoryItemById = function(id)
 			if not id or id == 0 then
@@ -8484,11 +9050,15 @@ local ok, err = pcall(function()
 			local durationSec = (duration and typeof(duration.Value) == 'number' and duration.Value > 0)
 				and duration.Value
 				or 1.5
+			local class = classVal and normalizeWeaponClass(classVal.Value) or nil
+			if skillName == 'Cursed Three Fold Slash' and not class then
+				class = '1HSword'
+			end
 			return {
 				name = skillName,
 				cooldown = (cooldown and typeof(cooldown.Value) == 'number') and cooldown.Value or 2,
 				cost = (cost and typeof(cost.Value) == 'number') and cost.Value or 0,
-				class = classVal and normalizeWeaponClass(classVal.Value) or nil,
+				class = class,
 				anytime = anytime,
 				duration = durationSec,
 			}
@@ -8869,7 +9439,7 @@ local ok, err = pcall(function()
 				if not skillPassesUnlock(skillName, entry, mySkills, level) then
 					return
 				end
-				if not hasHeld or not held[info.class] then
+				if hasHeld and not skillMatchesHeldWeapon(skillName, info, held) then
 					return
 				end
 				seen[skillName] = true
@@ -8912,6 +9482,10 @@ local ok, err = pcall(function()
 
 			for forceName in pairs(FORCE_ATTACK_SKILLS) do
 				tryAdd(forceName)
+			end
+			-- Owned cursed blade skill — always offer in combat dropdown when a weapon is held.
+			if mySkills and mySkills:FindFirstChild('Cursed Three Fold Slash') then
+				tryAdd('Cursed Three Fold Slash')
 			end
 
 			table.sort(names)
@@ -9200,16 +9774,16 @@ local ok, err = pcall(function()
 				local info = getSkillInfo(cur)
 				if info.class and not info.anytime then
 					local held = getEquippedWeaponClassesCached()
-					if held[info.class] then
+					if skillMatchesHeldWeapon(cur, info, held) then
 						return cur
 					end
 				end
 			end
-			-- nil / pistol / wrong-class → pick Downward Smash or first weapon skill.
+			-- nil / pistol / wrong-class → pick CTF / smash or first weapon skill.
 			local pick = nil
 			for _, name in ipairs(values) do
 				if name ~= '(none)' and not FORCE_ATTACK_SKILLS[name] then
-					if name == 'Downward Smash' then
+					if name == 'Cursed Three Fold Slash' or name == 'Downward Smash' then
 						pick = name
 						break
 					end
@@ -9248,7 +9822,7 @@ local ok, err = pcall(function()
 				then
 					local held = getEquippedWeaponClasses()
 					local info = getSkillInfo(farm)
-					if info.class and held[info.class] then
+					if skillMatchesHeldWeapon(farm, info, held) then
 						Options.SkillName:SetValue(farm)
 					else
 						preferWeaponCombatSkill(false)
@@ -9270,6 +9844,7 @@ local ok, err = pcall(function()
 			end
 			return values
 		end
+		getgenv().SB2RefreshSkillDropdown = refreshSkillDropdown
 
 		local function getGameSkillsService()
 			local svc = RequiredServices or getgenv().SB2RequiredServices
@@ -10377,14 +10952,17 @@ local ok, err = pcall(function()
 				end
 				if not usingEventFarmSkills() then
 					local held = getEquippedWeaponClassesCached()
-					if not held[info.class] then
+					if not skillMatchesHeldWeapon(skillName, info, held) then
 						-- Try first held-class skill instead of silently doing nothing.
 						local avail = getAvailableSkills()
 						local alt = nil
 						for _, name in ipairs(avail) do
 							if name ~= '(none)' and name ~= '(none for held weapon)' then
-								alt = name
-								break
+								local altInfo = getSkillInfo(name)
+								if skillMatchesHeldWeapon(name, altInfo, held) then
+									alt = name
+									break
+								end
 							end
 						end
 						if not alt then
@@ -10392,7 +10970,7 @@ local ok, err = pcall(function()
 						end
 						skillName = alt
 						info = getSkillInfo(skillName)
-						if not info.class or not held[info.class] then
+						if not info.class or not skillMatchesHeldWeapon(skillName, info, held) then
 							return nil
 						end
 					end
@@ -10444,7 +11022,8 @@ local ok, err = pcall(function()
 			local hit = false
 			local tag = (type(attackName) == 'string' and attackName ~= '') and attackName or nil
 
-			if getgenv().SB2WaveDefensePlace == true then
+			-- WD *hub* only — event instances (SB2WaveDefensePlace) need Attack remotes for CTF/skill reach.
+			if isWdHubKillauraCap() then
 				if RequiredServices
 					and RequiredServices.Combat
 					and type(RequiredServices.Combat.DealDamage) == 'function'
@@ -10523,6 +11102,10 @@ local ok, err = pcall(function()
 		end
 
 		local looksClientStacked = function(origin)
+			-- Event vacuum hovers in dense packs — mob count is not alt bring-stack.
+			if getgenv().SB2DiveFarmOn == true or isToggleOn('DiveFarm') then
+				return false
+			end
 			local now = os.clock()
 			if now - (tonumber(getgenv()._SB2StackLookAt) or 0) < 0.22 then
 				return getgenv()._SB2StackLook == true
@@ -10540,12 +11123,22 @@ local ok, err = pcall(function()
 				return
 			end
 			local now = os.clock()
-			if now - (tonumber(getgenv()._SB2MobCacheAt) or 0) < 0.35 then
+			local diving = getgenv().SB2DiveFarmOn == true or isToggleOn('DiveFarm')
+			local prof = getKillauraProfile()
+			local cacheGap = diving and (prof.diveMobCacheGap or 0.14) or (prof.mobCacheGap or 0.35)
+			if now - (tonumber(getgenv()._SB2MobCacheAt) or 0) < cacheGap then
 				return
 			end
 			getgenv()._SB2MobCacheAt = now
 			local stacked = looksClientStacked(origin)
 			for _, mob in mobsRoot:GetChildren() do
+				-- Streaming silhouettes (no Entity yet) — not corpses; don't wipe cache.
+				if not mob:FindFirstChild('Entity') then
+					if mob:GetAttribute('Died') == true then
+						mobRealCF[mob] = nil
+					end
+					continue
+				end
 				if isDeadMob(mob) then
 					mobRealCF[mob] = nil
 					continue
@@ -10792,6 +11385,24 @@ local ok, err = pcall(function()
 			return true
 		end
 
+		CombatBox:AddToggle('CombatLiteLoad', {
+			Text = 'Lite killaura (less lag)',
+			Default = false,
+			Tooltip = 'ON: throttled killaura (fewer hits + Attack remotes). OFF: full reach/rates (Cursed Threefold Slash, etc.).',
+		}):OnChanged(function(value)
+			getgenv().SB2CombatLiteLoad = value == true
+		end)
+		task.defer(function()
+			if type(getgenv().SB2SyncCombatLiteLoad) == 'function' then
+				pcall(getgenv().SB2SyncCombatLiteLoad)
+			end
+		end)
+		task.delay(0.6, function()
+			if type(getgenv().SB2SyncCombatLiteLoad) == 'function' then
+				pcall(getgenv().SB2SyncCombatLiteLoad)
+			end
+		end)
+
 		CombatBox:AddToggle('AutoAttack', {
 			Text = 'Killaura',
 			Tooltip = 'DealDamage/Attack nearby (and streamed) mobs. Pair with Auto skill for UseSkill + skill-tagged hits.',
@@ -10808,9 +11419,12 @@ local ok, err = pcall(function()
 			if not value then
 				return
 			end
-			if getgenv().SB2WaveDefensePlace == true and getgenv()._SB2WdAuraTold ~= true then
+			if isWdHubKillauraCap() and getgenv()._SB2WdAuraTold ~= true then
 				getgenv()._SB2WdAuraTold = true
-				Library:Notify('Wave Defense: killaura capped (6 nearby / slower) so the server does not choke', 7)
+				Library:Notify('Wave Defense hub: killaura capped (6 nearby / slower) so the server does not choke', 7)
+			elseif not combatLiteLoadEnabled() and getgenv()._SB2AggressiveAuraTold ~= true then
+				getgenv()._SB2AggressiveAuraTold = true
+				Library:Notify('Full killaura — enable Lite killaura if combat lags', 7)
 			end
 
 			-- Hive follow/stack already warps. Pinning in place here froze alts
@@ -10876,11 +11490,13 @@ local ok, err = pcall(function()
 					return
 				end
 
+				local prof = getKillauraProfile()
 				local now = os.clock()
 				local hitLivesRush = wantHitLivesRush()
-				local tickGap = hitLivesRush and HIT_LIVES_ATTACK_INTERVAL or AUTO_ATTACK_INTERVAL
+				local tickGap = hitLivesRush and prof.hitLivesInterval or prof.interval
 				if usingEventFarmSkills() then
-					tickGap = math.max(tickGap, 0.18)
+					local diveFloor = combatLiteLoadEnabled() and 0.24 or 0.16
+					tickGap = math.max(tickGap, diveFloor)
 				end
 				if now - lastTick < tickGap then
 					return
@@ -10906,15 +11522,15 @@ local ok, err = pcall(function()
 					return
 				end
 
-				local aaRange = AUTO_ATTACK_RANGE
-				local skillRange = SKILL_HIT_RANGE
+				local aaRange = prof.autoAttackRange or AUTO_ATTACK_RANGE
+				local skillRange = prof.skillHitRange or SKILL_HIT_RANGE
 				if usingEventFarmSkills() then
 					aaRange = math.max(aaRange, SKILL_HIT_RANGE)
 					skillRange = SKILL_HIT_RANGE
 				end
-				local delay = AUTO_ATTACK_DELAY
+				local delay = prof.delay or 0.1
 				if hitLivesRush then
-					delay = math.max(HIT_LIVES_MIN_DELAY, delay)
+					delay = math.max(prof.hitLivesMinDelay or delay, delay)
 				end
 				local origin = myPart.Position
 				local selectedSkill = getActiveWeaponSkillName()
@@ -10926,8 +11542,8 @@ local ok, err = pcall(function()
 					and getgenv().SB2SkillActiveUntil > time()
 				-- Prefer attack CFrame (handles client-stack). Unlimited stream wasted the
 				-- tick on far elites the server refuses to damage — bosses felt unhittable.
-				local range = AURA_DAMAGE_RANGE
-				local bossRange = BOSS_DAMAGE_RANGE
+				local range = prof.auraRange
+				local bossRange = prof.bossRange
 				local rangeSq = range * range
 				local bossRangeSq = bossRange * bossRange
 				local attackAllStreamed = false
@@ -10993,14 +11609,15 @@ local ok, err = pcall(function()
 
 				local mobList = {}
 				for _, mob in mobsRoot:GetChildren() do
-					if isDeadMob(mob) or shouldSkipMob(mob) then
+					if not isKillauraTargetMob(mob) then
 						continue
 					end
 					local root = getMobRoot(mob)
 					if not root then
 						continue
 					end
-					local priority = isPriorityMob(mob)
+					local rewardChest = isRewardChestMob(mob)
+					local priority = rewardChest or isPriorityMob(mob)
 					local atkCF = getMobAttackCFrame(mob, root, origin)
 					local dx = atkCF.Position.X - origin.X
 					local dz = atkCF.Position.Z - origin.Z
@@ -11024,11 +11641,15 @@ local ok, err = pcall(function()
 						hitLives = mobUsesHitLives(mob),
 						boss = isBossMob(mob),
 						priority = priority,
+						rewardChest = rewardChest,
 						special = mobHasSpecialAttribute(mob),
 						distSq = distSq,
 					}
 				end
 				table.sort(mobList, function(a, b)
+					if a.rewardChest ~= b.rewardChest then
+						return a.rewardChest
+					end
 					if a.hitLives ~= b.hitLives then
 						return a.hitLives
 					end
@@ -11045,10 +11666,10 @@ local ok, err = pcall(function()
 				end)
 
 				local attacked = 0
-				local maxAttacks = MAX_ATTACKS_PER_TICK
+				local maxAttacks = prof.maxAttacks
 				local diving = usingEventFarmSkills()
 				if diving then
-					maxAttacks = 4
+					maxAttacks = math.min(maxAttacks, combatLiteLoadEnabled() and 3 or 6)
 				end
 				for _, entry in ipairs(mobList) do
 					local mob = entry.mob
@@ -11057,7 +11678,7 @@ local ok, err = pcall(function()
 					end
 					local strikes = 1
 					if not diving and (entry.priority or entry.boss or entry.hitLives) then
-						strikes = BOSS_HITS_PER_TICK
+						strikes = prof.bossHits
 					end
 					for _ = 1, strikes do
 						if attacked >= maxAttacks then
@@ -11077,7 +11698,7 @@ local ok, err = pcall(function()
 							else
 								-- Bosses: brief per-strike spacing only.
 								onCooldown[mob] = true
-								task.delay(BOSS_ATTACK_DELAY, function()
+								task.delay(prof.bossDelay or 0.06, function()
 									onCooldown[mob] = nil
 								end)
 							end
@@ -11230,6 +11851,8 @@ local ok, err = pcall(function()
 			getgenv().SB2SoftReloadHadAutoSkill = nil
 		end)
 
+		-- Event dive owns ~140 locals — nested IIFE so Combat/Farm UI chunk stays under Luau's 200-register cap.
+		;(function()
 		-- Event dive: Bluu XZ-follow on the mob's *real* CF, Y under the floor
 		-- Vacuum-style event farm: hover ABOVE the attack CFrame (real CF when
 		-- client-stacked) and DealDamage from the dive loop — same idea as
@@ -11244,7 +11867,8 @@ local ok, err = pcall(function()
 		local DIVE_BOSS_Y_THRESH = 5
 		local DIVE_WRITE_DEBOUNCE = 1.5
 		local DIVE_PLATFORM_STEP = 5.5 -- one tier down (lower ledge CTF range)
-		local DIVE_APPROACH_MAX = 380 -- was 120 — aborting here never teleported, felt "stuck"
+		local DIVE_APPROACH_MAX = 720 -- event arenas are large; old cap caused bad-engage / no target
+		local DIVE_CIRCLE_DODGE = true
 		local DIVE_SURFACE_FLEE_SEC = 4 -- fight/heal on surface before under-map when already low HP
 		local DIVE_ARRIVE = 7
 		local DIVE_SNAP_DIST = 8
@@ -11280,6 +11904,15 @@ local ok, err = pcall(function()
 				skipBosses = true,
 				label = 'F5 labyrinth',
 			},
+			[540240728] = { -- The Between (event dungeon)
+				minX = -2500,
+				maxX = 2500,
+				minZ = -2500,
+				maxZ = 2500,
+				edgeInset = 40,
+				skipBosses = false,
+				label = 'The Between',
+			},
 		}
 		local DIVE_FIRE_HEAL = 0.65
 		local DIVE_RETARGET_SEC = 0.35
@@ -11295,7 +11928,30 @@ local ok, err = pcall(function()
 		local DIVE_SAFE_FLAT = 48
 		local DIVE_SAFE_Y = 36
 		local DIVE_MAX_BLINK = 42
+		local DIVE_LONG_HOP = 350 -- AutoFarm-style approach blinks (mobs + roam)
 		local DIVE_DODGE_RING = 38
+
+		local function diveVecHop(from, to, hop)
+			if typeof(from) ~= 'Vector3' or typeof(to) ~= 'Vector3' then
+				return typeof(to) == 'Vector3' and to or from
+			end
+			hop = tonumber(hop) or 0
+			if hop <= 0 then
+				return to
+			end
+			local delta = to - from
+			local dist = delta.Magnitude
+			if dist < 1e-4 then
+				return to
+			end
+			hop = math.min(hop, math.max(0, dist - 1))
+			if hop <= 0 then
+				return to
+			end
+			local y = typeof(to.Y) == 'number' and to.Y or from.Y
+			local flat = from + (delta / dist) * hop
+			return Vector3.new(flat.X, y, flat.Z)
+		end
 
 		local function diveOptNumber(name, fallback)
 			local opt = Options and Options[name]
@@ -11362,8 +12018,17 @@ local ok, err = pcall(function()
 			return nil
 		end
 
+		-- Only snap XZ to DarknerOrb on the event pad (see getgenv helper — no extra locals).
+		getgenv().SB2DiveUseDarknerOrbLock = function()
+			-- F5 only — new dungeons (The Between) must not XZ-snap to a distant orb.
+			local zfn = getgenv().SB2DiveFarmZone
+			local zone = type(zfn) == 'function' and zfn() or nil
+			return zone ~= nil and zone.bossSpawnName == 'ASpawnBoss'
+		end
+
 		local function diveLockDarknerOrbXZ(pos)
-			if typeof(pos) ~= 'Vector3' then
+			local useOrb = getgenv().SB2DiveUseDarknerOrbLock
+			if typeof(pos) ~= 'Vector3' or type(useOrb) ~= 'function' or not useOrb() then
 				return pos
 			end
 			local orb = diveDarknerOrbPos()
@@ -11476,8 +12141,85 @@ local ok, err = pcall(function()
 			return models
 		end
 
+		-- F5 needs full noclip; The Between / overworld keep HRP solid vs floor.
+		getgenv().SB2DiveKeepFloorCollide = function()
+			if getgenv().SB2DiveUnderMap == true then
+				return false
+			end
+			local zfn = getgenv().SB2DiveFarmZone
+			local zone = type(zfn) == 'function' and zfn() or nil
+			if zone and zone.bossSpawnName == 'ASpawnBoss' then
+				return false
+			end
+			return true
+		end
+
+		getgenv().SB2DiveIsMobChase = function(hrp)
+			if getgenv().SB2DiveUnderMap == true or not hrp then
+				return false
+			end
+			local chase = getgenv().SB2DiveChaseGoal
+			if typeof(chase) ~= 'Vector3' then
+				return false
+			end
+			return (chase - hrp.Position).Magnitude > 9
+		end
+
+		getgenv().SB2DiveShouldHoverAnchor = function(hrp)
+			if getgenv().SB2DiveUnderMap == true or getgenv().SB2DiveFarmOn ~= true then
+				return false
+			end
+			local approachUntil = tonumber(getgenv().SB2DiveApproachUntil) or 0
+			if os.clock() < approachUntil then
+				return false
+			end
+			if typeof(getgenv().SB2DiveChaseGoal) == 'Vector3' then
+				return false
+			end
+			local unanchorUntil = tonumber(getgenv().SB2DiveHoverUnanchorUntil) or 0
+			if os.clock() < unanchorUntil then
+				return false
+			end
+			return true
+		end
+
+		getgenv().SB2DiveBlinkTeleport = function(hrp, dest, lookAt)
+			if not hrp or not hrp.Parent or typeof(dest) ~= 'Vector3' then
+				return false
+			end
+			pcall(function()
+				hrp.Anchored = false
+				hrp.AssemblyLinearVelocity = Vector3.zero
+				hrp.AssemblyAngularVelocity = Vector3.zero
+				local cf = CFrame.new(dest)
+				if typeof(lookAt) == 'Vector3' then
+					local flat = Vector3.new(lookAt.X - dest.X, 0, lookAt.Z - dest.Z)
+					if flat.Magnitude >= 0.08 then
+						cf = CFrame.lookAt(dest, dest + flat.Unit)
+					end
+				end
+				hrp.CFrame = cf
+				local lv = getgenv().SB2DiveLinVel
+				if lv then
+					lv.VectorVelocity = Vector3.zero
+					local ensure = getgenv().SB2DiveEnsureFlyAttachment
+					local att = type(ensure) == 'function' and ensure(hrp) or nil
+					lv.Attachment0 = att
+					lv.MaxForce = 1e5
+					lv.Parent = hrp
+				end
+				diveHoldPos = dest
+				getgenv().SB2DivePinPos = dest
+				lastDiveWritePos = dest
+			end)
+			getgenv().SB2DiveHoverUnanchorUntil = os.clock() + 0.25
+			return true
+		end
+
 		local function diveApplyNoclipParts()
 			ensureDiveNoclipGroup()
+			local keepFloorFn = getgenv().SB2DiveKeepFloorCollide
+			local keepFloor = type(keepFloorFn) == 'function' and keepFloorFn()
 			for _, model in ipairs(diveNoclipModels()) do
 				for _, child in ipairs(model:GetDescendants()) do
 					if child:IsA('BasePart') then
@@ -11508,12 +12250,26 @@ local ok, err = pcall(function()
 								diveNoclipGroups[child] = 'Players'
 							end
 						end
-						child.CanCollide = false
-						child.CanTouch = false
-						-- Do NOT set Massless — breaks assembly + CharacterItems welds.
-						pcall(function()
-							child.CollisionGroup = DIVE_NOCLIP_GROUP
-						end)
+						local isCore = child.Name == 'HumanoidRootPart'
+							or child.Name == 'UpperTorso'
+							or child.Name == 'LowerTorso'
+							or child.Name == 'Torso'
+							or child.Name == 'Head'
+						if keepFloor and isCore then
+							child.CanCollide = true
+							child.CanTouch = true
+							pcall(function()
+								local group = diveNoclipGroups[child] or 'Players'
+								child.CollisionGroup = group
+							end)
+						else
+							child.CanCollide = false
+							child.CanTouch = false
+							-- Do NOT set Massless — breaks assembly + CharacterItems welds.
+							pcall(function()
+								child.CollisionGroup = DIVE_NOCLIP_GROUP
+							end)
+						end
 					end
 				end
 			end
@@ -11565,8 +12321,7 @@ local ok, err = pcall(function()
 					hum.PlatformStand = true -- fly: no ground physics
 					hum.AutoRotate = false
 					pcall(function()
-						-- Freefall + upright lock: Physics state is what tumbles you.
-						hum:ChangeState(Enum.HumanoidStateType.Freefall)
+						hum:ChangeState(Enum.HumanoidStateType.Flying)
 					end)
 				else
 					hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
@@ -11588,6 +12343,8 @@ local ok, err = pcall(function()
 		local diveNukeUntil = 0
 		local diveNukeCooldownUntil = 0
 		local diveNukeAnchor = nil
+		local diveAoeGoal = nil
+		local diveCircleScanAt = 0
 		local diveYaw = (((tonumber(LocalPlayer.UserId) or 1) % 12) / 12) * math.pi * 2
 		local lastDiveStreamAt = 0
 		local lastDiveStreamPos = nil
@@ -12098,9 +12855,10 @@ local ok, err = pcall(function()
 						diveSetFlyHumanoid(true)
 						local hrp = getMyBringPart()
 						if hrp then
-							-- Keep unanchored so the model + weapon welds stay one assembly.
-							hrp.Anchored = false
+							local anchorFn = getgenv().SB2DiveShouldHoverAnchor
+							hrp.Anchored = type(anchorFn) == 'function' and anchorFn(hrp) or false
 							hrp.AssemblyAngularVelocity = Vector3.zero
+							diveReassertHold()
 							local clampVel = getgenv().SB2DiveClampVelocity
 							if type(clampVel) == 'function' then
 								clampVel(hrp, 'stepped')
@@ -12119,6 +12877,7 @@ local ok, err = pcall(function()
 							return
 						end
 						diveApplyNoclipParts()
+						diveReassertHold()
 						local hrp = getMyBringPart()
 						if hrp then
 							local clampVel = getgenv().SB2DiveClampVelocity
@@ -12130,6 +12889,10 @@ local ok, err = pcall(function()
 						end
 					end)
 					getgenv().SB2DiveNoclipHeartbeat = diveNoclipHeartbeat
+				end
+				local ensureHold = getgenv().SB2DiveEnsureHoldConns
+				if type(ensureHold) == 'function' then
+					ensureHold()
 				end
 				local hrp = getMyBringPart()
 				if hrp then
@@ -12210,7 +12973,7 @@ local ok, err = pcall(function()
 		end
 
 		local function diveWriteCFrame(hrp, dest, lookAt, writeOpts)
-			if not hrp or not dest then
+			if not hrp or typeof(dest) ~= 'Vector3' then
 				return false
 			end
 			writeOpts = writeOpts or {}
@@ -12240,7 +13003,9 @@ local ok, err = pcall(function()
 				--#endregion
 				return false
 			end
-			if not writeOpts.force and typeof(lastDiveWritePos) == 'Vector3' then
+			local diving = getgenv().SB2DiveFarmOn == true or isToggleOn('DiveFarm')
+			-- Vacuum hover: debouncing CFrame writes let gravity win between ticks.
+			if not writeOpts.force and not diving and typeof(lastDiveWritePos) == 'Vector3' then
 				if (dest - lastDiveWritePos).Magnitude < DIVE_WRITE_DEBOUNCE then
 					return true
 				end
@@ -12254,7 +13019,9 @@ local ok, err = pcall(function()
 					yMax = anchor.Y + 6,
 				})
 			end
-			diveHoldPos = nil
+			if getgenv().SB2DiveUnderMap ~= true and writeOpts.allowVerticalVel ~= true then
+				dest = diveClampAboveArena(dest, fromPos.Y)
+			end
 			pcall(function()
 				local look = lookAt or (diveStickRoot and diveStickRoot.Parent and diveStickRoot.Position)
 				local cf
@@ -12276,7 +13043,19 @@ local ok, err = pcall(function()
 				end
 				-- HRP only — PivotTo desyncs CharacterItems welds (stuck-to-weapon).
 				local toDest = dest - hrp.Position
-				hrp.Anchored = false
+				local underMap = getgenv().SB2DiveUnderMap == true
+				local chaseFn = getgenv().SB2DiveIsMobChase
+				local mobChase = type(chaseFn) == 'function' and chaseFn(hrp)
+				local blink = writeOpts.unanchor == true or mobChase or toDest.Magnitude > 14
+				local anchorFn = getgenv().SB2DiveShouldHoverAnchor
+				if blink or underMap or not (type(anchorFn) == 'function' and anchorFn(hrp)) then
+					if blink then
+						getgenv().SB2DiveHoverUnanchorUntil = os.clock() + 0.2
+					end
+					hrp.Anchored = false
+				else
+					hrp.Anchored = true
+				end
 				hrp.CFrame = cf
 				if toDest.Magnitude > 2 then
 					local speed = math.clamp(toDest.Magnitude * 10, 50, DIVE_TWEEN_SPEED * 1.25)
@@ -12290,8 +13069,7 @@ local ok, err = pcall(function()
 				else
 					-- Soft hover hold (anti-grav), not a hard freeze.
 					diveLinVel.VectorVelocity = Vector3.zero
-					local v = hrp.AssemblyLinearVelocity
-					hrp.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+					hrp.AssemblyLinearVelocity = Vector3.zero
 				end
 				diveLinVel.MaxForce = 1e5
 				if diveLinVel.Parent ~= hrp then
@@ -12340,12 +13118,23 @@ local ok, err = pcall(function()
 				end
 				--#endregion
 				lastDiveWritePos = dest
+				diveHoldPos = dest
+				if diving and (writeOpts.hoverHold == true or writeOpts.blink ~= true) then
+					local anchorFn = getgenv().SB2DiveShouldHoverAnchor
+					if type(anchorFn) == 'function' and anchorFn(hrp) then
+						hrp.Anchored = true
+						hrp.AssemblyLinearVelocity = Vector3.zero
+					elseif not underMap and writeOpts.unanchor ~= true then
+						hrp.Anchored = false
+					end
+				end
 			end)
 			return true
 		end
 
 		local function diveSnapXZToDarknerOrb(hrp)
-			if not hrp or getgenv().SB2DiveFarmOn ~= true then
+			local useOrb = getgenv().SB2DiveUseDarknerOrbLock
+			if not hrp or getgenv().SB2DiveFarmOn ~= true or type(useOrb) ~= 'function' or not useOrb() then
 				return false
 			end
 			local orb = diveDarknerOrbPos()
@@ -12400,15 +13189,85 @@ local ok, err = pcall(function()
 		end
 
 		local function diveReassertHold()
-			if not getgenv().SB2DiveFarmOn or not diveHoldPos then
+			if not getgenv().SB2DiveFarmOn and not isToggleOn('DiveFarm') then
 				return
 			end
 			local hrp = getMyBringPart()
 			if not hrp then
 				return
 			end
-			if (hrp.Position - diveHoldPos).Magnitude > 1.25 then
-				diveWriteCFrame(hrp, diveHoldPos)
+			local approachUntil = tonumber(getgenv().SB2DiveApproachUntil) or 0
+			if os.clock() < approachUntil or typeof(getgenv().SB2DiveChaseGoal) == 'Vector3' then
+				pcall(function()
+					hrp.Anchored = false
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					if diveLinVel then
+						diveLinVel.VectorVelocity = Vector3.zero
+					end
+				end)
+				-- Never pin to idle hover while long-hop approach is driving toward a mob.
+				return
+			end
+			local pin = diveHoldPos
+			if typeof(pin) ~= 'Vector3' then
+				pin = getgenv().SB2DivePinPos
+			end
+			-- Toggle-on / roam gap: no write yet but fly hooks are live — pin here or gravity wins.
+			if typeof(pin) ~= 'Vector3' then
+				pin = hrp.Position
+				diveHoldPos = pin
+				getgenv().SB2DivePinPos = pin
+			end
+			local underMap = getgenv().SB2DiveUnderMap == true
+			local pos = hrp.Position
+			if not underMap then
+				pin = diveClampAboveArena(pin, pos.Y)
+				local groundY = divePreviewGroundY(pos)
+				if typeof(groundY) == 'number' then
+					local floorMin = groundY + 2
+					if pin.Y < floorMin then
+						pin = Vector3.new(pin.X, floorMin, pin.Z)
+					end
+					if pos.Y < floorMin - 0.75 then
+						pin = Vector3.new(pos.X, math.max(pin.Y, floorMin + 4), pos.Z)
+					end
+				end
+				diveHoldPos = pin
+				getgenv().SB2DivePinPos = pin
+			end
+			local drift = pos - pin
+			local vy = hrp.AssemblyLinearVelocity.Y
+			local floorRef = tonumber(getgenv().SB2DiveFloorRefY)
+			local fallFloor = floorRef and (pos.Y < floorRef - 0.5) or false
+			local fallingThrough = not underMap
+				and (fallFloor or pos.Y < pin.Y - 2 or pos.Y < -25 or vy < -1)
+			local anchorFn = getgenv().SB2DiveShouldHoverAnchor
+			local shouldAnchor = type(anchorFn) == 'function' and anchorFn(hrp)
+			if not fallingThrough and drift.Magnitude < 1.25 and shouldAnchor then
+				pcall(function()
+					hrp.Anchored = true
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+					if diveLinVel then
+						diveLinVel.VectorVelocity = Vector3.zero
+					end
+				end)
+				return
+			end
+			local needsSnap = fallingThrough or drift.Magnitude > 2.5 or math.abs(drift.Y) > 0.4
+			if needsSnap then
+				local blinkFn = getgenv().SB2DiveBlinkTeleport
+				if drift.Magnitude > 18 and type(blinkFn) == 'function' then
+					blinkFn(hrp, pin, pin)
+				else
+					diveWriteCFrame(hrp, pin, nil, { force = true, noClamp = true, hoverHold = true })
+				end
+			end
+			if shouldAnchor and not fallingThrough then
+				pcall(function()
+					hrp.Anchored = true
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				end)
 			end
 		end
 
@@ -12426,6 +13285,7 @@ local ok, err = pcall(function()
 				diveStepConn = RunService.Stepped:Connect(diveReassertHold)
 			end
 		end
+		getgenv().SB2DiveEnsureHoldConns = diveEnsureHoldConns
 
 		local function diveClearHoldConns()
 			diveHoldPos = nil
@@ -12502,10 +13362,10 @@ local ok, err = pcall(function()
 			if typeof(cached) == 'CFrame' then
 				return cached.Position
 			end
-			if origin and looksClientStacked(origin) then
+			if origin and looksClientStacked(origin) and not mobRealCF[mob] then
 				local dx = root.Position.X - origin.X
 				local dz = root.Position.Z - origin.Z
-				if (dx * dx + dz * dz) < (40 * 40) then
+				if (dx * dx + dz * dz) < (8 * 8) then
 					return nil
 				end
 			end
@@ -12580,8 +13440,9 @@ local ok, err = pcall(function()
 			local aura = math.max(80, AUTO_ATTACK_RANGE)
 			local auraSq = aura * aura
 			local tagged = 0
+			local auraCap = (getKillauraProfile().maxAttacks or 8)
 			for _, mob in ipairs(mobsRoot:GetChildren()) do
-				if tagged >= MAX_ATTACKS_PER_TICK then
+				if tagged >= auraCap then
 					break
 				end
 				if mob == diveStickMob or isDeadMob(mob) or shouldSkipMob(mob) then
@@ -12615,14 +13476,11 @@ local ok, err = pcall(function()
 			return clusterPos.Y + above
 		end
 
-		local function divePreviewGroundY(xzPos)
+		getgenv().SB2DivePreviewGroundY = function(xzPos)
 			local hrp = getMyBringPart()
 			local base = typeof(xzPos) == 'Vector3' and xzPos
 				or (hrp and hrp.Position)
 				or Vector3.zero
-			local ref = diveReturnCF or getgenv().SB2DiveReturnCF
-			local startY = (typeof(ref) == 'CFrame' and ref.Position.Y) or base.Y
-			local origin = Vector3.new(base.X, startY + 40, base.Z)
 			local params = RaycastParams.new()
 			params.FilterType = Enum.RaycastFilterType.Exclude
 			local exclude = {}
@@ -12633,23 +13491,90 @@ local ok, err = pcall(function()
 			if LocalPlayer.Character then
 				exclude[#exclude + 1] = LocalPlayer.Character
 			end
-			params.FilterDescendantsInstances = exclude
-			local hit = workspace:Raycast(origin, Vector3.new(0, -600, 0), params)
-			if hit then
-				return hit.Position.Y
+			local items = workspace:FindFirstChild('CharacterItems')
+			if items then
+				exclude[#exclude + 1] = items
 			end
-			return startY
+			params.FilterDescendantsInstances = exclude
+			-- Cast from near the feet — old ref.Y+40 picked ceilings (The Between).
+			local bestY = nil
+			for _, lift in ipairs({ 6, 22, 55 }) do
+				local origin = Vector3.new(base.X, base.Y + lift, base.Z)
+				local hit = workspace:Raycast(origin, Vector3.new(0, -900, 0), params)
+				if hit and hit.Position.Y <= base.Y + 20 then
+					if not bestY or hit.Position.Y > bestY then
+						bestY = hit.Position.Y
+					end
+				end
+			end
+			if bestY then
+				return bestY
+			end
+			local floorRef = tonumber(getgenv().SB2DiveFloorRefY)
+			if floorRef then
+				return floorRef
+			end
+			local ref = diveReturnCF or getgenv().SB2DiveReturnCF
+			if typeof(ref) == 'CFrame' then
+				return ref.Position.Y
+			end
+			return base.Y
+		end
+
+		local function divePreviewGroundY(xzPos)
+			local fn = getgenv().SB2DivePreviewGroundY
+			if type(fn) == 'function' then
+				local y = fn(xzPos)
+				if typeof(y) == 'number' then
+					return y
+				end
+			end
+			local hrp = getMyBringPart()
+			if hrp then
+				return hrp.Position.Y
+			end
+			if typeof(xzPos) == 'Vector3' then
+				return xzPos.Y
+			end
+			return 0
+		end
+
+		-- Noclip fly: never let fight/hover Y sit below streamed arena floor (void fall).
+		local function diveClampAboveArena(pos, refY)
+			if getgenv().SB2DiveUnderMap == true then
+				return pos
+			end
+			if typeof(pos) ~= 'Vector3' then
+				return pos
+			end
+			local groundY = divePreviewGroundY(pos)
+			if typeof(groundY) ~= 'number' then
+				return pos
+			end
+			local floorRef = tonumber(getgenv().SB2DiveFloorRefY)
+			local minY = groundY + 2
+			if floorRef and floorRef + 1 > minY then
+				minY = floorRef + 1
+			end
+			if typeof(refY) == 'number' and refY > minY + 80 then
+				minY = groundY + 2
+			end
+			if pos.Y < minY then
+				return Vector3.new(pos.X, minY, pos.Z)
+			end
+			return pos
 		end
 
 		local function diveIdleHoverPos(hrp)
 			if not hrp then
 				return nil
 			end
-			local groundY = divePreviewGroundY(hrp.Position)
+			local groundY = divePreviewGroundY(hrp.Position) or hrp.Position.Y
 			-- Always prefer the Farm height slider for live preview / testing
 			-- (even when Auto farm height is ON — combat still uses auto).
 			local above = math.clamp(diveOptNumber('DiveFarmHeight', diveFarmAboveStuds()), -40, 80)
-			local pos = Vector3.new(hrp.Position.X, groundY + math.max(above, 0), hrp.Position.Z)
+			local hoverY = groundY + math.max(above, 4)
+			local pos = Vector3.new(hrp.Position.X, hoverY, hrp.Position.Z)
 			if diveFarmZone() and not divePosInFarmZone(hrp.Position) then
 				local center = diveFarmZoneCenter(groundY + math.max(above, 0))
 				if center then
@@ -12684,6 +13609,10 @@ local ok, err = pcall(function()
 			end
 			-- Prefer standing on ground so disable returns to floor, not mid-air hover.
 			local groundY = divePreviewGroundY(hrp.Position)
+			if typeof(groundY) ~= 'number' then
+				groundY = hrp.Position.Y - 1
+			end
+			getgenv().SB2DiveFloorRefY = groundY
 			local pos = Vector3.new(hrp.Position.X, groundY + 3, hrp.Position.Z)
 			diveReturnCF = CFrame.new(pos) * (hrp.CFrame - hrp.CFrame.Position)
 			getgenv().SB2DiveReturnCF = diveReturnCF
@@ -12917,7 +13846,8 @@ local ok, err = pcall(function()
 			end
 			local y = math.clamp(goalPos.Y, yMin, yMax)
 			local orb = diveDarknerOrbPos()
-			if orb then
+			local useOrb = getgenv().SB2DiveUseDarknerOrbLock
+			if orb and type(useOrb) == 'function' and useOrb() then
 				return Vector3.new(orb.X, y, orb.Z)
 			end
 			local dx = goalPos.X - anchor.X
@@ -12931,9 +13861,62 @@ local ok, err = pcall(function()
 			return Vector3.new(anchor.X + dx, y, anchor.Z + dz)
 		end
 
-		local function diveFarmZone()
-			return DIVE_FARM_ZONES[game.PlaceId]
+		local function readNextPlaceId()
+			local fn = getgenv().SB2ReadNextPlaceId
+			if type(fn) == 'function' then
+				return fn()
+			end
+			return tonumber(workspace:GetAttribute('NextPlaceId'))
 		end
+
+		local function refreshDiveSessionFlags()
+			local nextId = readNextPlaceId()
+			if nextId == 540240728 or nextId == 580239979 then
+				getgenv().SB2WaveDefensePlace = true
+			end
+			local wdMode = workspace:GetAttribute('WaveDefenseMode')
+			if type(wdMode) == 'string' and wdMode ~= '' then
+				getgenv().SB2WaveDefensePlace = true
+			end
+		end
+
+		local function diveEffectivePlaceId()
+			refreshDiveSessionFlags()
+			local pid = game.PlaceId
+			if DIVE_FARM_ZONES[pid] then
+				return pid
+			end
+			local nextId = readNextPlaceId()
+			if nextId and DIVE_FARM_ZONES[nextId] then
+				return nextId
+			end
+			if getgenv().SB2WaveDefensePlace == true then
+				if nextId == 540240728 or nextId == 580239979 then
+					return nextId
+				end
+				local wdMode = workspace:GetAttribute('WaveDefenseMode')
+				if type(wdMode) == 'string' and wdMode ~= '' and DIVE_FARM_ZONES[540240728] then
+					return 540240728
+				end
+			end
+			for _, attrName in ipairs({ 'EventPlaceId', 'TargetPlaceId', 'DungeonPlaceId' }) do
+				local raw = workspace:GetAttribute(attrName)
+				if raw ~= nil then
+					local id = tonumber(raw)
+					if id and DIVE_FARM_ZONES[id] then
+						return id
+					end
+				end
+			end
+			return pid
+		end
+
+		local function diveFarmZone()
+			return DIVE_FARM_ZONES[diveEffectivePlaceId()]
+		end
+
+		getgenv().SB2DiveFarmZone = diveFarmZone
+		getgenv().SB2DiveEffectivePlaceId = diveEffectivePlaceId
 
 		local function diveBossSpawnPos(zone)
 			zone = zone or diveFarmZone()
@@ -13083,9 +14066,14 @@ local ok, err = pcall(function()
 					return true
 				end
 				local root = getMobRoot(mob)
-				local pos = root and root.Position
+				local hrp = getMyBringPart()
+				local origin = hrp and hrp.Position
+				local pos = root and (diveMobWorldPos(mob, root, origin) or root.Position)
 				if typeof(pos) == 'Vector3' and not divePosInFarmZone(pos) then
-					return true
+					-- T-pose silhouettes often sit at wrong XZ until Entity streams in.
+					if mob:FindFirstChild('Entity') then
+						return true
+					end
 				end
 			end
 			return false
@@ -13112,15 +14100,12 @@ local ok, err = pcall(function()
 				if not root then
 					continue
 				end
-				local pos = diveMobWorldPos(mob, root, origin)
-				if not pos then
-					continue
-				end
+				local pos = diveMobWorldPos(mob, root, origin) or root.Position
 				-- While stacked with no real cache yet, root.Position is your feet — skip.
 				if stacked and origin and not mobRealCF[mob] then
 					local dx = pos.X - origin.X
 					local dz = pos.Z - origin.Z
-					if (dx * dx + dz * dz) < (35 * 35) then
+					if (dx * dx + dz * dz) < (12 * 12) then
 						continue
 					end
 				end
@@ -13553,6 +14538,173 @@ local ok, err = pcall(function()
 		end
 
 		-- True only on real FillIn growth (anim/fresh names caused constant under↔up Y flicker).
+		-- Floor circle / telegraph discs (DungeonLootr-style gap find), throttled for Event dive.
+		local function diveAvoidFloorCircles(hrpPos, fightY, cluster)
+			if not DIVE_CIRCLE_DODGE or typeof(hrpPos) ~= 'Vector3' then
+				return nil
+			end
+			local now = os.clock()
+			if (now - diveCircleScanAt) < 0.12 then
+				if typeof(diveAoeGoal) == 'Vector3' and not getgenv().SB2DiveUnderMap then
+					return Vector3.new(diveAoeGoal.X, fightY or diveAoeGoal.Y, diveAoeGoal.Z)
+				end
+				return nil
+			end
+			diveCircleScanAt = now
+			local char = getMyCharacterModel() or LocalPlayer.Character
+			if not char then
+				return nil
+			end
+			local me = hrpPos
+			local circles = {}
+			local function namedDanger(n)
+				n = string.lower(tostring(n or ''))
+				return string.find(n, 'circle', 1, true)
+					or string.find(n, 'ring', 1, true)
+					or string.find(n, 'aoe', 1, true)
+					or string.find(n, 'telegraph', 1, true)
+					or string.find(n, 'indicator', 1, true)
+					or string.find(n, 'strike', 1, true)
+					or string.find(n, 'smash', 1, true)
+					or string.find(n, 'slam', 1, true)
+					or string.find(n, 'meteor', 1, true)
+					or string.find(n, 'nova', 1, true)
+			end
+			local function underTelegraphFolder(part)
+				local p = part
+				for _ = 1, 8 do
+					if not p then
+						return false
+					end
+					local n = string.lower(tostring(p.Name or ''))
+					if n == 'spelltelegraphs' or n == 'telegraphs' or n == 'telegraph_root' then
+						return true
+					end
+					p = p.Parent
+				end
+				return false
+			end
+			local function addPart(part)
+				if not part or not part:IsA('BasePart') or part == workspace.Terrain then
+					return
+				end
+				if part.Transparency >= 0.97 then
+					return
+				end
+				if part:IsDescendantOf(char) then
+					return
+				end
+				local pos, size = part.Position, part.Size
+				local dx, dz = pos.X - me.X, pos.Z - me.Z
+				if (dx * dx + dz * dz) > 14400 then
+					return
+				end
+				local col = part.Color
+				local hot = col
+					and (
+						(col.R > 0.5 and col.G < 0.5 and col.B < 0.48)
+						or (col.R > 0.65 and col.G > 0.35 and col.B < 0.4)
+					)
+				local sx, sy, sz = size.X, size.Y, size.Z
+				local thick = math.min(sx, sy, sz)
+				local span = math.max(sx, sy, sz)
+				local flat = thick < 8 and span >= 5
+				local neon = part.Material == Enum.Material.Neon or part.Material == Enum.Material.ForceField
+				local short = #tostring(part.Name) <= 2
+				local disc = flat and (hot or neon or (not part.CanCollide and span >= 8))
+				if not (namedDanger(part.Name) or underTelegraphFolder(part) or (hot and flat) or (short and disc)) then
+					return
+				end
+				circles[#circles + 1] = { x = pos.X, z = pos.Z, r = math.max(6, span * 0.5) }
+			end
+			local function scan(root, cap)
+				if not root then
+					return
+				end
+				local n = 0
+				for _, d in ipairs(root:GetDescendants()) do
+					n += 1
+					if n > (cap or 120) then
+						break
+					end
+					addPart(d)
+				end
+			end
+			local st = workspace:FindFirstChild('SpellTelegraphs')
+			if st then
+				for _, ch in ipairs(st:GetChildren()) do
+					addPart(ch)
+				end
+				scan(st, 180)
+			end
+			scan(workspace:FindFirstChild('Effects'), 140)
+			scan(workspace:FindFirstChild('Indicator'), 80)
+			scan(workspace:FindFirstChild('Lines'), 60)
+			scan(workspace:FindFirstChild('Circle'), 40)
+			if #circles == 0 then
+				diveAoeGoal = nil
+				return nil
+			end
+			local function covered(x, z, pad)
+				pad = pad or 3
+				for i = 1, #circles do
+					local c = circles[i]
+					local fx, fz = x - c.x, z - c.z
+					local need = c.r + pad
+					if fx * fx + fz * fz < need * need then
+						return true
+					end
+				end
+				return false
+			end
+			if not covered(me.X, me.Z, 2.5) then
+				diveAoeGoal = nil
+				return nil
+			end
+			local best, bestD = nil, nil
+			local function tryAt(x, z)
+				if covered(x, z, 3) then
+					return
+				end
+				local dx, dz = x - me.X, z - me.Z
+				local d = dx * dx + dz * dz
+				if not bestD or d < bestD then
+					bestD = d
+					best = Vector3.new(x, fightY or me.Y, z)
+				end
+			end
+			for i = 1, #circles do
+				local c = circles[i]
+				local fx, fz = me.X - c.x, me.Z - c.z
+				local mag = math.sqrt(fx * fx + fz * fz)
+				local ux, uz = 1, 0
+				if mag > 0.4 then
+					ux, uz = fx / mag, fz / mag
+				end
+				tryAt(c.x + ux * (c.r + 8), c.z + uz * (c.r + 8))
+			end
+			for i = 0, 15 do
+				local a = i / 16 * math.pi * 2
+				tryAt(me.X + math.cos(a) * 14, me.Z + math.sin(a) * 14)
+				tryAt(me.X + math.cos(a) * 24, me.Z + math.sin(a) * 24)
+			end
+			if not best then
+				return nil
+			end
+			if cluster then
+				best = clampNearCluster(best, cluster, DIVE_DODGE_RING)
+			end
+			if typeof(diveAoeGoal) == 'Vector3' and not covered(diveAoeGoal.X, diveAoeGoal.Z, 2.5) then
+				local dx = diveAoeGoal.X - best.X
+				local dz = diveAoeGoal.Z - best.Z
+				if (dx * dx + dz * dz) < 36 then
+					best = Vector3.new(diveAoeGoal.X, fightY or diveAoeGoal.Y, diveAoeGoal.Z)
+				end
+			end
+			diveAoeGoal = best
+			return best
+		end
+
 		local function detectBossNukeCharge(origin, stickMob)
 			local nearNuke = stickMob and isNukeBossMob(stickMob)
 			if not nearNuke then
@@ -13673,6 +14825,11 @@ local ok, err = pcall(function()
 			local wasOn = getgenv().SB2DiveFarmOn == true
 			getgenv().SB2DiveFarmOn = false
 			getgenv().SB2DiveUnderMap = false
+			getgenv().SB2DivePinPos = nil
+			getgenv().SB2DiveChaseGoal = nil
+			getgenv().SB2DiveFloorRefY = nil
+			getgenv().SB2DiveHoverUnanchorUntil = 0
+			getgenv().SB2DiveApproachUntil = 0
 			diveFleeing = false
 			diveNukeUntil = 0
 			diveNukeCooldownUntil = 0
@@ -13800,15 +14957,29 @@ local ok, err = pcall(function()
 			diveNukeCooldownUntil = 0
 			diveNukeAnchor = nil
 			diveShouldRetarget = true
-			diveClearHoldConns()
+			getgenv().SB2DiveChaseGoal = nil
 			pcall(function()
 				if Toggles.CombatAnchor and Toggles.CombatAnchor.Value then
 					Toggles.CombatAnchor:SetValue(false)
 				end
 			end)
 			pcall(function()
-				if Toggles.AutoAttack and Toggles.AutoAttack.SetValue and not Toggles.AutoAttack.Value then
-					Toggles.AutoAttack:SetValue(true)
+				local t = Toggles.AutoAttack
+				if not t or type(t.SetValue) ~= 'function' then
+					return
+				end
+				-- Toggle can stay true while Heartbeat conn died — vacuum then never hits.
+				if t.Value == true and getgenv().SB2AutoAttackConn == nil then
+					t:SetValue(false)
+				end
+				if not t.Value then
+					t:SetValue(true)
+				else
+					getgenv().SB2AutoAttackOn = true
+					if getgenv().SB2AutoAttackConn == nil then
+						t:SetValue(false)
+						t:SetValue(true)
+					end
 				end
 			end)
 			applyCombatAnchor(false)
@@ -13825,21 +14996,36 @@ local ok, err = pcall(function()
 					syncMultiSkillOrder('SB2SupportSkillOrder', farmMap)
 				end
 			end)
-			setDiveNoclip(true)
 			pcall(function()
 				local hrp = getMyBringPart()
 				if hrp then
 					hrp.Anchored = false
 					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+					local pin = diveIdleHoverPos(hrp) or hrp.Position
+					pin = diveClampAboveArena(pin, hrp.Position.Y)
+					diveHoldPos = pin
+					getgenv().SB2DivePinPos = pin
+				end
+			end)
+			diveEnsureHoldConns()
+			setDiveNoclip(true)
+			pcall(function()
+				local hrp = getMyBringPart()
+				local pin = diveHoldPos or (hrp and diveIdleHoverPos(hrp))
+				if hrp and typeof(pin) == 'Vector3' then
+					diveWriteCFrame(hrp, pin, nil, { force = true, noClamp = true })
 				end
 			end)
 			local DIVE_KILL_TIMEOUT = 45
-			local DIVE_LONG_HOP = 350
 			local DIVE_SKIP_FINISHED = 1.0
 			local diveFinishedUntil = setmetatable({}, { __mode = 'k' })
 
 			local function stillActive()
-				if getgenv().SB2DiveFarmOn ~= true or not isToggleOn('DiveFarm') then
+				if not isToggleOn('DiveFarm') then
+					return false
+				end
+				if getgenv().SB2DiveFarmOn ~= true then
 					return false
 				end
 				-- Bail if a stranger is already here (join race / missed PlayerAdded).
@@ -14087,6 +15273,11 @@ local ok, err = pcall(function()
 				if typeof(engagePlaneY) == 'number' and floorY > engagePlaneY + 2.5 then
 					-- Mob above your ledge: still hover relative to the mob, not dig under.
 					fightY = topY + above
+				end
+				local arenaProbe = Vector3.new(hitPos.X, engagePlaneY or fightY, hitPos.Z)
+				local arenaGround = divePreviewGroundY(arenaProbe)
+				if typeof(arenaGround) == 'number' and fightY < arenaGround + 2 then
+					fightY = arenaGround + math.max(above, 4)
 				end
 				--#region agent log
 				pcall(function()
@@ -14339,6 +15530,120 @@ local ok, err = pcall(function()
 				return Vector3.new(worldPos.X, worldPos.Y + h, worldPos.Z)
 			end
 
+			local function diveSnapTo(hrp, goalPos, lookAt, clampOpts)
+				if not hrp or not goalPos then
+					return false
+				end
+				goalPos = diveClampGoal(goalPos, diveLastCluster or hrp.Position, clampOpts or {
+					yRef = goalPos.Y,
+					yMin = goalPos.Y - 8,
+					yMax = goalPos.Y + 8,
+				})
+				diveWriteCFrame(hrp, goalPos, lookAt, {
+					force = true,
+					clamp = clampOpts,
+				})
+				diveHoldPos = goalPos
+				getgenv().SB2DivePinPos = goalPos
+				pcall(function()
+					lockReplicationFocus(getMyCharacterModel())
+				end)
+				task.wait(0.04)
+				return true
+			end
+
+			-- Long-hop blink chain toward mobs (AutoFarm-style), without dumping on floor feet.
+			local function diveApproachMob(hrp, goalPos, lookAt, clampOpts)
+				if not stillActive() or not hrp or not hrp.Parent or typeof(goalPos) ~= 'Vector3' then
+					return false
+				end
+				clampOpts = clampOpts or {
+					yRef = goalPos.Y,
+					yMin = goalPos.Y - 12,
+					yMax = goalPos.Y + 12,
+					flatMax = DIVE_LONG_HOP,
+				}
+				getgenv().SB2DiveChaseGoal = goalPos
+				diveFocusStream(goalPos)
+				diveLastCluster = Vector3.new(goalPos.X, goalPos.Y, goalPos.Z)
+				diveHoldPos = goalPos
+				getgenv().SB2DivePinPos = goalPos
+				local deadline = os.clock() + 14
+				getgenv().SB2DiveApproachUntil = deadline
+				-- Immediate first hop so hold/reassert does not pin at idle before the loop runs.
+				local dist0 = (hrp.Position - goalPos).Magnitude
+				if dist0 > DIVE_ARRIVE + 2 then
+					local hop0 = math.min(DIVE_LONG_HOP, math.max(12, dist0 - DIVE_ARRIVE))
+					local step0 = diveVecHop(hrp.Position, goalPos, hop0)
+					if typeof(goalPos.Y) == 'number' then
+						step0 = Vector3.new(step0.X, goalPos.Y, step0.Z)
+					end
+					diveLastCluster = step0
+					local blinkFn0 = getgenv().SB2DiveBlinkTeleport
+					if type(blinkFn0) == 'function' then
+						blinkFn0(hrp, step0, lookAt)
+					else
+						diveWriteCFrame(hrp, step0, lookAt, { force = true, noClamp = true, unanchor = true })
+					end
+				end
+				while stillActive()
+					and hrp.Parent
+					and (hrp.Position - goalPos).Magnitude > DIVE_ARRIVE + 2
+					and os.clock() < deadline
+				do
+					diveHoldPos = goalPos
+					getgenv().SB2DivePinPos = goalPos
+					getgenv().SB2DiveChaseGoal = goalPos
+					local dist = (hrp.Position - goalPos).Magnitude
+					if dist > 52 then
+						local pos = hrp.Position
+						local delta = goalPos - pos
+						if delta.Magnitude < 0.05 then
+							break
+						end
+						local hop = math.min(DIVE_LONG_HOP, dist - DIVE_ARRIVE)
+						if hop < 12 then
+							hop = math.min(dist, 48)
+						end
+						local stepGoal = diveVecHop(pos, goalPos, hop)
+						if typeof(goalPos.Y) == 'number' then
+							stepGoal = Vector3.new(stepGoal.X, goalPos.Y, stepGoal.Z)
+						end
+						diveLastCluster = stepGoal
+						local blinkFn = getgenv().SB2DiveBlinkTeleport
+						if type(blinkFn) == 'function' then
+							blinkFn(hrp, stepGoal, lookAt)
+						else
+							diveWriteCFrame(hrp, stepGoal, lookAt, { force = true, noClamp = true, unanchor = true })
+						end
+						diveDebug('approach-blink', string.format('d=%.0f hop=%.0f', dist, hop))
+						pcall(function()
+							lockReplicationFocus(getMyCharacterModel())
+						end)
+						task.wait(0.05)
+					else
+						diveStepToward(
+							hrp,
+							goalPos,
+							DIVE_TWEEN_SPEED * DIVE_APPROACH_SPEED_MULT,
+							lookAt,
+							clampOpts
+						)
+					end
+				end
+				getgenv().SB2DiveChaseGoal = nil
+				getgenv().SB2DiveApproachUntil = 0
+				if stillActive() and hrp.Parent and (hrp.Position - goalPos).Magnitude > DIVE_ARRIVE then
+					local blinkFn = getgenv().SB2DiveBlinkTeleport
+					if type(blinkFn) == 'function' then
+						blinkFn(hrp, goalPos, lookAt)
+					else
+						diveSnapTo(hrp, goalPos, lookAt, clampOpts)
+					end
+				end
+				return stillActive() and hrp.Parent ~= nil
+			end
+
 			-- Same motion model as AutoFarm stepToward / tweenTo (keepGoalY).
 			local function diveStepToward(hrp, goalPos, speed, lookAt, clampOpts)
 				if not hrp or not hrp.Parent or not goalPos then
@@ -14439,7 +15744,12 @@ local ok, err = pcall(function()
 				if not mobsRoot or not fromPos then
 					return nil
 				end
+				refreshDiveSessionFlags()
 				pcall(cacheMobRealPositions, fromPos)
+				local maxFlat = 520
+				if diveFarmZone() or getgenv().SB2WaveDefensePlace == true then
+					maxFlat = 1600
+				end
 				local best, bestD = nil, math.huge
 				local bestSil, bestSilD, bestSilPos = nil, math.huge, nil
 				for _, mob in ipairs(mobsRoot:GetChildren()) do
@@ -14462,7 +15772,7 @@ local ok, err = pcall(function()
 					local dz = cand.Z - fromPos.Z
 					local flat = math.sqrt(dx * dx + dz * dz)
 					-- Prefer flat XZ so Y-fling doesn't hide nearby silhouettes.
-					if flat > 520 then
+					if flat > maxFlat then
 						continue
 					end
 					-- On zoned floors, prefer targets deeper in the pad (away from boss).
@@ -14491,9 +15801,10 @@ local ok, err = pcall(function()
 					return best
 				end
 				-- No streamed mobs: push replication toward nearest silhouette.
-				if bestSilPos then
+				if bestSil then
 					getgenv().SB2DivePendingStream = bestSilPos
-					diveDebug('wait-stream', string.format('%s d=%.0f', tostring(bestSil and bestSil.Name), bestSilD))
+					diveDebug('stream-chase', string.format('%s d=%.0f', tostring(bestSil.Name), bestSilD))
+					return bestSil
 				end
 				return nil
 			end
@@ -14531,12 +15842,48 @@ local ok, err = pcall(function()
 				if not diveMobStreamed(mob) then
 					local root0 = getMobRoot(mob)
 					local streamPos = root0 and root0.Position or nil
+					local pending = getgenv().SB2DivePendingStream
+					if typeof(pending) == 'Vector3' then
+						streamPos = pending
+					end
 					if streamPos then
 						diveFocusStream(streamPos)
-						diveDebug('unstreamed', mob.Name)
 					end
-					diveFinishedUntil[mob] = os.clock() + 0.45
-					return
+					diveDebug('unstreamed-chase', mob.Name)
+					local chaseUntil = os.clock() + 10
+					while stillActive() and mob.Parent and not diveMobStreamed(mob) and os.clock() < chaseUntil do
+						myPart = getMyBringPart()
+						if not myPart then
+							task.wait(0.12)
+							continue
+						end
+						setDiveNoclip(true)
+						local r = getMobRoot(mob)
+						local goal = streamPos
+						if r then
+							goal = diveMobWorldPos(mob, r, myPart.Position) or r.Position
+							streamPos = goal
+						end
+						if typeof(goal) == 'Vector3' then
+							local hover = diveFarmAboveStuds()
+							local approach = Vector3.new(goal.X, goal.Y + math.max(hover, 4), goal.Z)
+							diveApproachMob(myPart, approach, approach, {
+								yRef = approach.Y,
+								yMin = approach.Y - 12,
+								yMax = approach.Y + 8,
+								flatMax = DIVE_LONG_HOP,
+							})
+						end
+						task.wait(0.05)
+					end
+					if not stillActive() or not mob.Parent then
+						return
+					end
+					if not diveMobStreamed(mob) then
+						diveFinishedUntil[mob] = os.clock() + 0.35
+						diveDebug('stream-timeout', mob.Name)
+						return
+					end
 				end
 				local root = getMobRoot(mob)
 				if not root then
@@ -14558,14 +15905,6 @@ local ok, err = pcall(function()
 				if typeof(cached) == 'CFrame' then
 					engagePos = cached.Position
 				end
-				local function flatNear(p, maxD)
-					if not p then
-						return false
-					end
-					local dx = p.X - myPart.Position.X
-					local dz = p.Z - myPart.Position.Z
-					return math.sqrt(dx * dx + dz * dz) < (maxD or 320)
-				end
 				local function withGoodY(p)
 					if not p then
 						return nil
@@ -14583,40 +15922,18 @@ local ok, err = pcall(function()
 					end
 					return Vector3.new(p.X, y, p.Z)
 				end
-				if hitFocus and flatNear(hitFocus) then
-					engagePos = withGoodY(hitFocus)
-					mobRealCF[mob] = CFrame.new(engagePos)
-				elseif flatNear(root.Position) then
-					engagePos = withGoodY(root.Position)
-					mobRealCF[mob] = CFrame.new(engagePos)
-				elseif typeof(cached) == 'CFrame' and flatNear(cached.Position) then
-					engagePos = withGoodY(cached.Position)
-				elseif flatNear(atkCF.Position) then
-					engagePos = withGoodY(atkCF.Position)
-					mobRealCF[mob] = CFrame.new(engagePos)
-				else
-					-- Last resort: flatten XZ to arena Y (client BB/Y-fling used to
-					-- soft-skip forever — nickb910 stuck on "target" only).
+				do
 					local raw = root.Position
-					if typeof(cached) == 'CFrame' then
-						raw = cached.Position
-					elseif hitFocus then
+					if hitFocus then
 						raw = hitFocus
+					elseif typeof(cached) == 'CFrame' then
+						raw = cached.Position
 					elseif atkCF then
 						raw = atkCF.Position
 					end
-					local flat = Vector3.new(raw.X, myPart.Position.Y, raw.Z)
-					local dx = flat.X - myPart.Position.X
-					local dz = flat.Z - myPart.Position.Z
-					local flatDist = math.sqrt(dx * dx + dz * dz)
-					if flatDist < 120 and flatDist > 0.5 then
-						engagePos = flat
+					engagePos = withGoodY(raw)
+					if engagePos then
 						mobRealCF[mob] = CFrame.new(engagePos)
-						diveDebug('engage-flat', string.format('%s d=%.0f', mob.Name, flatDist))
-					else
-						diveDebug('bad-engage', string.format('%s flat=%.0f', mob.Name, flatDist))
-						diveFinishedUntil[mob] = os.clock() + 0.6
-						return
 					end
 				end
 				local lockedPos = engagePos
@@ -14674,8 +15991,9 @@ local ok, err = pcall(function()
 				local pullIn = false
 				local approachY = stickyFightY
 				local approach = Vector3.new(lockedPos.X, approachY, lockedPos.Z)
+				local useOrb = getgenv().SB2DiveUseDarknerOrbLock
 				local darknerOrb = diveDarknerOrbPos()
-				if darknerOrb then
+				if darknerOrb and type(useOrb) == 'function' and useOrb() then
 					lockedPos = Vector3.new(darknerOrb.X, lockedPos.Y, darknerOrb.Z)
 					approach = Vector3.new(darknerOrb.X, approachY, darknerOrb.Z)
 					diveLastCluster = lockedPos
@@ -14685,36 +16003,26 @@ local ok, err = pcall(function()
 					yRef = approachY,
 					yMin = approachY - 12,
 					yMax = approachY + (isBigBossEngage and 10 or 2),
+					flatMax = DIVE_LONG_HOP,
 				}
 				local dist0 = (myPart.Position - approach).Magnitude
 				diveDebug(
 					'approach',
 					string.format(
-						'd=%.0f blade=%.1f approachY=%.0f fightY=%.0f feet=%.0f',
+						'd=%.0f blade=%.1f approachY=%.0f fightY=%.0f feet=%.0f zone=%s',
 						dist0,
 						diveGetWeaponReach(),
 						approachY,
 						stickyFightY,
-						lockedFloorY
+						lockedFloorY,
+						tostring(diveFarmZone() and diveFarmZone().label or 'none')
 					)
 				)
-				if not darknerOrb and dist0 > DIVE_APPROACH_MAX then
-					diveDebug('skip-far', string.format('d=%.0f', dist0))
-					diveFinishedUntil[mob] = os.clock() + 0.6
-					return
-				end
-				-- Tween to mob — no upfront snap (was dumping you on arena floor at feet).
+				diveHoldPos = approach
+				getgenv().SB2DivePinPos = approach
 				if dist0 > DIVE_ARRIVE + 2 then
-					local approachT0 = os.clock()
-					while stillActive() and (myPart.Position - approach).Magnitude > DIVE_ARRIVE + 2 do
-						if os.clock() - approachT0 > 12 then
-							diveDebug('approach-timeout', string.format('d=%.0f', (myPart.Position - approach).Magnitude))
-							break
-						end
-						diveStepToward(myPart, approach, DIVE_TWEEN_SPEED * DIVE_APPROACH_SPEED_MULT, lookFocus, approachClamp)
-					end
-				end
-				if stillActive() and (myPart.Position - approach).Magnitude > DIVE_ARRIVE then
+					diveApproachMob(myPart, approach, lookFocus, approachClamp)
+				elseif stillActive() and (myPart.Position - approach).Magnitude > DIVE_ARRIVE then
 					diveSnapTo(myPart, approach, lookFocus, approachClamp)
 				end
 				if not stillActive() then
@@ -14754,7 +16062,9 @@ local ok, err = pcall(function()
 					yMin = stickyFightY - 2,
 					yMax = stickyFightY + 2,
 				}
-				diveClearHoldConns()
+				diveCancelTween()
+				diveEnsureHoldConns()
+				setDiveNoclip(true)
 
 				while stillActive()
 					and mob.Parent
@@ -14796,7 +16106,12 @@ local ok, err = pcall(function()
 						local dz = myPart.Position.Z - lockedPos.Z
 						local flatOff = math.sqrt(dx * dx + dz * dz)
 						local yOff = math.abs(myPart.Position.Y - stickyFightY)
-						if flatOff > DIVE_SAFE_FLAT + 20 or yOff > DIVE_SAFE_Y + 50 then
+						local zoneFlat = DIVE_SAFE_FLAT + 20
+						local farmZone = diveFarmZone()
+						if farmZone and not farmZone.bossSpawnName then
+							zoneFlat = math.max(zoneFlat, 380)
+						end
+						if flatOff > zoneFlat or yOff > DIVE_SAFE_Y + 50 then
 							voidRescues += 1
 							if voidRescues > 3 then
 								diveDebug('void-abort', string.format('flat=%.0f y=%.0f', flatOff, yOff))
@@ -14865,9 +16180,24 @@ local ok, err = pcall(function()
 						and os.clock() < diveMendingUntil
 						and typeof(diveMendingPos) == 'Vector3'
 
-					-- Side dodges — nuke bosses only (workspace telegraph scan is expensive).
+					-- Floor circle telegraphs (DungeonLootr-style) + beam/charge dodge.
 					local dodgePos, needDash, dashDir, chargeThreat = nil, false, nil, false
-					if isNukeBossMob(mob) and not fleeing and not underNow then
+					if not fleeing and not underNow then
+						local circleGoal = diveAvoidFloorCircles(myPart.Position, stickyFightY, lockedPos)
+						if circleGoal and (os.clock() - lastDodgeAt) >= 0.28 then
+							local flatMove = Vector3.new(
+								circleGoal.X - myPart.Position.X,
+								0,
+								circleGoal.Z - myPart.Position.Z
+							)
+							if flatMove.Magnitude >= 4 then
+								lastDodgeAt = os.clock()
+								diveDebug('circle-dodge', string.format('d=%.0f', flatMove.Magnitude))
+								diveStepToward(myPart, circleGoal, DIVE_TWEEN_SPEED * 1.2, lockedPos, fightClamp)
+								task.wait(0.05)
+								continue
+							end
+						end
 						dodgePos, needDash, dashDir, chargeThreat = telegraphEscape(myPart.Position, lockedPos)
 					end
 					if chargeThreat and isNukeBossMob(mob) and os.clock() >= diveNukeCooldownUntil then
@@ -15097,6 +16427,10 @@ local ok, err = pcall(function()
 						stickPos = Vector3.new(orbNow.X, stickyFightY, orbNow.Z)
 						lockedPos = Vector3.new(orbNow.X, lockedPos.Y, orbNow.Z)
 					end
+					if typeof(stickPos) == 'Vector3' then
+						diveHoldPos = stickPos
+						getgenv().SB2DivePinPos = stickPos
+					end
 					if not aimAt then
 						aimAt = bossAim or lockedPos
 					end
@@ -15106,13 +16440,11 @@ local ok, err = pcall(function()
 					if not orbNow and distNow > runawayLimit then
 						runawayStrikes += 1
 						diveDebug('runaway-snap', string.format('d=%.0f', distNow))
-						local safe = diveClampGoal(
-							Vector3.new(lockedPos.X, stickyFightY, lockedPos.Z),
-							lockedPos,
-							{ yRef = stickyFightY, yPad = 6 }
-						)
-						diveStepToward(myPart, safe, DIVE_TWEEN_SPEED * DIVE_DASH_CHASE_MULT, lockedPos)
-						if runawayStrikes >= 3 then
+						local chaseGoal = Vector3.new(stickPos.X, stickyFightY, stickPos.Z)
+						getgenv().SB2DiveChaseGoal = chaseGoal
+						diveApproachMob(myPart, chaseGoal, aimAt or lockedPos, fightClamp)
+						getgenv().SB2DiveChaseGoal = nil
+						if runawayStrikes >= 4 then
 							break
 						end
 					else
@@ -15121,30 +16453,31 @@ local ok, err = pcall(function()
 						local moveThresh = isBigBoss and (headTopHold and DIVE_BOSS_MOVE_THRESH or 4) or 2
 						local yThresh = isBigBoss and (headTopHold and DIVE_BOSS_Y_THRESH or 3.5) or 3.5
 						if posDelta > moveThresh or math.abs(myPart.Position.Y - stickyFightY) > yThresh then
-							local chaseSpeed = DIVE_TWEEN_SPEED
-							if isBigBoss and distNow > 14 then
-								chaseSpeed = DIVE_TWEEN_SPEED * DIVE_DASH_CHASE_MULT
-							end
-							if orbNow or (isBigBoss and distNow > DIVE_DASH_BLINK_FLAT) then
+							if distNow > 52 and not orbNow then
+								getgenv().SB2DiveChaseGoal = stickPos
+								diveApproachMob(myPart, stickPos, aimAt, fightClamp)
+								getgenv().SB2DiveChaseGoal = nil
+							elseif orbNow or (isBigBoss and distNow > DIVE_DASH_BLINK_FLAT) then
 								diveWriteCFrame(myPart, stickPos, aimAt, {
 									clamp = fightClamp,
 									force = true,
 									noClamp = orbNow ~= nil,
 								})
 							else
+								local chaseSpeed = DIVE_TWEEN_SPEED
+								if isBigBoss and distNow > 14 then
+									chaseSpeed = DIVE_TWEEN_SPEED * DIVE_DASH_CHASE_MULT
+								end
 								diveStepToward(myPart, stickPos, chaseSpeed, aimAt, fightClamp)
 							end
 							lastMoveAt = os.clock()
 						else
-							-- On station: kill residual vertical velocity so we don't bob.
-							pcall(function()
-								local v = myPart.AssemblyLinearVelocity
-								myPart.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
-								if diveLinVel then
-									local lv = diveLinVel.VectorVelocity
-									diveLinVel.VectorVelocity = Vector3.new(lv.X, 0, lv.Z)
-								end
-							end)
+							-- Noclip + PlatformStand: zeroing Y vel once per tick is not enough — pin CFrame.
+							diveWriteCFrame(myPart, stickPos, aimAt, {
+								clamp = fightClamp,
+								force = true,
+								noClamp = orbNow ~= nil,
+							})
 						end
 						--#region agent log
 						do
@@ -15213,17 +16546,8 @@ local ok, err = pcall(function()
 							pcall(castSelectedSupportSkill)
 							pcall(ensureSkillWindow)
 						end
-						if not isToggleOn('AutoAttack') then
-							local attackName = nil
-							local untilT = getgenv().SB2SkillActiveUntil
-							if isToggleOn('AutoSkill')
-								and type(untilT) == 'number'
-								and untilT > time()
-							then
-								attackName = getgenv().SB2SkillActiveName
-							end
-							pcall(fireMobAttack, mob, attackName)
-						end
+						-- Always hit from the dive loop — killaura alone is unreliable while hovering.
+						pcall(divePulseAttack)
 					end
 
 					if os.clock() - lastDbgAt > 1 then
@@ -15258,8 +16582,28 @@ local ok, err = pcall(function()
 				if not mobsRoot then
 					return
 				end
-				diveMobsFolderConns[#diveMobsFolderConns + 1] = mobsRoot.ChildAdded:Connect(function()
-					-- New stream-ins are picked by the nearest loop automatically.
+				diveMobsFolderConns[#diveMobsFolderConns + 1] = mobsRoot.ChildAdded:Connect(function(child)
+					if not getgenv().SB2DiveFarmOn or not child or not child:IsA('Instance') then
+						return
+					end
+					task.spawn(function()
+						local deadline = os.clock() + 8
+						while getgenv().SB2DiveFarmOn and child.Parent and os.clock() < deadline do
+							if diveMobStreamed(child) and not diveMobGone(child) and not diveShouldSkipMob(child) then
+								local hrp = getMyBringPart()
+								local root = getMobRoot(child)
+								if hrp and root then
+									getgenv()._SB2MobCacheAt = 0
+									pcall(cacheMobRealPositions, hrp.Position)
+									if not mobRealCF[child] then
+										mobRealCF[child] = root.CFrame
+									end
+								end
+								break
+							end
+							task.wait(0.08)
+						end
+					end)
 				end)
 				diveMobsFolderConns[#diveMobsFolderConns + 1] = mobsRoot.ChildRemoved:Connect(function(child)
 					if child == diveStickMob then
@@ -15303,7 +16647,7 @@ local ok, err = pcall(function()
 				end
 			end)
 
-			getgenv().SB2DiveFarmThread = task.spawn(function()
+			local farmThread = task.spawn(function()
 				local ok, err = pcall(function()
 					Library:Notify('Event vacuum — AutoFarm-style tween → kill → next', 5)
 					local reach0 = diveGetWeaponReach()
@@ -15312,6 +16656,7 @@ local ok, err = pcall(function()
 						4
 					)
 					while stillActive() do
+						refreshDiveSessionFlags()
 						local myPart = getMyBringPart()
 						if not myPart then
 							task.wait(0.15)
@@ -15321,6 +16666,9 @@ local ok, err = pcall(function()
 							task.wait(0.2)
 							continue
 						end
+						pcall(function()
+							myPart.Anchored = false
+						end)
 						setDiveNoclip(true)
 						pcall(diveSnapXZToDarknerOrb, myPart)
 						pcall(cacheMobRealPositions, myPart.Position)
@@ -15355,19 +16703,28 @@ local ok, err = pcall(function()
 							end
 							if dest then
 								dest = diveLockDarknerOrbXZ(dest)
-								pcall(function()
-									diveStepToward(myPart, dest, DIVE_TWEEN_SPEED, dest, {
-										yRef = dest.Y,
-										yMin = dest.Y - 4,
-										yMax = dest.Y + 4,
-										noClamp = true,
-									})
-								end)
-								if math.abs(myPart.Position.Y - dest.Y) > 2 then
+								dest = diveClampAboveArena(dest, myPart.Position.Y)
+								diveEnsureHoldConns()
+								local roamDist = (myPart.Position - dest).Magnitude
+								if roamDist > 55 then
 									pcall(function()
-										local cf = CFrame.new(dest) * (myPart.CFrame - myPart.CFrame.Position)
-										myPart.CFrame = cf
-										diveLinVel.VectorVelocity = Vector3.zero
+										diveApproachMob(myPart, dest, dest, {
+											yRef = dest.Y,
+											yMin = dest.Y - 6,
+											yMax = dest.Y + 6,
+											flatMax = DIVE_LONG_HOP,
+										})
+									end)
+								else
+									diveHoldPos = dest
+									getgenv().SB2DivePinPos = dest
+									pcall(function()
+										diveStepToward(myPart, dest, DIVE_TWEEN_SPEED, dest, {
+											yRef = dest.Y,
+											yMin = dest.Y - 4,
+											yMax = dest.Y + 4,
+											noClamp = true,
+										})
 									end)
 								end
 							end
@@ -15400,21 +16757,40 @@ local ok, err = pcall(function()
 					getgenv().SB2DiveFarmThread = nil
 				end
 			end)
+			getgenv().SB2DiveFarmThread = farmThread
+		end
 
-			-- If the farm thread dies while the toggle stays on, restart it.
+		local diveFarmWatchdogStarted = false
+		local function ensureDiveFarmWatchdog()
+			if diveFarmWatchdogStarted then
+				return
+			end
+			diveFarmWatchdogStarted = true
 			task.spawn(function()
 				while getgenv()[CONFIG.GenvKey] do
-					task.wait(1.25)
-					if not isToggleOn('DiveFarm') then
-						continue
-					end
-					if getgenv().SB2DiveFarmOn == true and getgenv().SB2DiveFarmThread == nil then
-						diveDebug('thread-restart', 'DiveFarmOn but thread nil')
-						pcall(startDiveFarm)
+					task.wait(1.1)
+					if isToggleOn('DiveFarm') then
+						if getgenv().SB2DiveFarmThread == nil or getgenv().SB2DiveFarmConn == nil then
+							pcall(startDiveFarm)
+						end
+					elseif getgenv().SB2DiveFarmOn == true then
+						pcall(stopDiveFarm, true)
 					end
 				end
 			end)
 		end
+
+		local function syncDiveFarmFromToggle()
+			if isToggleOn('DiveFarm') then
+				if getgenv().SB2DiveFarmThread == nil or getgenv().SB2DiveFarmConn == nil then
+					pcall(startDiveFarm)
+				end
+			elseif getgenv().SB2DiveFarmOn == true then
+				pcall(stopDiveFarm, true)
+			end
+		end
+
+		ensureDiveFarmWatchdog()
 
 		FarmBox:AddToggle('DiveFarm', {
 			Text = 'Event vacuum (hover farm)',
@@ -15425,7 +16801,16 @@ local ok, err = pcall(function()
 				stopDiveFarm(true)
 				return
 			end
-			startDiveFarm()
+			local okStart, startErr = pcall(startDiveFarm)
+			if not okStart then
+				warn('[PlayerTools] Event vacuum start failed: ', startErr)
+				pcall(function()
+					if Toggles.DiveFarm and Toggles.DiveFarm.SetValue then
+						Toggles.DiveFarm:SetValue(false)
+					end
+				end)
+				return
+			end
 			pcall(function()
 				local zone = diveFarmZone()
 				if zone then
@@ -15438,6 +16823,9 @@ local ok, err = pcall(function()
 				end
 			end)
 		end)
+		task.defer(syncDiveFarmFromToggle)
+		task.delay(0.75, syncDiveFarmFromToggle)
+		task.delay(2.5, syncDiveFarmFromToggle)
 
 		FarmBox:AddToggle('DiveAutoHeight', {
 			Text = 'Auto farm height',
@@ -15584,7 +16972,7 @@ local ok, err = pcall(function()
 			local farmSupport = getAvailableSupportSkills()
 			local farmHeal = getAvailableHealSkills()
 			local defaultFarmSkill = '(none)'
-			for _, pick in ipairs({ 'Water Blast', 'Downward Smash', 'Everfrost Strike' }) do
+			for _, pick in ipairs({ 'Cursed Three Fold Slash', 'Water Blast', 'Downward Smash', 'Everfrost Strike' }) do
 				if table.find(farmSkills, pick) then
 					defaultFarmSkill = pick
 					break
@@ -15658,6 +17046,11 @@ local ok, err = pcall(function()
 			end)
 		end
 
+		getgenv().SB2StopDiveFarm = stopDiveFarm
+		getgenv().SB2StartDiveFarm = startDiveFarm
+		getgenv().SB2SyncDiveFarmFromToggle = syncDiveFarmFromToggle
+		end)()
+
 		-- Anyone else joining → kill combat so you don't look blatant / get Secure API'd.
 		local function stopCombatRuntime(unanchor)
 			getgenv().SB2AutoAttackOn = false
@@ -15700,8 +17093,9 @@ local ok, err = pcall(function()
 			end)
 			if getgenv().SB2DiveFarmOn or diveWasOn then
 				pcall(function()
-					if type(stopDiveFarm) == 'function' then
-						stopDiveFarm(true)
+					local stopDive = getgenv().SB2StopDiveFarm
+					if type(stopDive) == 'function' then
+						stopDive(true)
 					else
 						getgenv().SB2DiveFarmOn = false
 						local th = getgenv().SB2DiveFarmThread
@@ -16000,6 +17394,25 @@ local ok, err = pcall(function()
 					pcall(function()
 						if type(applyCombatAnchor) == 'function' then
 							applyCombatAnchor(false)
+						end
+					end)
+				end
+				if enabled then
+					task.defer(function()
+						local atk = Toggles.AutoAttack
+						if type(atk) == 'table' and atk.Value == true and getgenv().SB2AutoAttackConn == nil then
+							pcall(function()
+								atk:SetValue(false)
+							end)
+							task.wait(0.05)
+							pcall(function()
+								atk:SetValue(true)
+							end)
+						end
+						if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
+							if type(getgenv().SB2SyncDiveFarmFromToggle) == 'function' then
+								pcall(getgenv().SB2SyncDiveFarmFromToggle)
+							end
 						end
 					end)
 				end
@@ -22485,6 +23898,52 @@ local ok, err = pcall(function()
 			return upgrade < maxUp, rarity, upgrade, maxUp
 		end
 
+		local function itemNumericId(item)
+			if not item then
+				return nil
+			end
+			if item:IsA('ValueBase') then
+				return item.Value
+			end
+			local id = item:FindFirstChild('ID') or item:FindFirstChild('Id')
+			if id and id:IsA('ValueBase') then
+				return id.Value
+			end
+			return nil
+		end
+
+		local function getEquippedInventoryItems()
+			local idSet = {}
+			local equip = getLiveProfile() and getLiveProfile():FindFirstChild('Equip')
+			if equip then
+				for _, slot in ipairs(equip:GetChildren()) do
+					if slot:IsA('ValueBase') then
+						local v = slot.Value
+						if type(v) == 'number' and v ~= 0 then
+							idSet[v] = true
+						elseif type(v) == 'string' and v ~= '' and v ~= '0' then
+							idSet[v] = true
+							idSet[tonumber(v) or v] = true
+						end
+					end
+				end
+			end
+			local out = {}
+			local seen = {}
+			local inv = getInventoryFolder()
+			if not inv then
+				return out
+			end
+			for _, item in ipairs(inv:GetChildren()) do
+				local id = itemNumericId(item)
+				if id ~= nil and idSet[id] and not seen[id] then
+					seen[id] = true
+					out[#out + 1] = item
+				end
+			end
+			return out
+		end
+
 		local function getUpgradeItemQuery()
 			local q = Options.RemoteUpgradeQuery and Options.RemoteUpgradeQuery.Value or ''
 			if type(q) ~= 'string' then
@@ -22904,6 +24363,117 @@ local ok, err = pcall(function()
 			Library:Notify('Closed upgrade / result overlays')
 		end)
 
+		local function readUpgradeBatchSizes()
+			local batchCrystals = Options.RemoteUpgradeCrystals and Options.RemoteUpgradeCrystals.Value or 25
+			batchCrystals = math.clamp(math.floor(tonumber(batchCrystals) or 25), 1, 25)
+			local batchScrolls = Options.RemoteUpgradeScrolls and Options.RemoteUpgradeScrolls.Value or 0
+			batchScrolls = math.max(0, math.floor(tonumber(batchScrolls) or 0))
+			return batchCrystals, batchScrolls
+		end
+
+		local function maxUpgradeItemLoop(item, Event, batchCrystals, batchScrolls)
+			if not (item and item.Parent and Event) then
+				return false, 'missing item or Event'
+			end
+			local startUp = item:FindFirstChild('Upgrade') and item.Upgrade.Value or 0
+			local rounds = 0
+			local stagnant = 0
+			while item.Parent and rounds < 80 do
+				rounds += 1
+				dismissUpgradeNotifications()
+
+				local still, curRarity, curUp, curMax = canUpgradeItem(item)
+				if not still then
+					break
+				end
+
+				local crystalName = UPGRADE_CRYSTAL[curRarity]
+				if not crystalName then
+					break
+				end
+
+				local inv = getInventoryFolder()
+				local crystal = inv and inv:FindFirstChild(crystalName)
+				if not crystal then
+					return false, 'Out of ' .. tostring(crystalName)
+				end
+				local ownedCrystals = crystal:FindFirstChild('Count') and crystal.Count.Value or 1
+				local wantCrystals = math.min(batchCrystals, ownedCrystals, curMax - curUp)
+				if wantCrystals < 1 then
+					return false, 'Not enough crystals to continue'
+				end
+
+				local wantScrolls = 0
+				if batchScrolls > 0 then
+					local scroll = inv:FindFirstChild('Upgrade Protection Scroll')
+					local ownedScrolls = scroll and (scroll:FindFirstChild('Count') and scroll.Count.Value or 1) or 0
+					if ownedScrolls < 1 then
+						return false, 'Out of protection scrolls'
+					end
+					wantScrolls = math.min(batchScrolls, ownedScrolls, wantCrystals, 25)
+				end
+
+				local before = curUp
+				local okFire, errFire = pcall(function()
+					Event:FireServer('Equipment', {
+						'Upgrade',
+						item,
+						wantCrystals,
+						wantScrolls,
+					})
+				end)
+				if not okFire then
+					return false, 'Upgrade fire failed: ' .. tostring(errFire)
+				end
+
+				local changed = waitForUpgradeSettle(item, before, 2.8)
+				dismissUpgradeNotifications()
+				local mod = findUpgradeModule()
+				if mod then
+					pcall(mod.Close, true)
+				end
+
+				if not changed then
+					stagnant += 1
+					if stagnant >= 3 then
+						return false, 'Upgrade stalled (no level change)'
+					end
+					task.wait(0.35)
+				else
+					stagnant = 0
+				end
+
+				task.wait(0.12)
+			end
+
+			local finalUp = item:FindFirstChild('Upgrade') and item.Upgrade.Value or startUp
+			local _, _, _, finalMax = canUpgradeItem(item)
+			if finalMax and finalUp >= finalMax then
+				return true, ('Maxed %s at +%d'):format(item.Name, finalUp)
+			end
+			return true, ('Stopped %s at +%d'):format(item.Name, finalUp)
+		end
+
+		local function finishMaxUpgradeRun(item, upgrade, okRun, errRun)
+			remoteUpgradeBusy = false
+			closeUpgradeUiHard()
+
+			if not okRun then
+				Library:Notify('Max upgrade error: ' .. tostring(errRun))
+				return
+			end
+
+			task.spawn(function()
+				for _ = 1, 25 do
+					closeUpgradeUiHard()
+					task.wait(0.04)
+				end
+			end)
+			pcall(function()
+				refreshUpgradeNameList(getUpgradeItemQuery(), true)
+			end)
+		end
+
 		UpgradeBox:AddButton('Max upgrade', function()
 			if remoteUpgradeBusy then
 				Library:Notify('Already maxing an item')
@@ -22929,114 +24499,83 @@ local ok, err = pcall(function()
 				return
 			end
 
-			local crystalName = UPGRADE_CRYSTAL[rarity]
-			local batchCrystals = Options.RemoteUpgradeCrystals and Options.RemoteUpgradeCrystals.Value or 25
-			batchCrystals = math.clamp(math.floor(tonumber(batchCrystals) or 25), 1, 25)
-			local batchScrolls = Options.RemoteUpgradeScrolls and Options.RemoteUpgradeScrolls.Value or 0
-			batchScrolls = math.max(0, math.floor(tonumber(batchScrolls) or 0))
+			local batchCrystals, batchScrolls = readUpgradeBatchSizes()
 
 			remoteUpgradeBusy = true
 			Library:Notify(('Maxing %s (+%d → +%d)…'):format(item.Name, upgrade, maxUp))
 
 			task.spawn(function()
 				local okRun, errRun = withUpgradeUiSuppressed(function()
-					local rounds = 0
-					local stagnant = 0
-					while item.Parent and rounds < 80 do
-						rounds += 1
-						dismissUpgradeNotifications()
-
-						local still, curRarity, curUp, curMax = canUpgradeItem(item)
-						if not still then
-							break
-						end
-
-						local inv = getInventoryFolder()
-						local crystal = inv and inv:FindFirstChild(crystalName)
-						if not crystal then
-							Library:Notify('Out of ' .. tostring(crystalName))
-							break
-						end
-						local ownedCrystals = crystal:FindFirstChild('Count') and crystal.Count.Value or 1
-						local wantCrystals = math.min(batchCrystals, ownedCrystals, curMax - curUp)
-						if wantCrystals < 1 then
-							Library:Notify('Not enough crystals to continue')
-							break
-						end
-
-						local wantScrolls = 0
-						if batchScrolls > 0 then
-							local scroll = inv:FindFirstChild('Upgrade Protection Scroll')
-							local ownedScrolls = scroll
-									and (scroll:FindFirstChild('Count') and scroll.Count.Value or 1)
-								or 0
-							if ownedScrolls < 1 then
-								Library:Notify('Out of protection scrolls — stopping')
-								break
-							end
-							wantScrolls = math.min(batchScrolls, ownedScrolls, wantCrystals, 25)
-						end
-
-						local before = curUp
-						local okFire, errFire = pcall(function()
-							Event:FireServer('Equipment', {
-								'Upgrade',
-								item,
-								wantCrystals,
-								wantScrolls,
-							})
-						end)
-						if not okFire then
-							Library:Notify('Upgrade fire failed: ' .. tostring(errFire))
-							break
-						end
-
-						local changed = waitForUpgradeSettle(item, before, 2.8)
-						dismissUpgradeNotifications()
-						local mod = findUpgradeModule()
-						if mod then
-							pcall(mod.Close, true)
-						end
-
-						if not changed then
-							stagnant += 1
-							if stagnant >= 3 then
-								Library:Notify('Upgrade stalled (no level change) — stopped')
-								break
-							end
-							task.wait(0.35)
-						else
-							stagnant = 0
-						end
-
-						task.wait(0.12)
+					local okLoop, msg = maxUpgradeItemLoop(item, Event, batchCrystals, batchScrolls)
+					if msg then
+						Library:Notify(msg, okLoop and 5 or 7)
+					end
+					if not okLoop and msg then
+						error(msg)
 					end
 				end)
 
-				remoteUpgradeBusy = false
-				closeUpgradeUiHard()
+				finishMaxUpgradeRun(item, upgrade, okRun, errRun)
+			end)
+		end)
 
-				if not okRun then
-					Library:Notify('Max upgrade error: ' .. tostring(errRun))
-					return
+		UpgradeBox:AddButton('Max equipped', function()
+			if remoteUpgradeBusy then
+				Library:Notify('Already maxing equipment')
+				return
+			end
+
+			local Event = game:GetService('ReplicatedStorage'):FindFirstChild('Event')
+			if not Event then
+				Library:Notify('ReplicatedStorage.Event missing')
+				return
+			end
+
+			local queue = {}
+			for _, item in ipairs(getEquippedInventoryItems()) do
+				if canUpgradeItem(item) then
+					queue[#queue + 1] = item
 				end
+			end
 
-				local finalUp = item and item.Parent and item:FindFirstChild('Upgrade') and item.Upgrade.Value or upgrade
-				local _, _, _, finalMax = canUpgradeItem(item)
-				if item and item.Parent and finalMax and finalUp >= finalMax then
-					Library:Notify(('Maxed %s at +%d'):format(item.Name, finalUp))
-				elseif item and item.Parent then
-					Library:Notify(('Stopped %s at +%d (not max)'):format(item.Name, finalUp))
-				else
-					Library:Notify('Upgrade finished (item gone from inventory?)')
-				end
+			if #queue == 0 then
+				Library:Notify('No upgradable equipped weapons or armor (starred / maxed / wrong type skipped)', 7)
+				return
+			end
 
-				task.spawn(function()
-					for _ = 1, 25 do
-						closeUpgradeUiHard()
-						task.wait(0.04)
+			local batchCrystals, batchScrolls = readUpgradeBatchSizes()
+			remoteUpgradeBusy = true
+			Library:Notify(('Maxing %d equipped item(s)…'):format(#queue), 6)
+
+			task.spawn(function()
+				local okRun, errRun = withUpgradeUiSuppressed(function()
+					for i, item in ipairs(queue) do
+						if not (item and item.Parent) then
+							continue
+						end
+						local okUp, _, upgrade, maxUp = canUpgradeItem(item)
+						if not okUp then
+							continue
+						end
+						Library:Notify(
+							('[%d/%d] %s +%d → +%d'):format(i, #queue, item.Name, upgrade, maxUp or upgrade),
+							4
+						)
+						local okLoop, msg = maxUpgradeItemLoop(item, Event, batchCrystals, batchScrolls)
+						if msg then
+							Library:Notify(msg, okLoop and 5 or 7)
+						end
+						if not okLoop then
+							error(msg or ('Stopped on ' .. item.Name))
+						end
+						task.wait(0.2)
 					end
 				end)
+
+				finishMaxUpgradeRun(nil, 0, okRun, errRun)
+				if okRun then
+					Library:Notify('Finished maxing equipped gear', 5)
+				end
 			end)
 		end)
 
@@ -23425,6 +24964,81 @@ local ok, err = pcall(function()
 			return false
 		end
 
+		local function parseTagIconAssetId(tagIcon)
+			if type(tagIcon) == 'number' then
+				return tostring(tagIcon)
+			end
+			local s = tostring(tagIcon or '')
+			return s:match('rbxassetid://(%d+)') or s:match('^(%d+)$')
+		end
+
+		local function getMobVariantsTable()
+			local rs = game:GetService('ReplicatedStorage')
+			local shared = rs:FindFirstChild('Shared')
+			local lib = shared and shared:FindFirstChild('Library')
+			local mod = lib and lib:FindFirstChild('MobVariants')
+			if mod and mod:IsA('ModuleScript') then
+				local ok, data = pcall(require, mod)
+				if ok and type(data) == 'table' then
+					return data
+				end
+			end
+			return nil
+		end
+
+		local function formatMobVariantIdLines()
+			local data = getMobVariantsTable()
+			if not data then
+				return nil, 'MobVariants module not found (ReplicatedStorage.Shared.Library.MobVariants)'
+			end
+			local names = {}
+			for name in pairs(data) do
+				names[#names + 1] = tostring(name)
+			end
+			table.sort(names)
+			local lines = {}
+			local found = 0
+			local missing = 0
+			for _, name in ipairs(names) do
+				if name == 'Godly' then
+					continue
+				end
+				local entry = data[name]
+				local id = entry and parseTagIconAssetId(entry.TagIcon)
+				if id and id ~= '' then
+					found += 1
+					lines[#lines + 1] = ('%s: %s'):format(name, id)
+				else
+					missing += 1
+					lines[#lines + 1] = ('%s: (missing)'):format(name)
+				end
+			end
+			if found == 0 then
+				return nil, 'No TagIcon asset IDs on MobVariants'
+			end
+			return table.concat(lines, '\n'), found, missing
+		end
+
+		local function copyMobVariantTagIcons()
+			local text, found, missing = formatMobVariantIdLines()
+			if not text then
+				Library:Notify(tostring(found or 'MobVariants copy failed'))
+				return false
+			end
+			if copyText(text) then
+				local msg = ('Copied %d mob variant TagIcon lines (Name: id)'):format(found)
+				if missing and missing > 0 then
+					msg = msg .. (' (%d missing)'):format(missing)
+				end
+				Library:Notify(msg)
+				return true
+			end
+			Library:Notify('Clipboard unavailable')
+			return false
+		end
+
+		getgenv().SB2CopyMobVariantTagIcons = copyMobVariantTagIcons
+
 		local function ensureItemsFolder()
 			if type(writefile) ~= 'function' then
 				return false
@@ -23436,6 +25050,54 @@ local ok, err = pcall(function()
 				end
 			end
 			return true
+		end
+
+		local function ensureWikiPagesFolder(subfolder)
+			if type(writefile) ~= 'function' then
+				return false, 'writefile unavailable (executor cannot save files)'
+			end
+			if not ensureItemsFolder() then
+				return false, 'Could not prepare config folder'
+			end
+			subfolder = tostring(subfolder or 'PlayerTools/wiki_pages')
+			if subfolder:sub(1, 1) ~= '/' and not subfolder:find('PlayerTools', 1, true) then
+				subfolder = 'PlayerTools/' .. subfolder
+			end
+			if type(makefolder) ~= 'function' or type(isfolder) ~= 'function' then
+				return true, subfolder
+			end
+			local parts = {}
+			for part in subfolder:gmatch('[^/]+') do
+				parts[#parts + 1] = part
+			end
+			local acc = ''
+			for i, part in ipairs(parts) do
+				acc = (i == 1) and part or (acc .. '/' .. part)
+				if not isfolder(acc) then
+					local ok, err = pcall(makefolder, acc)
+					if not ok then
+						return false, ('makefolder failed: %s (%s)'):format(acc, tostring(err))
+					end
+				end
+			end
+			return true, subfolder
+		end
+
+		local function safeWriteFile(path, content)
+			if type(writefile) ~= 'function' then
+				return false, 'writefile unavailable'
+			end
+			local ok, err = pcall(writefile, path, content)
+			if not ok then
+				return false, tostring(err)
+			end
+			if type(readfile) == 'function' then
+				local verifyOk, readBack = pcall(readfile, path)
+				if not verifyOk or type(readBack) ~= 'string' or #readBack == 0 then
+					return false, 'writefile did not persist (readback failed)'
+				end
+			end
+			return true, nil
 		end
 
 		local function valueOf(folder, name)
@@ -23453,6 +25115,18 @@ local ok, err = pcall(function()
 			return nil
 		end
 
+		-- Item folder only (Database.Items[].Class — not Stats.Class).
+		local function valueOfDirect(folder, name)
+			if not folder then
+				return nil
+			end
+			local v = folder:FindFirstChild(name)
+			if v and v:IsA('ValueBase') then
+				return v.Value
+			end
+			return nil
+		end
+
 		local function recFromFolder(folder)
 			local level = valueOf(folder, 'Level')
 			if type(level) ~= 'number' then
@@ -23461,7 +25135,7 @@ local ok, err = pcall(function()
 			return {
 				rarity = tostring(valueOf(folder, 'Rarity') or ''),
 				type = tostring(valueOf(folder, 'Type') or ''),
-				class = tostring(valueOf(folder, 'Class') or ''),
+				class = tostring(valueOfDirect(folder, 'Class') or ''),
 				level = level,
 			}
 		end
@@ -23531,6 +25205,78 @@ local ok, err = pcall(function()
 			return nil
 		end
 
+		local function getSkillsFolder()
+			local db = getDatabase()
+			return db and db:FindFirstChild('Skills')
+		end
+
+		local function skillIconIdOf(entry)
+			if not entry then
+				return nil
+			end
+			local tex = entry:FindFirstChild('Texture')
+			if tex and tex:IsA('Decal') then
+				return extractAssetId(tex.Texture)
+			end
+			return iconIdOf(entry)
+		end
+
+		local function formatSkillIconIdLines()
+			local skills = getSkillsFolder()
+			if not skills then
+				return nil, 'ReplicatedStorage.Database.Skills not found'
+			end
+			local names = {}
+			for _, child in ipairs(skills:GetChildren()) do
+				if child:IsA('StringValue') then
+					names[#names + 1] = child.Name
+				end
+			end
+			table.sort(names)
+			if #names == 0 then
+				return nil, 'No skills in Database.Skills'
+			end
+			local lines = {}
+			local found = 0
+			local missing = 0
+			for _, name in ipairs(names) do
+				local entry = skills:FindFirstChild(name)
+				local id = skillIconIdOf(entry)
+				if id and id ~= '' then
+					found += 1
+					lines[#lines + 1] = ('%s: %s'):format(name, id)
+				else
+					missing += 1
+					lines[#lines + 1] = ('%s: (missing)'):format(name)
+				end
+			end
+			if found == 0 then
+				return nil, 'No Texture icon IDs on skills'
+			end
+			return table.concat(lines, '\n'), found, missing
+		end
+
+		local function copySkillIconIds()
+			local text, found, missing = formatSkillIconIdLines()
+			if not text then
+				Library:Notify(tostring(found or 'Skill icon copy failed'))
+				return false
+			end
+			if copyText(text) then
+				local msg = ('Copied %d skill icon lines (Name: id)'):format(found)
+				if missing and missing > 0 then
+					msg = msg .. (' (%d missing)'):format(missing)
+				end
+				Library:Notify(msg)
+				return true
+			end
+			Library:Notify('Clipboard unavailable')
+			return false
+		end
+
+		getgenv().SB2CopySkillIconIds = copySkillIconIds
+		getgenv().SB2FormatSkillIconIdLines = formatSkillIconIdLines
+
 		local function formatRatio(n)
 			if type(n) ~= 'number' then
 				return tostring(n)
@@ -23552,6 +25298,123 @@ local ok, err = pcall(function()
 		local function prettyStatName(name)
 			return tostring(name):gsub('(%l)(%u)', '%1 %2'):gsub('(%u)(%u%l)', '%1 %2')
 		end
+
+		local BLESSING_FRACTION_STATS = {
+			Speed = true,
+			HealthRegeneration = true,
+			StaminaRegeneration = true,
+			Lifesteal = true,
+			SkillReduction = true,
+			MobVel = true,
+			BossVel = true,
+			DeadlyInfliction = true,
+		}
+
+		local function blessingNumStr(n)
+			local s = string.format('%.3f', tonumber(n) or 0):gsub('0+$', ''):gsub('%.$', '')
+			if s == '-0' then
+				s = '0'
+			end
+			return s
+		end
+
+		local function blessingPctStr(n)
+			local pct = (tonumber(n) or 0) * 100
+			if math.abs(pct - math.floor(pct + 0.5)) < 0.05 then
+				return tostring(math.floor(pct + 0.5))
+			end
+			return string.format('%.1f', pct):gsub('0+$', ''):gsub('%.$', '')
+		end
+
+		local function formatBlessingRangeLine(stat, minVal, maxVal)
+			local label = prettyStatName(stat)
+			minVal = tonumber(minVal) or 0
+			maxVal = tonumber(maxVal) or 0
+			local line = label .. ': ' .. blessingNumStr(minVal) .. ' to ' .. blessingNumStr(maxVal)
+			if BLESSING_FRACTION_STATS[stat] then
+				line = line .. (' (%s%% to %s%%)'):format(blessingPctStr(minVal), blessingPctStr(maxVal))
+			end
+			return line
+		end
+
+		local function getBlessingsModule()
+			local rs = game:GetService('ReplicatedStorage')
+			local shared = rs:FindFirstChild('Shared')
+			local lib = shared and shared:FindFirstChild('Library')
+			local mod = lib and lib:FindFirstChild('Blessings')
+			if mod and mod:IsA('ModuleScript') then
+				local ok, data = pcall(require, mod)
+				if ok and type(data) == 'table' then
+					return data
+				end
+			end
+			return nil
+		end
+
+		local function formatBlessingsValueRangeLines()
+			local data = getBlessingsModule()
+			if not data or type(data.Listed) ~= 'table' then
+				return nil, 'Shared.Library.Blessings not found'
+			end
+			local entries = {}
+			for idx, entry in pairs(data.Listed) do
+				if type(entry) == 'table' and type(entry.Name) == 'string' then
+					entries[#entries + 1] = { idx = tonumber(idx) or 0, entry = entry }
+				end
+			end
+			table.sort(entries, function(a, b)
+				return a.idx < b.idx
+			end)
+			local lines = {}
+			if data.PotentialPity then
+				lines[#lines + 1] = ('Potential pity: %s'):format(tostring(data.PotentialPity))
+				lines[#lines + 1] = ''
+			end
+			for _, row in ipairs(entries) do
+				local entry = row.entry
+				lines[#lines + 1] = entry.Name
+				local buffRows = {}
+				for stat, info in pairs(entry.Buffs or {}) do
+					local rng = info and info.ValueRange
+					if rng and typeof(rng) == 'NumberRange' then
+						buffRows[#buffRows + 1] = { tostring(stat), rng.Min, rng.Max }
+					elseif rng and type(rng) == 'table' then
+						buffRows[#buffRows + 1] = { tostring(stat), rng.Min or rng[1], rng.Max or rng[2] }
+					end
+				end
+				table.sort(buffRows, function(a, b)
+					return a[1] < b[1]
+				end)
+				for _, br in ipairs(buffRows) do
+					lines[#lines + 1] = formatBlessingRangeLine(br[1], br[2], br[3])
+				end
+				lines[#lines + 1] = ''
+			end
+			while lines[#lines] == '' do
+				table.remove(lines)
+			end
+			return table.concat(lines, '\n'), #entries
+		end
+
+		local function copyBlessingsValueRanges()
+			local text, n = formatBlessingsValueRangeLines()
+			if not text then
+				Library:Notify(tostring(n or 'Blessings copy failed'))
+				return false
+			end
+			if ensureItemsFolder() then
+				pcall(writefile, 'PlayerTools/wiki_pages/Blessings_value_ranges.txt', text)
+			end
+			if copyText(text) then
+				Library:Notify(('Copied %d blessing stat ranges'):format(n))
+				return true
+			end
+			Library:Notify('Wrote wiki_pages/Blessings_value_ranges.txt (clipboard unavailable)')
+			return false
+		end
+
+		getgenv().SB2CopyBlessingsValueRanges = copyBlessingsValueRanges
+		getgenv().SB2FormatBlessingsValueRangeLines = formatBlessingsValueRangeLines
 
 		local function readValueMap(container)
 			local map = {}
@@ -23583,7 +25446,7 @@ local ok, err = pcall(function()
 
 		local function itemKind(folder)
 			local typ = tostring(valueOf(folder, 'Type') or '')
-			local class = tostring(valueOf(folder, 'Class') or '')
+			local class = tostring(valueOfDirect(folder, 'Class') or '')
 			local name = folder.Name
 			local lowerName = string.lower(name)
 			local isShield = string.lower(class) == 'shield' or lowerName:find('shield', 1, true) ~= nil
@@ -23616,6 +25479,25 @@ local ok, err = pcall(function()
 			return t and t:IsA('ValueBase') and tostring(t.Value) == 'Chest'
 		end
 
+		local function itemEntryLooksLikeAura(itemName)
+			if type(itemName) ~= 'string' or itemName == '' then
+				return false
+			end
+			local lower = string.lower(itemName)
+			if lower:find('aura', 1, true) then
+				return true
+			end
+			local entry = getItemFolder(itemName)
+			if not entry then
+				return false
+			end
+			local typ = tostring(valueOf(entry, 'Type') or '')
+			if typ == 'Skin' then
+				return true
+			end
+			return typ == 'Accessory' and lower:find('body aura', 1, true) ~= nil
+		end
+
 		local function chestLooksLikeAuras(folder)
 			if folder.Name:lower():find('aura', 1, true) then
 				return true
@@ -23625,25 +25507,62 @@ local ok, err = pcall(function()
 				return false
 			end
 			for _, child in ipairs(items:GetChildren()) do
-				if string.lower(child.Name):find('aura', 1, true) then
+				if itemEntryLooksLikeAura(child.Name) then
 					return true
 				end
 			end
 			return false
 		end
 
+		local function cashShopEntryIsAura(folder)
+			if not folder then
+				return false
+			end
+			local t = folder:FindFirstChild('Type')
+			if not t or not t:IsA('ValueBase') then
+				return false
+			end
+			local typ = tostring(t.Value)
+			if typ == 'Chest' then
+				return isShopChest(folder) and chestLooksLikeAuras(folder)
+			end
+			if typ == 'Product' then
+				return itemEntryLooksLikeAura(folder.Name)
+			end
+			return false
+		end
+
 		local function listAuraChests()
 			local names = {}
+			local seen = {}
 			local shop = getCashShop()
 			if not shop then
 				return names
 			end
-			for _, child in ipairs(shop:GetChildren()) do
-				if isShopChest(child) and chestLooksLikeAuras(child) then
-					names[#names + 1] = child.Name
+			-- Match the live Cash Shop aura row order when the UI is loaded.
+			local okUi, list = pcall(function()
+				return game.Players.LocalPlayer.PlayerGui.CardinalUI.PlayerUI.MainFrame.TabFrames.CashShop.List
+			end)
+			if okUi and list then
+				for _, row in ipairs(list:GetChildren()) do
+					if row:IsA('GuiObject') and row.Name ~= 'Layout' then
+						local folder = shop:FindFirstChild(row.Name)
+						if folder and cashShopEntryIsAura(folder) and not seen[row.Name] then
+							seen[row.Name] = true
+							names[#names + 1] = row.Name
+						end
+					end
 				end
 			end
-			table.sort(names)
+			if #names == 0 then
+				for _, child in ipairs(shop:GetChildren()) do
+					if cashShopEntryIsAura(child) and not seen[child.Name] then
+						seen[child.Name] = true
+						names[#names + 1] = child.Name
+					end
+				end
+				table.sort(names)
+			end
 			return names
 		end
 
@@ -23706,6 +25625,125 @@ local ok, err = pcall(function()
 				return bySlot[row.slot]
 			end
 			return ''
+		end
+
+		local function chestIsBodyAuraChest(chestFolder)
+			if not chestFolder then
+				return false
+			end
+			local itemsFolder = chestFolder:FindFirstChild('Items')
+			if not itemsFolder then
+				return true
+			end
+			for _, child in ipairs(itemsFolder:GetChildren()) do
+				if child:IsA('ValueBase') then
+					local itemFolder = getItemFolder(child.Name)
+					if itemFolder then
+						local typ = tostring(valueOf(itemFolder, 'Type') or '')
+						if typ == 'Skin' then
+							return false
+						end
+					end
+				end
+			end
+			return true
+		end
+
+		-- Body aura chests: 17B, 18B, … Weapon-skin chests: X57, X58, …
+		local BODY_AURA_CHEST_SPAN_START = 17
+		local NORMAL_AURA_CHEST_SPAN_START = 57
+
+		local function listBodyAuraChests()
+			local names = {}
+			local shop = getCashShop()
+			for _, name in ipairs(listAuraChests()) do
+				local folder = shop and shop:FindFirstChild(name)
+				if folder and chestIsBodyAuraChest(folder) then
+					names[#names + 1] = name
+				end
+			end
+			if #names == 0 and shop then
+				for _, child in ipairs(shop:GetChildren()) do
+					if isShopChest(child) and chestLooksLikeAuras(child) and chestIsBodyAuraChest(child) then
+						names[#names + 1] = child.Name
+					end
+				end
+				table.sort(names)
+			end
+			return names
+		end
+
+		local function listNormalAuraChests()
+			local names = {}
+			local shop = getCashShop()
+			for _, name in ipairs(listAuraChests()) do
+				local folder = shop and shop:FindFirstChild(name)
+				if folder and not chestIsBodyAuraChest(folder) then
+					names[#names + 1] = name
+				end
+			end
+			if #names == 0 and shop then
+				for _, child in ipairs(shop:GetChildren()) do
+					if isShopChest(child) and chestLooksLikeAuras(child) and not chestIsBodyAuraChest(child) then
+						names[#names + 1] = child.Name
+					end
+				end
+				table.sort(names)
+			end
+			return names
+		end
+
+		local function wikiAuraChestSpanId(chestName, chestFolder)
+			if chestIsBodyAuraChest(chestFolder) then
+				for i, name in ipairs(listBodyAuraChests()) do
+					if name == chestName then
+						return tostring(BODY_AURA_CHEST_SPAN_START + i - 1) .. 'B'
+					end
+				end
+				return tostring(BODY_AURA_CHEST_SPAN_START) .. 'B'
+			end
+			for i, name in ipairs(listNormalAuraChests()) do
+				if name == chestName then
+					return 'X' .. tostring(NORMAL_AURA_CHEST_SPAN_START + i - 1)
+				end
+			end
+			return 'X' .. tostring(NORMAL_AURA_CHEST_SPAN_START)
+		end
+
+		local function wikiChestShopDescription(chestFolder)
+			local desc = valueOf(chestFolder, 'Description')
+			if desc == nil then
+				return ''
+			end
+			local s = tostring(desc):gsub('^%s+', ''):gsub('%s+$', '')
+			return s
+		end
+
+		local function appendWikiAuraChestHeader(lines, chestName, chestFolder)
+			local spanId = wikiAuraChestSpanId(chestName, chestFolder)
+			local price = valueOf(chestFolder, 'Price')
+			local priceNum = tonumber(price)
+			local priceStr = ''
+			if priceNum then
+				priceStr = tostring(math.floor(priceNum + 0.5))
+			elseif price ~= nil then
+				priceStr = tostring(price):gsub('^%s+', ''):gsub('%s+$', '')
+			end
+			local descStr = wikiChestShopDescription(chestFolder)
+			if descStr == '' then
+				descStr = 'Description'
+			else
+				descStr = descStr:gsub('"', "'")
+			end
+			lines[#lines + 1] = ('==<span id="%s">[[%s]]=='):format(spanId, chestName)
+			if priceStr ~= '' then
+				lines[#lines + 1] = ("'''Chest Price: %s R$'''<br>"):format(priceStr)
+			else
+				lines[#lines + 1] = "'''Chest Price:  R$'''<br>"
+			end
+			lines[#lines + 1] = ('"%s"<br>'):format(descStr)
+			lines[#lines + 1] = "'''Made by '''"
+			lines[#lines + 1] = ''
 		end
 
 		local function readChestContents(chestFolder)
@@ -23771,6 +25809,29 @@ local ok, err = pcall(function()
 			return r
 		end
 
+		local WIKI_UPGRADE_MAX = {
+			Common = 10,
+			Uncommon = 10,
+			Rare = 15,
+			Legendary = 20,
+			Tribute = 20,
+			Burst = 25,
+		}
+
+		local function wikiMaxUpgradeLevel(rarity)
+			return WIKI_UPGRADE_MAX[wikiNormRarity(rarity)] or 20
+		end
+
+		-- Armor/shields: +2% defense per upgrade level (matches live +20 legendary = ×1.4).
+		local function wikiMaxDefense(baseDefense, rarity)
+			local base = tonumber(baseDefense)
+			if not base or base <= 0 then
+				return nil
+			end
+			local maxUp = wikiMaxUpgradeLevel(rarity)
+			return math.floor(base * (1 + 0.02 * maxUp) + 0.5)
+		end
+
 		local function wikiRarityCategory(rarity)
 			local r = wikiNormRarity(rarity)
 			local map = {
@@ -23800,37 +25861,379 @@ local ok, err = pcall(function()
 			return tonumber(string.format('%.1f', pct))
 		end
 
-		local function wikiWeaponTypeLabel(folder, stats)
-			local classVal = tostring(valueOf(folder, 'Class') or '')
-			local statsClass = tostring(stats and stats.Class or '')
-			if classVal == '1HSword' then
-				if statsClass ~= '' then
-					return '1H ' .. statsClass
+		local WIKI_WEAPON_CLASS_SINGULAR = {
+			['1HSword'] = 'Longsword',
+			['SingleSword'] = 'Longsword',
+			['Longsword'] = 'Longsword',
+			['2HSword'] = 'Greatsword',
+			['Greatsword'] = 'Greatsword',
+			['Katana'] = 'Katana',
+			['Rapier'] = 'Rapier',
+			['Spear'] = 'Spear',
+			['Scythe'] = 'Scythe',
+			['Dagger'] = 'Dagger',
+			['DualWield'] = 'Dual Wield',
+		}
+
+		local MERCHANT_WIKI_BY_NPC = {
+			Shop = 'Helmfirth Shop',
+			ShopMan = 'Helmfirth Armor Shop',
+			ExpertShopPerson = 'Helmfirth Expert Shop',
+			ExclusiveShopPerson = 'Helmfirth Exclusive Shop',
+			ExclusiveShop = 'Helmfirth Exclusive Shop',
+		}
+
+		local MERCHANT_INDEX_PATH = CONFIG.ConfigFolder .. '/merchant_index.json'
+		local merchantIndexLive = nil
+
+		local function wikiMerchantNpcRoot(inst)
+			local n = inst
+			while n and n.Parent and n.Parent ~= workspace do
+				n = n.Parent
+			end
+			return n
+		end
+
+		local function wikiMerchantShopTitle(npcName)
+			npcName = tostring(npcName or '')
+			local mapped = MERCHANT_WIKI_BY_NPC[npcName]
+			if mapped then
+				return mapped
+			end
+			if npcName:find('Exclusive', 1, true) then
+				return 'Helmfirth Exclusive Shop'
+			end
+			if npcName:find('Expert', 1, true) then
+				return 'Helmfirth Expert Shop'
+			end
+			if npcName == 'ShopMan' then
+				return 'Helmfirth Armor Shop'
+			end
+			if npcName == 'Shop' then
+				return 'Helmfirth Shop'
+			end
+			if npcName ~= '' then
+				return 'Helmfirth ' .. npcName
+			end
+			return 'Helmfirth Shop'
+		end
+
+		local function absorbMerchantShops(root, into)
+			if not root then
+				return
+			end
+			for _, d in ipairs(root:GetDescendants()) do
+				if d.Name == 'Shop' and d.Parent and d.Parent.Name == 'ShopDialog' then
+					local npc = wikiMerchantNpcRoot(d)
+					local npcName = npc and npc.Name or 'Shop'
+					local wikiShop = wikiMerchantShopTitle(npcName)
+					for _, iv in ipairs(d:GetChildren()) do
+						if iv:IsA('IntValue') then
+							into[iv.Name] = {
+								price = iv.Value,
+								wikiShop = wikiShop,
+								npc = npcName,
+							}
+						end
+					end
 				end
-				return '1H Sword'
+			end
+		end
+
+		local function loadMerchantIndexFile()
+			local merged = {}
+			if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+				return merged
+			end
+			for _, path in ipairs({
+				MERCHANT_INDEX_PATH,
+				'PlayerTools/merchant_index.json',
+				'merchant_index.json',
+			}) do
+				local okExists, exists = pcall(isfile, path)
+				if okExists and exists then
+					local okRead, body = pcall(readfile, path)
+					if okRead and type(body) == 'string' and body ~= '' then
+						local okJson, data = pcall(function()
+							return HttpService:JSONDecode(body)
+						end)
+						if okJson and type(data) == 'table' and type(data.items) == 'table' then
+							for name, row in pairs(data.items) do
+								if type(name) == 'string' and type(row) == 'table' then
+									merged[name] = row
+								end
+							end
+						end
+					end
+				end
+			end
+			return merged
+		end
+
+		local function saveMerchantIndex(index)
+			if not ensureItemsFolder() or type(writefile) ~= 'function' or type(index) ~= 'table' then
+				return
+			end
+			local items = {}
+			local n = 0
+			for name, row in pairs(index) do
+				if type(name) == 'string' and type(row) == 'table' then
+					items[name] = row
+					n += 1
+				end
+			end
+			local okJson, body = pcall(function()
+				return HttpService:JSONEncode({ count = n, items = items })
+			end)
+			if okJson and type(body) == 'string' then
+				pcall(writefile, MERCHANT_INDEX_PATH, body)
+				pcall(writefile, 'PlayerTools/merchant_index.json', body)
+			end
+		end
+
+		local function buildMerchantIndex(refresh)
+			if merchantIndexLive and refresh ~= true then
+				return merchantIndexLive
+			end
+			local index = loadMerchantIndexFile()
+			absorbMerchantShops(workspace, index)
+			absorbMerchantShops(game:GetService('ReplicatedStorage'):FindFirstChild('Town'), index)
+			merchantIndexLive = index
+			if refresh == true then
+				saveMerchantIndex(index)
+			end
+			return index
+		end
+
+		local function lookupMerchantItem(itemName)
+			return buildMerchantIndex(false)[itemName]
+		end
+
+		local function wikiWeaponClassSingular(folder)
+			local classVal = tostring(valueOfDirect(folder, 'Class') or '')
+			local mapped = WIKI_WEAPON_CLASS_SINGULAR[classVal]
+			if mapped then
+				return mapped
+			end
+			if classVal == '1HSword' then
+				return 'Longsword'
 			end
 			if classVal == '2HSword' then
-				if statsClass ~= '' then
-					return '2H ' .. statsClass
-				end
-				return '2H Sword'
-			end
-			if statsClass ~= '' then
-				return statsClass
+				return 'Greatsword'
 			end
 			if classVal ~= '' then
-				return classVal
+				return prettyStatName(classVal)
 			end
 			return 'Weapon'
 		end
 
-		local function wikiOverviewWeaponWord(folder, stats)
-			local statsClass = tostring(stats and stats.Class or '')
-			if statsClass ~= '' then
-				return statsClass
+		local function wikiInfoboxTypeLabel(folder, stats, kind)
+			if kind == 'Armor' then
+				return 'Armor'
 			end
-			local label = wikiWeaponTypeLabel(folder, stats)
-			return label:gsub('^1H%s+', ''):gsub('^2H%s+', '')
+			if kind == 'Shield' then
+				return 'Shield'
+			end
+			if kind == 'Accessory' then
+				return 'Accessory'
+			end
+			if kind == 'Companion' then
+				return 'Companion'
+			end
+			local collection = tostring(stats and stats.Class or '')
+			local weaponWord = wikiWeaponClassSingular(folder)
+			if collection ~= '' and kind == 'Weapon' then
+				return collection .. ' (' .. weaponWord .. ')'
+			end
+			if collection ~= '' then
+				return collection
+			end
+			return weaponWord
+		end
+
+		local function wikiOverviewWeaponWord(folder, _stats)
+			return wikiWeaponClassSingular(folder)
+		end
+
+		local function wikiFileSlug(itemName)
+			return string.lower(tostring(itemName or ''):gsub('[^%w]', ''))
+		end
+
+		local function wikiMerchantInfoboxType(folder, kind)
+			if kind == 'Armor' then
+				return 'Armor'
+			end
+			if kind == 'Shield' then
+				return 'Shield'
+			end
+			if kind == 'Accessory' then
+				return 'Accessory'
+			end
+			if kind == 'Companion' then
+				return 'Companion'
+			end
+			return wikiWeaponClassSingular(folder)
+		end
+
+		local function wikiMerchantOverviewKind(folder, kind)
+			if kind == 'Weapon' then
+				return string.lower(wikiWeaponClassSingular(folder))
+			end
+			if kind == 'Accessory' then
+				return 'accessory'
+			end
+			if kind == 'Armor' then
+				return 'armor'
+			end
+			if kind == 'Shield' then
+				return 'shield'
+			end
+			return string.lower(wikiMerchantInfoboxType(folder, kind))
+		end
+
+		-- Merchant wiki: stamina ability line before health; overview mentions health then stamina.
+		local function wikiMerchantBuffLines(buffs)
+			local healthPct, staminaPct = nil, nil
+			local other = {}
+			for bname, bval in pairs(buffs or {}) do
+				local pct = wikiPctFromValue(bval)
+				if bname == 'HealthRegeneration' then
+					healthPct = pct
+				elseif bname == 'StaminaRegeneration' then
+					staminaPct = pct
+				elseif pct ~= nil then
+					other[#other + 1] = { key = bname, pct = pct }
+				else
+					other[#other + 1] = { key = bname, raw = bval }
+				end
+			end
+			table.sort(other, function(a, b)
+				return a.key < b.key
+			end)
+			local abilities = {}
+			if staminaPct ~= nil then
+				abilities[#abilities + 1] = ('+%s%% Stamina Regeneration'):format(tostring(staminaPct))
+			end
+			if healthPct ~= nil then
+				abilities[#abilities + 1] = ('+%s%% Health Regeneration'):format(tostring(healthPct))
+			end
+			for _, row in ipairs(other) do
+				local label = prettyStatName(row.key)
+				if row.pct ~= nil then
+					abilities[#abilities + 1] = ('+%s%% %s'):format(tostring(row.pct), label)
+				else
+					abilities[#abilities + 1] = ('%s: %s'):format(label, tostring(row.raw))
+				end
+			end
+			local proseTail = ''
+			if healthPct ~= nil and staminaPct ~= nil then
+				proseTail = ('a +%s%% health regeneration buff and +%s%% stamina regeneration buff'):format(
+					tostring(healthPct),
+					tostring(staminaPct)
+				)
+			elseif healthPct ~= nil then
+				proseTail = ('a +%s%% health regeneration buff'):format(tostring(healthPct))
+			elseif staminaPct ~= nil then
+				proseTail = ('a +%s%% stamina regeneration buff'):format(tostring(staminaPct))
+			elseif #other > 0 then
+				proseTail = 'additional stat buffs'
+			end
+			return abilities, proseTail
+		end
+
+		local function dumpWikiMerchantItem(name, folder, kind, rarity, level, damage, crit, defense, buffs, merchant)
+			local critPct = wikiPctFromValue(crit)
+			local dmgText = damage and wikiCommaNumber(damage) or ''
+			local upgDmgText = damage and wikiCommaNumber(damage * 2) or ''
+			local defText = defense and wikiCommaNumber(defense) or ''
+			local upgDefText = defense and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
+			local isArmorLike = kind == 'Armor' or kind == 'Shield'
+			local typeLabel = wikiMerchantInfoboxType(folder, kind)
+			local overviewKind = wikiMerchantOverviewKind(folder, kind)
+			local abilities, buffProse = wikiMerchantBuffLines(buffs)
+			local shopLink = '[[' .. tostring(merchant.wikiShop or 'Helmfirth Shop') .. ']]'
+			local iconFile = name .. '.png'
+			local inGameFile = wikiFileSlug(name) .. '.png'
+
+			local lines = {
+				'{{ItemID}}',
+				'{{Item infobox',
+				'|name=' .. name,
+				'|image=<gallery>',
+				iconFile .. ' | Icon',
+				inGameFile .. ' | In-game',
+				'</gallery>',
+				'|type=' .. typeLabel,
+				'|rarity=' .. rarity,
+				'|level=' .. (level and tostring(level) or ''),
+			}
+			if dmgText ~= '' then
+				lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
+				if upgDmgText ~= '' then
+					lines[#lines + 1] = 'Max: ' .. upgDmgText
+				end
+			end
+			if critPct then
+				lines[#lines + 1] = '|crit=' .. tostring(critPct) .. '%'
+			end
+			if defText ~= '' then
+				lines[#lines + 1] = '|def=Clean: ' .. defText
+				if upgDefText ~= '' then
+					lines[#lines + 1] = 'Max: ' .. upgDefText
+				end
+			end
+			if #abilities == 0 then
+				lines[#lines + 1] = '|abilities='
+			else
+				lines[#lines + 1] = '|abilities=' .. abilities[1]
+				for i = 2, #abilities do
+					lines[#lines + 1] = abilities[i]
+				end
+			end
+			lines[#lines + 1] = '|cost=[[File:ShopVelIcon.png|20px]] ' .. wikiCommaNumber(merchant.price)
+			lines[#lines + 1] = '|obtain=' .. shopLink
+			lines[#lines + 1] = '}}'
+			lines[#lines + 1] = ''
+			lines[#lines + 1] = '== Overview =='
+
+			local overview = ("'''%s''' is a %s"):format(name, wikiRarityTag(rarity))
+			if level then
+				overview = overview .. (' level %d %s,'):format(level, overviewKind)
+			else
+				overview = overview .. (' %s,'):format(overviewKind)
+			end
+			overview = overview .. (' purchasable from the %s in [[Helmfirth]].'):format(shopLink)
+			if critPct then
+				overview = overview .. (' It has a %s%% critical chance'):format(tostring(critPct))
+				if dmgText ~= '' then
+					overview = overview .. (' and does %s damage.'):format(dmgText)
+				else
+					overview = overview .. '.'
+				end
+			elseif dmgText ~= '' then
+				overview = overview .. (' It does %s damage.'):format(dmgText)
+			end
+			if isArmorLike and defText ~= '' then
+				overview = overview .. (' At base, it provides the player with %s defenses'):format(defText)
+				if upgDefText ~= '' then
+					local maxUp = wikiMaxUpgradeLevel(rarity)
+					overview = overview
+						.. (', and when [[Upgrading|upgraded]] to +%d, it provides the player with %s defense.'):format(
+							maxUp,
+							upgDefText
+						)
+				else
+					overview = overview .. '.'
+				end
+			elseif dmgText ~= '' and upgDmgText ~= '' then
+				overview = overview
+					.. (' When [[Upgrading|upgraded]] to +20, it does %s damage.'):format(upgDmgText)
+			end
+			if buffProse ~= '' then
+				overview = overview .. (' In addition, it grants the user %s.'):format(buffProse)
+			end
+			lines[#lines + 1] = overview
+			return table.concat(lines, '\n')
 		end
 
 		local function wikiBuffAbilityLines(buffs)
@@ -23859,39 +26262,81 @@ local ok, err = pcall(function()
 			end
 			local abilities = {}
 			local prose = {}
-			if healthPct ~= nil and staminaPct ~= nil and healthPct == staminaPct then
-				-- Same % — one combined ability line (wiki style).
-				abilities[#abilities + 1] = ('*+%s%%Health & Stamina Regeneration'):format(tostring(healthPct))
-				prose[#prose + 1] = ('a %s%% buff to both Stamina and Health Regeneration'):format(tostring(healthPct))
-			else
-				if healthPct ~= nil then
-					abilities[#abilities + 1] = ('*+%s%% Health Regeneration'):format(tostring(healthPct))
-					prose[#prose + 1] = ('a %s%% buff to Health Regeneration'):format(tostring(healthPct))
-				end
-				if staminaPct ~= nil then
-					abilities[#abilities + 1] = ('*+%s%% Stamina Regeneration'):format(tostring(staminaPct))
-					prose[#prose + 1] = ('a %s%% buff to Stamina Regeneration'):format(tostring(staminaPct))
-				end
+			if healthPct ~= nil then
+				abilities[#abilities + 1] = ('+%s%% Health Regeneration'):format(tostring(healthPct))
+				prose[#prose + 1] = ('+%s%% health regeneration buff'):format(tostring(healthPct))
+			end
+			if staminaPct ~= nil then
+				abilities[#abilities + 1] = ('+%s%% Stamina Regeneration'):format(tostring(staminaPct))
+				prose[#prose + 1] = ('+%s%% stamina regeneration buff'):format(tostring(staminaPct))
 			end
 			for _, row in ipairs(other) do
 				local label = prettyStatName(row.key)
 				if row.pct ~= nil then
-					abilities[#abilities + 1] = ('*+%s%% %s'):format(tostring(row.pct), label)
-					prose[#prose + 1] = ('a %s%% buff to %s'):format(tostring(row.pct), label)
+					abilities[#abilities + 1] = ('+%s%% %s'):format(tostring(row.pct), label)
+					prose[#prose + 1] = ('+%s%% %s buff'):format(tostring(row.pct), string.lower(label))
 				else
-					abilities[#abilities + 1] = ('*%s: %s'):format(label, tostring(row.raw))
+					abilities[#abilities + 1] = ('%s: %s'):format(label, tostring(row.raw))
 					prose[#prose + 1] = ('%s (%s)'):format(label, tostring(row.raw))
 				end
 			end
 			return abilities, prose
 		end
 
-		local function dumpWikiAura(name, folder)
-			local iconId = iconIdOf(folder)
-			if iconId then
-				return name .. '\n' .. iconId
+		local function wikiJoinBuffProse(parts)
+			if #parts == 0 then
+				return ''
 			end
-			return name .. '\n(missing icon)'
+			if #parts == 1 then
+				return parts[1]
+			end
+			if #parts == 2 then
+				return parts[1] .. ' and ' .. parts[2]
+			end
+			return table.concat(parts, ', ', 1, #parts - 1) .. ', and ' .. parts[#parts]
+		end
+
+		local function dumpWikiAura(name, folder)
+			local rarity = wikiNormRarity(valueOf(folder, 'Rarity'))
+			local buffs = readValueMap(folder:FindFirstChild('Buffs'))
+			local abilities, buffProse = wikiBuffAbilityLines(buffs)
+			local iconFile = name .. '.png'
+			local inGameFile = name .. ' in-game.png'
+			local lines = {
+				'{{Item infobox',
+				'|name=' .. name,
+				'|image=<gallery>',
+				iconFile .. ' | Icon',
+				inGameFile .. ' | In-game',
+				'</gallery>',
+				'|type=Weapon',
+				'|rarity=' .. rarity,
+				'|level=',
+				'|obtain=[[]]',
+			}
+			if #abilities == 0 then
+				lines[#lines + 1] = '|abilities='
+				lines[#lines + 1] = '}}'
+			else
+				lines[#lines + 1] = '|abilities=' .. abilities[1]
+				for i = 2, #abilities do
+					lines[#lines + 1] = abilities[i]
+				end
+				lines[#lines + 1] = '}}'
+			end
+			lines[#lines + 1] = '== Overview =='
+			local overview = ("'''{{PAGENAME}}''' is a %s Weapon, dropped by [[???]] in [[]]."):format(
+				wikiRarityTag(rarity)
+			)
+			if #buffProse > 0 then
+				overview = overview
+					.. (' In addition, it grants the user a %s.'):format(wikiJoinBuffProse(buffProse))
+			end
+			lines[#lines + 1] = overview
+			lines[#lines + 1] = ''
+			lines[#lines + 1] = "The drop rate for this item is '''???'''."
+			lines[#lines + 1] = '[[Category:' .. wikiRarityCategory(rarity) .. ']]'
+			return table.concat(lines, '\n')
 		end
 
 		local function dumpWikiCompanion(name, folder)
@@ -23899,31 +26344,43 @@ local ok, err = pcall(function()
 			local rarity = wikiNormRarity(valueOf(folder, 'Rarity'))
 			local level = tonumber(valueOf(folder, 'Level')) or tonumber(stats.Level)
 			local buffs = readValueMap(folder:FindFirstChild('Buffs'))
-			local abilities = wikiBuffAbilityLines(buffs)
+			local abilities, buffProse = wikiBuffAbilityLines(buffs)
 			local fileName = name .. '.png'
 			local levelText = level and tostring(level) or '_'
 			local lines = {
-				'{{Item infobox|name={{PAGENAME}}|image=<gallery>',
+				'{{Item infobox',
+				'|name={{PAGENAME}}',
+				'|image=<gallery>',
 				fileName .. ' | Icon',
 				fileName .. ' | In-game',
-				'</gallery>|type=Companion|rarity=' .. rarity .. '|level=' .. (level and tostring(level) or ''),
+				'</gallery>',
+				'|type=Companion',
+				'|rarity=' .. rarity,
+				'|level=' .. (level and tostring(level) or ''),
 			}
 			if #abilities == 0 then
 				lines[#lines + 1] = '|abilities='
 			else
-				lines[#lines + 1] = '|abilities='
-				for _, line in ipairs(abilities) do
-					lines[#lines + 1] = line
+				lines[#lines + 1] = '|abilities=' .. abilities[1]
+				for i = 2, #abilities do
+					lines[#lines + 1] = abilities[i]
 				end
 			end
 			lines[#lines + 1] = '|cost=None'
 			lines[#lines + 1] = '|obtain=[[]]'
-			lines[#lines + 1] = '|description=}}'
-			lines[#lines + 1] = '==Overview=='
-			lines[#lines + 1] = ("'''{{PAGENAME}}''' is a %s level %s Companion."):format(
+			lines[#lines + 1] = '|description='
+			lines[#lines + 1] = '}}'
+			lines[#lines + 1] = ''
+			lines[#lines + 1] = '== Overview =='
+			local overview = ("'''{{PAGENAME}}''' is a %s level %s Companion."):format(
 				wikiRarityTag(rarity),
 				levelText
 			)
+			if #buffProse > 0 then
+				overview = overview
+					.. (' In addition, it grants the user a %s.'):format(wikiJoinBuffProse(buffProse))
+			end
+			lines[#lines + 1] = overview
 			return table.concat(lines, '\n')
 		end
 
@@ -23955,85 +26412,110 @@ local ok, err = pcall(function()
 				defense = tonumber(valueOf(folder, 'Defense'))
 			end
 			local buffs = readValueMap(folder:FindFirstChild('Buffs'))
-			local typeLabel = wikiWeaponTypeLabel(folder, stats)
-			if kind == 'Armor' then
-				typeLabel = 'Armor'
-			elseif kind == 'Shield' then
-				typeLabel = 'Shield'
-			elseif kind == 'Accessory' then
-				typeLabel = 'Accessory'
-			elseif kind == 'Companion' then
-				typeLabel = 'Companion'
-			end
+			local typeLabel = wikiInfoboxTypeLabel(folder, stats, kind)
 			local overviewWord = wikiOverviewWeaponWord(folder, stats)
 			if kind == 'Companion' then
 				overviewWord = 'level ' .. ((level and tostring(level)) or '_') .. ' Companion'
 			elseif kind ~= 'Weapon' then
-				overviewWord = typeLabel
+				overviewWord = wikiMerchantOverviewKind(folder, kind)
+			end
+			local isArmorLike = kind == 'Armor' or kind == 'Shield'
+
+			local merchant = lookupMerchantItem(name)
+			if merchant and merchant.price then
+				return dumpWikiMerchantItem(name, folder, kind, rarity, level, damage, crit, defense, buffs, merchant)
 			end
 
 			local critPct = wikiPctFromValue(crit)
 			local dmgText = damage and wikiCommaNumber(damage) or ''
 			local upgDmgText = damage and wikiCommaNumber(damage * 2) or ''
+			local defText = defense and wikiCommaNumber(defense) or ''
+			local upgDefText = defense and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
 			local abilities, buffProse = wikiBuffAbilityLines(buffs)
-			local fileName = name .. '.png'
+			local baseName = name
+			local iconFile = baseName .. '.png'
+			local inGameFile = baseName .. ' in-game.png'
 
 			local lines = {
-				'{{ItemID}}',
-				string.format(
-					'{{Item infobox|name=%s|image=%s|type=%s|rarity=%s|level=%s|dmg=%s|crit=%s',
-					name,
-					fileName,
-					typeLabel,
-					rarity,
-					level and tostring(level) or '',
-					dmgText,
-					critPct and (tostring(critPct) .. '%') or ''
-				),
+				'{{Item infobox',
+				'|name=' .. baseName,
+				'|image=<gallery>',
+				iconFile .. ' | Icon',
+				inGameFile .. ' | In-game',
+				'</gallery>',
+				'|type=' .. typeLabel,
+				'|rarity=' .. rarity,
+				'|level=' .. (level and tostring(level) or ''),
 			}
+			if dmgText ~= '' then
+				lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
+				if upgDmgText ~= '' then
+					lines[#lines + 1] = 'Max: ' .. upgDmgText
+				end
+			end
+			if critPct then
+				lines[#lines + 1] = '|crit=' .. tostring(critPct) .. '%'
+			end
+			if defText ~= '' then
+				lines[#lines + 1] = '|def=Clean: ' .. defText
+				if upgDefText ~= '' then
+					lines[#lines + 1] = 'Max: ' .. upgDefText
+				end
+			end
+			lines[#lines + 1] = '|obtain=[[]]'
 			if #abilities == 0 then
 				lines[#lines + 1] = '|abilities='
-			elseif #abilities == 1 then
-				-- Same-stat combined (or single buff): one |abilities= line.
-				lines[#lines + 1] = '|abilities=' .. abilities[1]
+				lines[#lines + 1] = '}}'
 			else
-				-- Different stats: each ability on its own line so * bullets render.
 				lines[#lines + 1] = '|abilities=' .. abilities[1]
 				for i = 2, #abilities do
 					lines[#lines + 1] = abilities[i]
 				end
+				lines[#lines + 1] = '}}'
 			end
-			lines[#lines + 1] = '|obtain=[[]]'
-			lines[#lines + 1] = '|image = <gallery>'
-			lines[#lines + 1] = fileName .. ' | Icon'
-			lines[#lines + 1] = ' | In-game'
-			lines[#lines + 1] = ''
-			lines[#lines + 1] = '</gallery>}}'
-			lines[#lines + 1] = '==Overview=='
+			lines[#lines + 1] = '== Overview =='
 
-			local overview = ("'''{{PAGENAME}}''' is a %s"):format(wikiRarityTag(rarity))
-			if level then
-				overview = overview .. (' level %d'):format(level)
-			end
-			overview = overview .. (' %s, dropped by [[???]] in [[]].'):format(overviewWord)
-			if critPct then
-				overview = overview .. (' It has a %s%% critical chance'):format(tostring(critPct))
-				if dmgText ~= '' then
-					overview = overview .. (' and does %s damage.'):format(dmgText)
-				else
-					overview = overview .. '.'
+			local overview
+			do
+				overview = ("'''{{PAGENAME}}''' is a %s"):format(wikiRarityTag(rarity))
+				if level then
+					overview = overview .. (' level %d'):format(level)
 				end
-			elseif dmgText ~= '' then
-				overview = overview .. (' It does %s damage.'):format(dmgText)
+				overview = overview .. (' %s, dropped by [[???]] in [[]].'):format(overviewWord)
+				if isArmorLike and defText ~= '' then
+					overview = overview .. (' At base, it provides the player with %s defenses'):format(defText)
+					if upgDefText ~= '' then
+						local maxUp = wikiMaxUpgradeLevel(rarity)
+						overview = overview
+							.. (', and when [[Upgrading|upgraded]] to +%d, it provides the player with %s defense.'):format(
+								maxUp,
+								upgDefText
+							)
+					else
+						overview = overview .. '.'
+					end
+				elseif critPct then
+					overview = overview .. (' It has a %s%% critical chance'):format(tostring(critPct))
+					if dmgText ~= '' then
+						overview = overview .. (' and does %s damage.'):format(dmgText)
+					else
+						overview = overview .. '.'
+					end
+					if dmgText ~= '' and upgDmgText ~= '' then
+						overview = overview
+							.. (' When [[Upgrading|upgraded]] to +20, it does %s damage.'):format(upgDmgText)
+					end
+				elseif dmgText ~= '' then
+					overview = overview .. (' It does %s damage.'):format(dmgText)
+					if upgDmgText ~= '' then
+						overview = overview
+							.. (' When [[Upgrading|upgraded]] to +20, it does %s damage.'):format(upgDmgText)
+					end
+				end
 			end
-			if dmgText ~= '' and upgDmgText ~= '' then
-				overview = overview .. (' When upgraded to +20, it does %s damage.'):format(upgDmgText)
-			end
-			if #buffProse == 1 then
-				overview = overview .. (' In addition, it grants the user %s.'):format(buffProse[1])
-			elseif #buffProse > 1 then
+			if #buffProse > 0 then
 				overview = overview
-					.. (' In addition, it grants the user %s.'):format(table.concat(buffProse, ', '))
+					.. (' In addition, it grants the user a %s.'):format(wikiJoinBuffProse(buffProse))
 			end
 			lines[#lines + 1] = overview
 			lines[#lines + 1] = ''
@@ -24064,14 +26546,9 @@ local ok, err = pcall(function()
 
 			local n = #wikiRows
 			local lines = {}
-			local price = valueOf(folder, 'Price')
-			if price ~= nil and tostring(price) ~= '' then
-				lines[#lines + 1] = ('**Chest Price: %s R$**'):format(tostring(price))
-				lines[#lines + 1] = ''
-			end
+			appendWikiAuraChestHeader(lines, chestName, folder)
 			lines[#lines + 1] = '{{X' .. n .. 'AurasBox'
-			lines[#lines + 1] = '|chesticon= '
-			lines[#lines + 1] = chestName .. '.png'
+			lines[#lines + 1] = '|chesticon=' .. chestName .. '.png'
 			for i, row in ipairs(wikiRows) do
 				local rarityBit = wikiRarityTag(row.rarity)
 				local prob = row.chance ~= '' and row.chance or '?'
@@ -24145,15 +26622,188 @@ local ok, err = pcall(function()
 			return table.concat(lines, '\n')
 		end
 
+		-- Burst Store subpage body (not a duplicate of full [[Auras]]). Bot target: [[Auras/Burst Store]].
+		local WIKI_AURAS_HUB_INTRO = table.concat({
+			'<!-- PlayerTools BURST_STORE_PAGE: upload to [[Auras/Burst Store]] via sync_burst_store.py (not the whole Auras page). -->',
+			'{{DISPLAYTITLE:Burst Store auras}}',
+			'<div style="background-color: #2a4a3a; border: 1px solid #393756; padding: 8px; margin: 8px 0;">',
+			"<i><b>Editors:</b> Legacy + event chests stay on [[Auras]]. This page is <b>robux Burst Store only</b> — regenerate from PlayerTools → <b>Copy wiki: hub full (burst)</b>, then bot-upload <code>PlayerTools/auras_burst_store.wikitext</code> (or paste once). Nav + span IDs come from Cash Shop order.</i>",
+			'</div>',
+			'',
+			'__NOTOC__',
+		}, '\n')
+
+		local WIKI_BURST_STORE_FILE = 'PlayerTools/auras_burst_store.wikitext'
+		local WIKI_BURST_STORE_UPLOAD = 'PlayerTools/wiki_pages/Auras_Burst Store.wiki.txt'
+
+		local function writeWikiBurstStoreFiles(text)
+			if type(text) ~= 'string' or text == '' or type(writefile) ~= 'function' then
+				return false
+			end
+			text = wikiStripEffectGallery(text)
+			pcall(writefile, WIKI_BURST_STORE_FILE, text)
+			pcall(writefile, WIKI_BURST_STORE_UPLOAD, '|name=Auras/Burst Store\n' .. text)
+			return true
+		end
+
+		local function wikiReverseNameList(list)
+			local out = {}
+			for i = #list, 1, -1 do
+				out[#out + 1] = list[i]
+			end
+			return out
+		end
+
+		local function wikiNavCellForChest(chestName, shop)
+			local folder = shop and shop:FindFirstChild(chestName)
+			local spanId = wikiAuraChestSpanId(chestName, folder)
+			local prefix = '|'
+			if chestName:find('April Fools', 1, true) then
+				prefix = '| style="background-color:#7D2A2A;"|'
+			end
+			return prefix
+				.. ('<big>[[#%s|%s]]</big> [[File:%s.png|25px]]'):format(spanId, chestName, chestName)
+		end
+
+		local function appendWikiNavChestGrid(lines, sectionTitle, chestNames, shop)
+			if #chestNames == 0 then
+				return
+			end
+			if #lines == 0 or lines[#lines] ~= '{| class="article-table" border="1" style="width: 100%; text-align: center; color: #ffebee; font-size: 14px; clear: both;"' then
+				lines[#lines + 1] =
+					'{| class="article-table" border="1" style="width: 100%; text-align: center; color: #ffebee; font-size: 14px; clear: both;"'
+			end
+			lines[#lines + 1] = ('|colspan="4" style="background-color: #2A4A7D" |<center><span style="color:#fff"><b><big>%s</big></b></span></center>'):format(
+				sectionTitle
+			)
+			for i = 1, #chestNames, 4 do
+				lines[#lines + 1] = '|- style="background-color:#2A747D;"'
+				for j = i, math.min(i + 3, #chestNames) do
+					lines[#lines + 1] = wikiNavCellForChest(chestNames[j], shop)
+				end
+			end
+		end
+
+		local function buildWikiBurstShopNavTable(weaponNames, bodyNames)
+			local shop = getCashShop()
+			local lines = {}
+			appendWikiNavChestGrid(lines, 'Burst Store — weapon aura chests', weaponNames, shop)
+			if #bodyNames > 0 then
+				if #lines > 0 then
+					lines[#lines + 1] = '|-'
+					lines[#lines + 1] =
+						'|colspan="4" style="background-color: #2A4A7D" |<center><span style="color:#fff"><b><big>Burst Store — body aura chests</big></b></span></center>'
+				end
+				for i = 1, #bodyNames, 4 do
+					lines[#lines + 1] = '|- style="background-color:#2A747D;"'
+					for j = i, math.min(i + 3, #bodyNames) do
+						lines[#lines + 1] = wikiNavCellForChest(bodyNames[j], shop)
+					end
+				end
+			end
+			if #lines > 0 then
+				lines[#lines + 1] = '|}'
+			end
+			return table.concat(lines, '\n')
+		end
+
+		local function appendWikiHubChestBlocks(lines, chestNames)
+			for _, chestName in ipairs(chestNames) do
+				local block = dumpWikiChest(chestName)
+				if
+					block
+					and not block:find('%(not in Database%.CashShop%)', 1, true)
+					and not block:find('%(no auras in Items folder%)', 1, true)
+				then
+					lines[#lines + 1] = block
+					lines[#lines + 1] = ''
+				end
+			end
+		end
+
+		local function dumpWikiAurasHubPage(kind, opts)
+			kind = kind or 'burst_all'
+			opts = opts or {}
+			local includeIntro = opts.intro ~= false
+			local includeNav = opts.nav ~= false
+			local weaponNames = wikiReverseNameList(listNormalAuraChests())
+			local bodyNames = wikiReverseNameList(listBodyAuraChests())
+			local lines = {}
+			if includeIntro then
+				lines[#lines + 1] = WIKI_AURAS_HUB_INTRO
+				lines[#lines + 1] = ''
+			end
+			if includeNav then
+				if kind == 'weapon' then
+					if #weaponNames > 0 then
+						local shop = getCashShop()
+						local navLines = {}
+						appendWikiNavChestGrid(navLines, 'Burst Store — weapon aura chests', weaponNames, shop)
+						if #navLines > 0 then
+							navLines[#navLines + 1] = '|}'
+							lines[#lines + 1] = table.concat(navLines, '\n')
+						end
+					end
+				elseif kind == 'body' then
+					if #bodyNames > 0 then
+						local shop = getCashShop()
+						local navLines = {}
+						appendWikiNavChestGrid(navLines, 'Burst Store — body aura chests', bodyNames, shop)
+						if #navLines > 0 then
+							navLines[#navLines + 1] = '|}'
+							lines[#lines + 1] = table.concat(navLines, '\n')
+						end
+					end
+				else
+					local nav = buildWikiBurstShopNavTable(weaponNames, bodyNames)
+					if nav ~= '' then
+						lines[#lines + 1] = nav
+					end
+				end
+				if #lines > 0 and lines[#lines] ~= '' then
+					lines[#lines + 1] = ''
+				end
+			end
+			if kind == 'weapon' then
+				appendWikiHubChestBlocks(lines, weaponNames)
+			elseif kind == 'body' then
+				appendWikiHubChestBlocks(lines, bodyNames)
+			else
+				appendWikiHubChestBlocks(lines, weaponNames)
+				appendWikiHubChestBlocks(lines, bodyNames)
+			end
+			return table.concat(lines, '\n')
+		end
+
+		local function dumpWikiAurasHubSections(kind)
+			return dumpWikiAurasHubPage(kind, { intro = false, nav = false })
+		end
+
+		local function wikiStripEffectGallery(text)
+			if type(text) ~= 'string' or text == '' then
+				return text
+			end
+			local out = {}
+			for line in string.gmatch(text, '[^\r\n]+') do
+				local lower = string.lower(line)
+				if not lower:find('effect%.gif', 1, true) and not lower:match(' | effect%s*$') then
+					out[#out + 1] = line
+				end
+			end
+			return table.concat(out, '\n')
+		end
+
 		local function writeWikiDump(text)
 			if not ensureItemsFolder() or type(writefile) ~= 'function' then
 				return
 			end
+			text = wikiStripEffectGallery(text)
 			pcall(writefile, WIKI_DUMP_PATH, text)
 			pcall(writefile, 'PlayerTools/wiki_dump.txt', text)
 		end
 
 		local function copyWiki(text)
+			text = wikiStripEffectGallery(text)
 			writeWikiDump(text)
 			if copyText(text) then
 				Library:Notify('Copied wiki dump (also PlayerTools/wiki_dump.txt)', 6)
@@ -24163,6 +26813,65 @@ local ok, err = pcall(function()
 			return false
 		end
 
+		local function wikiSafeFileName(pageName)
+			return tostring(pageName):gsub('[\\/:*?"<>|]', '_')
+		end
+
+		local function writeWikiPageFiles(nameList, subfolder)
+			if type(nameList) ~= 'table' or #nameList == 0 then
+				return false, 'empty name list', {}, {}
+			end
+			local folderOk, folderOrErr = ensureWikiPagesFolder(subfolder)
+			if not folderOk then
+				return false, folderOrErr, {}, {}
+			end
+			subfolder = folderOrErr
+			buildMerchantIndex(true)
+			local written = 0
+			local missing = {}
+			local failed = {}
+			for _, name in ipairs(nameList) do
+				if type(name) == 'string' and name ~= '' then
+					local okDump, body = pcall(dumpWikiItem, name)
+					if not okDump then
+						failed[#failed + 1] = name .. ' (dump error)'
+					elseif body:find('%(not in Database%.Items%)', 1, true) then
+						missing[#missing + 1] = name
+					else
+						local path = subfolder .. '/' .. wikiSafeFileName(name) .. '.wiki.txt'
+						local okWrite, werr = safeWriteFile(path, wikiStripEffectGallery(body))
+						if okWrite then
+							written += 1
+						else
+							failed[#failed + 1] = name .. ': ' .. tostring(werr)
+						end
+					end
+				end
+			end
+			local summary = ('written=%d missing=%d failed=%d folder=%s'):format(
+				written,
+				#missing,
+				#failed,
+				subfolder
+			)
+			safeWriteFile(
+				subfolder .. '/_manifest.txt',
+				summary
+					.. '\n'
+					.. table.concat(missing, '\n')
+					.. (#failed > 0 and ('\n-- failed --\n' .. table.concat(failed, '\n')) or '')
+			)
+			if written == 0 then
+				return false, summary, missing, failed
+			end
+			return true, summary, missing, failed
+		end
+
+		getgenv().SB2DumpWikiItem = dumpWikiItem
+		getgenv().SB2WriteWikiPages = writeWikiPageFiles
+		getgenv().SB2DumpWikiAurasHub = dumpWikiAurasHubPage
+		getgenv().SB2DumpWikiAurasHubSections = dumpWikiAurasHubSections
+		getgenv().SB2WriteWikiBurstStoreFiles = writeWikiBurstStoreFiles
 
 		local function scanLiveItems()
 			table.clear(liveCache)
@@ -24574,20 +27283,36 @@ local ok, err = pcall(function()
 			return nil
 		end
 
+		local WIKI_BATCH_SEPARATOR = '\n\n----\n\n'
+
+		local function wikiTrimBlock(text)
+			return tostring(text or ''):gsub('^[%s\r\n]+', ''):gsub('[%s\r\n]+$', '')
+		end
+
+		local function wikiBatchWrap(title, body)
+			return ('<!-- %s -->'):format(title) .. '\n\n' .. wikiTrimBlock(body)
+		end
+
 		local function dumpAllNewWiki()
 			if #lastAdded == 0 then
 				return nil, 'No new names — Scan first'
 			end
+			buildMerchantIndex(true)
 			local blocks = {}
 			local shop = getCashShop()
-			for _, name in ipairs(lastAdded) do
-				blocks[#blocks + 1] = dumpWikiItem(name)
+			local names = {}
+			for i, n in ipairs(lastAdded) do
+				names[i] = n
+			end
+			table.sort(names)
+			for _, name in ipairs(names) do
+				blocks[#blocks + 1] = wikiBatchWrap(name, dumpWikiItem(name))
 				local chest = shop and shop:FindFirstChild(name)
 				if chest and isShopChest(chest) then
-					blocks[#blocks + 1] = dumpWikiChest(name)
+					blocks[#blocks + 1] = wikiBatchWrap(name .. ' (chest)', dumpWikiChest(name))
 				end
 			end
-			return table.concat(blocks, '\n\n'), nil
+			return table.concat(blocks, WIKI_BATCH_SEPARATOR), nil
 		end
 
 		DiffBox:AddButton('Scan for new items', function()
@@ -24644,6 +27369,18 @@ local ok, err = pcall(function()
 			end
 		end)
 
+		DiffBox:AddButton('Copy IDs: mob variants', function()
+			copyMobVariantTagIcons()
+		end)
+
+		DiffBox:AddButton('Copy IDs: skills', function()
+			copySkillIconIds()
+		end)
+
+		DiffBox:AddButton('Copy: blessings ranges', function()
+			copyBlessingsValueRanges()
+		end)
+
 		DiffBox:AddButton('Copy wiki: all new', function()
 			local text, err = dumpAllNewWiki()
 			if not text then
@@ -24651,6 +27388,77 @@ local ok, err = pcall(function()
 				return
 			end
 			copyWiki(text)
+		end)
+
+		local WIKI_BATCH_34 = {
+			'Astral Breach',
+			'Bred',
+			'Cinder Fang',
+			'Cinderbrand',
+			'Dead Signal',
+			'Deepwarden’s Hook',
+			'Depthpiercer',
+			'Fracture Fang',
+			'Fracture Void',
+			'Funeral Crescent',
+			'Hollow Pyre',
+			'Infernal Glaive',
+			'Lagspike',
+			'Nightwatch Reaper',
+			'Nythrane Chainmail',
+			'Nythrane Robes',
+			'Onslaught Pike',
+			'Palebrand',
+			'Riftborn Armor',
+			'Riftborn Robes',
+			'Riftborn Scepter',
+			'Riftcleaver',
+			'Riftshard',
+			'Soulharvest',
+			'Stormpiercer',
+			'Tempest Crescent',
+			'Vaelith’s Needle',
+			'Void Piercer',
+			'Warden Platemail',
+			'Warden Vanguard',
+			'Warden’s Spine',
+			'Whiteflame Lance',
+			'Wi-Fi Cutter',
+			'Wispfang',
+		}
+
+		local function writeWikiBatch34()
+			local ok, summary, missing, failed = writeWikiPageFiles(WIKI_BATCH_34, 'PlayerTools/wiki_pages')
+			if not ok then
+				local err = tostring(summary or 'Write failed')
+				if type(failed) == 'table' and #failed > 0 then
+					err = err .. ' | ' .. failed[1]
+				end
+				warn('[PlayerTools Wiki] ' .. err)
+				Library:Notify(err, 10)
+				return false
+			end
+			local msg = (summary or 'Wrote wiki_pages')
+				.. ' — open Potassium/workspace/PlayerTools/wiki_pages on disk'
+			if type(missing) == 'table' and #missing > 0 then
+				msg = msg .. ' | missing: ' .. table.concat(missing, ', ')
+			end
+			if type(failed) == 'table' and #failed > 0 then
+				msg = msg .. ' | failed: ' .. table.concat(failed, ', ')
+			end
+			warn('[PlayerTools Wiki] ' .. msg)
+			Library:Notify(msg, 10)
+			return true
+		end
+
+		getgenv().SB2WriteWikiBatch34 = writeWikiBatch34
+
+		DiffBox:AddButton('Write wiki files: batch 34', function()
+			local ok, err = pcall(writeWikiBatch34)
+			if not ok then
+				warn('[PlayerTools Wiki] batch 34 error: ' .. tostring(err))
+				Library:Notify('Wiki batch 34 error: ' .. tostring(err), 10)
+			end
 		end)
 
 		DiffBox:AddButton('Save current DB as known', function()
@@ -24776,7 +27584,12 @@ local ok, err = pcall(function()
 				Library:Notify('Pick a search match or new-list item first')
 				return
 			end
-			copyWiki(dumpWikiItem(name))
+			local ok, text = pcall(dumpWikiItem, name)
+			if not ok then
+				Library:Notify('Wiki dump failed: ' .. tostring(text), 8)
+				return
+			end
+			copyWiki(text)
 		end)
 
 		local chestDetail = ChestBox:AddLabel('Scan to load robux shop aura chests.')
@@ -24789,6 +27602,15 @@ local ok, err = pcall(function()
 			end
 			local shop = getCashShop()
 			local folder = shop and shop:FindFirstChild(name)
+			if not folder then
+				setLabel(chestDetail, name .. ' — not in CashShop')
+				return
+			end
+			local t = folder:FindFirstChild('Type')
+			if t and t:IsA('ValueBase') and tostring(t.Value) == 'Product' then
+				setLabel(chestDetail, ('%s — direct robux aura'):format(name))
+				return
+			end
 			local rows = readChestContents(folder)
 			setLabel(chestDetail, ('%s — %d auras'):format(name, #rows))
 		end
@@ -24849,7 +27671,7 @@ local ok, err = pcall(function()
 					setLabel(chestDetail, ('%d match "%s"'):format(#hits, query))
 				end
 			end
-			setLabel(chestStatusLabel, ('Live %d aura chests in CashShop'):format(#allAuraChests))
+			setLabel(chestStatusLabel, ('Live %d aura shop entries (chests + buy)'):format(#allAuraChests))
 		end
 
 		local function refreshAuraChests(notify)
@@ -24862,7 +27684,7 @@ local ok, err = pcall(function()
 				showChestDetail(allAuraChests[1])
 			end
 			if notify then
-				Library:Notify(('Scanned %d aura chests'):format(#allAuraChests))
+				Library:Notify(('Scanned %d aura shop entries'):format(#allAuraChests))
 			end
 		end
 
@@ -24903,7 +27725,65 @@ local ok, err = pcall(function()
 				Library:Notify('Pick an aura chest first')
 				return
 			end
+			local shop = getCashShop()
+			local folder = shop and shop:FindFirstChild(name)
+			local t = folder and folder:FindFirstChild('Type')
+			if t and t:IsA('ValueBase') and tostring(t.Value) == 'Product' then
+				copyWiki(dumpWikiItem(name))
+				return
+			end
 			copyWiki(dumpWikiChest(name))
+		end)
+
+		ChestBox:AddButton('Copy wiki: hub full (burst)', function()
+			local w = #listNormalAuraChests()
+			local b = #listBodyAuraChests()
+			if w + b == 0 then
+				Library:Notify('Open Cash Shop once, then Scan chests')
+				return
+			end
+			local text = dumpWikiAurasHubPage('burst_all')
+			writeWikiBurstStoreFiles(text)
+			copyWiki(text)
+			Library:Notify(
+				('Burst Store page: %d weapon + %d body → clipboard + auras_burst_store.wikitext (bot uploads [[Auras/Burst Store]])'):format(
+					w,
+					b
+				),
+				9
+			)
+		end)
+
+		ChestBox:AddButton('Copy wiki: hub chests only', function()
+			local w = #listNormalAuraChests()
+			local b = #listBodyAuraChests()
+			if w + b == 0 then
+				Library:Notify('Open Cash Shop once, then Scan chests')
+				return
+			end
+			copyWiki(dumpWikiAurasHubSections('burst_all'))
+			Library:Notify(
+				('Chest blocks only (%d) — paste into [[Auras/Burst Store]] or replace burst section; use hub full for nav too'):format(
+					w + b
+				),
+				7
+			)
+		end)
+
+		ChestBox:AddButton('Copy wiki: hub (weapon)', function()
+			if #listNormalAuraChests() == 0 then
+				Library:Notify('Open Cash Shop once, then Scan chests')
+				return
+			end
+			copyWiki(dumpWikiAurasHubPage('weapon'))
+		end)
+
+		ChestBox:AddButton('Copy wiki: hub (body)', function()
+			if #listBodyAuraChests() == 0 then
+				Library:Notify('Open Cash Shop once, then Scan chests')
+				return
+			end
+			copyWiki(dumpWikiAurasHubPage('body'))
 		end)
 
 		ChestBox:AddButton('Chest page copy', function()
@@ -24929,7 +27809,7 @@ local ok, err = pcall(function()
 			end
 			local lines = {}
 			local chestIcon = iconIdOf(folder)
-			lines[#lines + 1] = 'Chest icon: ' .. (chestIcon or '(missing)')
+			lines[#lines + 1] = name .. ': ' .. (chestIcon or '(missing)')
 			local rows = readChestContents(folder)
 			table.sort(rows, function(a, b)
 				return a.name < b.name
@@ -27969,4 +30849,100 @@ else
 		writefile('PlayerTools/_mcp_status.txt', 'PlayerTools OK')
 	end)
 end
+
+-- Ancient Shrine / Blessings UI: game client can throw Vector3+nil when camera
+-- cache or tracked item is missing (common with 0 Catalyst Runes or no item selected).
+;(function()
+	local function notifyBlessErr(msg)
+		warn('[PlayerTools] ' .. tostring(msg))
+		pcall(function()
+			local lib = getgenv()[LIBRARY_KEY] or getgenv().Library
+			if lib and type(lib.Notify) == 'function' then
+				lib:Notify(tostring(msg):sub(1, 140), 7)
+			end
+		end)
+	end
+
+	local function patchBlessingGear()
+		local RS = game:GetService('ReplicatedStorage')
+		local services = RS:FindFirstChild('CardinalClient')
+		services = services and services:FindFirstChild('MainModule')
+		services = services and services:FindFirstChild('Services')
+		local modScript = services and services:FindFirstChild('BlessingGear')
+		if not modScript then
+			return false
+		end
+		local ok, gear = pcall(require, modScript)
+		if not ok or type(gear) ~= 'table' or gear._SB2BlessPatch == true then
+			return ok == true
+		end
+		gear._SB2BlessPatch = true
+
+		local function ensureBlessContext()
+			local shrine = workspace:FindFirstChild('Shrine')
+			if shrine and (gear.ShrineModel == nil or not gear.ShrineModel.Parent) then
+				gear.ShrineModel = shrine
+			end
+			local cam = workspace.CurrentCamera
+			if cam and (gear.Camera == nil or not gear.Camera.Parent) then
+				gear.Camera = cam
+			end
+		end
+
+		local function wrap(name)
+			local fn = gear[name]
+			if type(fn) ~= 'function' then
+				return
+			end
+			gear[name] = function(...)
+				ensureBlessContext()
+				local okCall, result = pcall(fn, ...)
+				if not okCall then
+					local err = tostring(result)
+					if err:find('Vector3', 1, true) and err:find('nil', 1, true) then
+						notifyBlessErr(
+							'Blessing UI bug — select a weapon in inventory first, then open Bless Equipment again.'
+						)
+					else
+						notifyBlessErr('Blessing UI: ' .. err)
+					end
+					return nil
+				end
+				return result
+			end
+		end
+
+		for _, name in ipairs({
+			'Open',
+			'Float',
+			'UpdateModel',
+			'CacheOpenPositions',
+			'CreateSpinningModel',
+			'TrackRightItem',
+			'SetEffects',
+			'SetConfirmation',
+			'AnimateOut',
+			'UpdateLastRolled',
+		}) do
+			wrap(name)
+		end
+		return true
+	end
+
+	local function runPatch()
+		pcall(patchBlessingGear)
+	end
+	task.defer(runPatch)
+	task.delay(1.5, runPatch)
+	task.delay(5, runPatch)
+	pcall(function()
+		game:GetService('Players').LocalPlayer.PlayerGui.ChildAdded:Connect(function(ch)
+			if ch and (ch.Name == 'Blessings' or ch.Name == 'NPCDialogue') then
+				task.defer(runPatch)
+			end
+		end)
+	end)
+	getgenv().SB2PatchBlessingGear = patchBlessingGear
+end)()
+
 -- SB2_PLAYERTOOLS_EOF

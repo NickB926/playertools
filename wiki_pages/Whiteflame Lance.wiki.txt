@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Whiteflame Lance
+|image=<gallery>
+Whiteflame Lance.png | Icon
+Whiteflame Lance in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Legendary
+|level=455
+|dmg=Clean: 39,530
+Max: 79,060
+|crit=35%
+|obtain=[[]]
+|abilities=+20% Health Regeneration
++40% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 455 Rapier, dropped by [[???]] in [[]]. It has a 35% critical chance and does 39,530 damage. When [[Upgrading|upgraded]] to +20, it does 79,060 damage. In addition, it grants the user a +20% health regeneration buff and +40% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

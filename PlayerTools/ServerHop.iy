@@ -11,11 +11,14 @@
       join Wave Defense
       join 121252145396212
       shlist / shgui     — toggle Join panel (DEX-style chip on load)
+      join panel: pick floor → public server list (Shift+click floor = random join)
+      PlayerTools → Join player → Browse floor servers
 ]]
 
 local Players = game:GetService('Players')
 local TeleportService = game:GetService('TeleportService')
 local UserInputService = game:GetService('UserInputService')
+local HttpService = game:GetService('HttpService')
 
 local LocalPlayer = Players.LocalPlayer
 	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
@@ -30,6 +33,20 @@ pcall(function()
 	end
 	getgenv().SB2ServerHop = { active = false }
 end)
+
+-- Bump when Join panel click behavior changes (forces new floor rows / handlers).
+local SERVER_HOP_UI_VER = 6
+getgenv().SB2ServerHopUiVerExpected = SERVER_HOP_UI_VER
+if getgenv().SB2ServerHopUiVer ~= SERVER_HOP_UI_VER then
+	pcall(function()
+		local gui = getgenv().SB2ServerHopGui
+		if gui and gui.Destroy then
+			gui:Destroy()
+		end
+	end)
+	getgenv().SB2ServerHopGui = nil
+	getgenv().SB2ServerHopUiVer = SERVER_HOP_UI_VER
+end
 
 local function say(text)
 	pcall(function()
@@ -427,16 +444,94 @@ local function resolveTarget(raw)
 	return nil
 end
 
+local function httpRequest(opts)
+	local req = (syn and syn.request)
+		or (http and http.request)
+		or http_request
+		or request
+	if type(req) ~= 'function' then
+		return nil, 'no http request function'
+	end
+	local ok, res = pcall(req, opts)
+	if not ok then
+		return nil, tostring(res)
+	end
+	return res
+end
+
+local function joinPlaceInstance(placeId, jobId, label)
+	placeId = tonumber(placeId)
+	jobId = type(jobId) == 'string' and jobId or nil
+	if not placeId or not jobId or jobId == '' then
+		return false
+	end
+	if placeId == game.PlaceId and jobId == game.JobId then
+		say('already in that server')
+		return false
+	end
+	if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
+		pcall(getgenv().SB2PlayerToolsArmTeleport)
+	end
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	setFloorPanelOpen(false)
+	say('joining ' .. tostring(label or jobId:sub(1, 8)) .. '…')
+	local ok, err = pcall(function()
+		TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+	end)
+	if not ok then
+		say('instance join failed: ' .. tostring(err))
+		return false
+	end
+	return true
+end
+
+local function joinRandomOnPlace(placeId, name)
+	placeId = tonumber(placeId)
+	if not placeId then
+		return false
+	end
+	if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
+		pcall(getgenv().SB2PlayerToolsArmTeleport)
+	end
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	setFloorPanelOpen(false)
+	say('random server on ' .. tostring(name or placeId) .. '…')
+	local teleported = false
+	local okReserve, code = pcall(function()
+		return TeleportService:ReserveServer(placeId)
+	end)
+	if okReserve and type(code) == 'string' and code ~= '' then
+		teleported = pcall(function()
+			TeleportService:TeleportToPrivateServer(placeId, code, { LocalPlayer })
+		end)
+	end
+	if not teleported then
+		teleported = pcall(function()
+			TeleportService:Teleport(placeId, LocalPlayer)
+		end)
+	end
+	if not teleported then
+		say('random join failed')
+	end
+	return teleported
+end
+
 local function joinPlace(target)
 	if not target or not target.placeId then
 		return false
 	end
 	if tonumber(target.placeId) == game.PlaceId then
-		say('already on ' .. tostring(target.name))
-		return false
+		return joinRandomOnPlace(target.placeId, target.name)
 	end
 	local label = target.floor and ('F' .. target.floor .. ' ' .. target.name) or target.name
 	say('joining ' .. label .. '...')
+	if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
+		pcall(getgenv().SB2PlayerToolsArmTeleport)
+	end
 	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
 		pcall(getgenv().SB2CloseAllPillPanels)
 	end
@@ -448,6 +543,430 @@ local function joinPlace(target)
 		return false
 	end
 	return true
+end
+
+getgenv().SB2ServerHopJoinInstance = joinPlaceInstance
+
+local function fetchPublicServersPage(placeId, cursor)
+	placeId = tonumber(placeId)
+	if not placeId then
+		return nil, 'bad placeId', nil
+	end
+	local q = 'limit=100&sortOrder=Desc'
+	if type(cursor) == 'string' and cursor ~= '' then
+		q = q .. '&cursor=' .. HttpService:UrlEncode(cursor)
+	end
+	local urls = {
+		('https://games.roblox.com/v1/games/%.0f/servers/Public?%s'):format(placeId, q),
+		('https://games.roproxy.com/v1/games/%.0f/servers/Public?%s'):format(placeId, q),
+	}
+	local lastErr = 'HTTP failed'
+	for _, url in ipairs(urls) do
+		local res, err = httpRequest({
+			Url = url,
+			Method = 'GET',
+			Headers = { Accept = 'application/json' },
+		})
+		if not res then
+			lastErr = err or lastErr
+			continue
+		end
+		local status = tonumber(res.StatusCode) or tonumber(res.Status) or 0
+		local rawBody = res.Body or res.body or ''
+		if status < 200 or status >= 300 or type(rawBody) ~= 'string' or rawBody == '' then
+			lastErr = ('HTTP %s'):format(tostring(status))
+			continue
+		end
+		local okDecode, data = pcall(function()
+			return HttpService:JSONDecode(rawBody)
+		end)
+		if not okDecode or type(data) ~= 'table' then
+			lastErr = 'bad JSON'
+			continue
+		end
+		local rows = data.data or data.Data
+		if type(rows) ~= 'table' then
+			lastErr = 'no servers array'
+			continue
+		end
+		local nextCursor = data.nextPageCursor or data.NextPageCursor
+		return rows, nil, nextCursor
+	end
+	return nil, lastErr, nil
+end
+
+local function collectFriendIds(maxN)
+	maxN = tonumber(maxN) or 200
+	local ids = {}
+	local idToName = {}
+	local ok, pages = pcall(function()
+		return Players:GetFriendsAsync(LocalPlayer.UserId)
+	end)
+	if not ok or not pages then
+		return ids, idToName
+	end
+	while true do
+		local page = pages:GetCurrentPage()
+		for _, item in ipairs(page) do
+			local uid = type(item) == 'table' and (item.Id or item.UserId or item.id) or item
+			uid = tonumber(uid)
+			if uid and uid > 0 then
+				ids[#ids + 1] = uid
+				local uname = type(item) == 'table' and (item.Username or item.Name or item.username)
+				if type(uname) == 'string' and uname ~= '' then
+					idToName[uid] = uname
+				end
+				if #ids >= maxN then
+					return ids, idToName
+				end
+			end
+		end
+		if pages.IsFinished then
+			break
+		end
+		local okAdv = pcall(function()
+			pages:AdvanceToNextPageAsync()
+		end)
+		if not okAdv then
+			break
+		end
+	end
+	return ids, idToName
+end
+
+local function fetchFriendsOnPlace(placeId)
+	placeId = tonumber(placeId)
+	local byJob = {}
+	if not placeId then
+		return byJob
+	end
+	local ids, idToName = collectFriendIds(180)
+	if #ids == 0 then
+		return byJob
+	end
+	local chunk = {}
+	local function flushChunk()
+		if #chunk == 0 then
+			return
+		end
+		local body = HttpService:JSONEncode({ userIds = chunk })
+		local urls = {
+			'https://presence.roblox.com/v1/presence/users',
+			'https://presence.roproxy.com/v1/presence/users',
+		}
+		for _, url in ipairs(urls) do
+			local res = httpRequest({
+				Url = url,
+				Method = 'POST',
+				Headers = {
+					['Content-Type'] = 'application/json',
+					Accept = 'application/json',
+				},
+				Body = body,
+			})
+			if not res then
+				continue
+			end
+			local status = tonumber(res.StatusCode) or tonumber(res.Status) or 0
+			local rawBody = res.Body or res.body or ''
+			if status < 200 or status >= 300 or type(rawBody) ~= 'string' or rawBody == '' then
+				continue
+			end
+			local okDecode, data = pcall(function()
+				return HttpService:JSONDecode(rawBody)
+			end)
+			if not okDecode or type(data) ~= 'table' then
+				continue
+			end
+			local list = data.userPresences or data.UserPresences or {}
+			for _, row in ipairs(list) do
+				if type(row) ~= 'table' then
+					continue
+				end
+				local ptype = tonumber(row.userPresenceType or row.UserPresenceType) or 0
+				if ptype ~= 2 then
+					continue
+				end
+				local pid = tonumber(row.placeId or row.PlaceId or row.rootPlaceId or row.RootPlaceId)
+				if pid ~= placeId then
+					continue
+				end
+				local job = row.gameId or row.GameId or row.instanceId or row.InstanceId
+				if type(job) ~= 'string' or job == '' then
+					continue
+				end
+				local uid = tonumber(row.userId or row.UserId)
+				local name = (uid and idToName[uid]) or (uid and ('User' .. uid)) or '?'
+				local bag = byJob[job]
+				if not bag then
+					bag = {}
+					byJob[job] = bag
+				end
+				bag[#bag + 1] = name
+			end
+			break
+		end
+		table.clear(chunk)
+	end
+	for _, uid in ipairs(ids) do
+		chunk[#chunk + 1] = uid
+		if #chunk >= 100 then
+			flushChunk()
+		end
+	end
+	flushChunk()
+	return byJob
+end
+
+local serverBrowseGen = 0
+
+local function clearListItems(list)
+	for _, child in ipairs(list:GetChildren()) do
+		if not child:IsA('UIListLayout') and not child:IsA('UIPadding') then
+			child:Destroy()
+		end
+	end
+end
+
+local function setPanelChrome(list, titleText, hintText)
+	local root = list and list.Parent
+	if not root then
+		return
+	end
+	local drag = root:FindFirstChild('Drag')
+	if drag and drag:IsA('TextButton') then
+		drag.Text = titleText or 'Join floor'
+	end
+	local hint = root:FindFirstChild('Hint')
+	if hint and hint:IsA('TextLabel') then
+		hint.Text = hintText or ''
+	end
+end
+
+local function fillServerList(list, rec, nextCursor, accumulated)
+	accumulated = accumulated or {}
+	serverBrowseGen += 1
+	local gen = serverBrowseGen
+	getgenv().SB2ServerHopListMode = 'servers'
+	getgenv().SB2ServerHopBrowseRec = rec
+
+	local label = rec.floor and ('F' .. rec.floor .. ' ' .. rec.name) or rec.name
+	setPanelChrome(
+		list,
+		'Servers — ' .. label,
+		'Tap a server to join · Friends shown when Roblox reports them · Shift+click floor = random'
+	)
+	clearListItems(list)
+
+	local order = 1
+	local function addActionButton(text, color, onClick)
+		local btn = Instance.new('TextButton')
+		btn.Size = UDim2.new(1, -4, 0, 34)
+		btn.BackgroundColor3 = color
+		btn.BorderSizePixel = 0
+		btn.AutoButtonColor = true
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 13
+		btn.TextColor3 = Color3.fromRGB(235, 238, 245)
+		btn.Text = text
+		btn.LayoutOrder = order
+		order += 1
+		btn.Parent = list
+		Instance.new('UICorner', btn).CornerRadius = UDim.new(0, 6)
+		btn.MouseButton1Click:Connect(onClick)
+		return btn
+	end
+
+	addActionButton('← Back to floors', Color3.fromRGB(50, 55, 65), function()
+		local back = getgenv().SB2ServerHopBackToFloors
+		if type(back) == 'function' then
+			back(list)
+			return
+		end
+		serverBrowseGen += 1
+		local refill = getgenv().SB2ServerHopRefillFloors
+		if type(refill) == 'function' then
+			refill(list)
+		end
+	end)
+	addActionButton('Join random server', Color3.fromRGB(45, 70, 95), function()
+		joinPlace(rec)
+	end)
+
+	local loading = Instance.new('TextLabel')
+	loading.Size = UDim2.new(1, -4, 0, 28)
+	loading.BackgroundTransparency = 1
+	loading.Font = Enum.Font.Gotham
+	loading.TextSize = 12
+	loading.TextXAlignment = Enum.TextXAlignment.Left
+	loading.TextColor3 = Color3.fromRGB(140, 148, 160)
+	loading.Text = nextCursor and 'Loading more servers…' or 'Loading public servers…'
+	loading.LayoutOrder = order
+	loading.Parent = list
+
+	task.spawn(function()
+		local friendsMap = fetchFriendsOnPlace(rec.placeId)
+		if gen ~= serverBrowseGen then
+			return
+		end
+
+		local page, err, cursor = fetchPublicServersPage(rec.placeId, nextCursor)
+		if gen ~= serverBrowseGen then
+			return
+		end
+		if loading.Parent then
+			loading:Destroy()
+		end
+
+		if not page then
+			local errLbl = Instance.new('TextLabel')
+			errLbl.Size = UDim2.new(1, -4, 0, 48)
+			errLbl.BackgroundTransparency = 1
+			errLbl.Font = Enum.Font.Gotham
+			errLbl.TextWrapped = true
+			errLbl.TextSize = 12
+			errLbl.TextXAlignment = Enum.TextXAlignment.Left
+			errLbl.TextColor3 = Color3.fromRGB(255, 140, 140)
+			errLbl.Text = 'Could not load servers: ' .. tostring(err)
+			errLbl.LayoutOrder = order
+			errLbl.Parent = list
+			return
+		end
+
+		for _, srv in ipairs(page) do
+			if type(srv) == 'table' and srv.id then
+				accumulated[#accumulated + 1] = srv
+			end
+		end
+
+		table.sort(accumulated, function(a, b)
+			local pa = tonumber(a.playing) or 0
+			local pb = tonumber(b.playing) or 0
+			if pa ~= pb then
+				return pa > pb
+			end
+			return tostring(a.id) < tostring(b.id)
+		end)
+
+		if gen ~= serverBrowseGen then
+			return
+		end
+		if getgenv().SB2ServerHopListMode ~= 'servers' then
+			return
+		end
+
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA('TextButton') or child:IsA('TextLabel') then
+				if child.Text:find('Loading') or child.Text:find('Could not') then
+					child:Destroy()
+				end
+			end
+		end
+		-- Remove duplicate server rows from prior partial render.
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA('TextButton') and child.Name == 'ServerRow' then
+				child:Destroy()
+			end
+		end
+
+		local rowOrder = order + 10
+		local herePlace = tonumber(game.PlaceId) == tonumber(rec.placeId)
+		local hereJob = tostring(game.JobId or '')
+
+		for _, srv in ipairs(accumulated) do
+			local job = tostring(srv.id)
+			local playing = tonumber(srv.playing) or 0
+			local maxP = tonumber(srv.maxPlayers) or 20
+			local friends = friendsMap[job]
+			local friendLine = ''
+			if type(friends) == 'table' and #friends > 0 then
+				friendLine = '\n  Friends: ' .. table.concat(friends, ', ')
+			end
+			local suffix = ''
+			if herePlace and job == hereJob then
+				suffix = '  (this server)'
+			end
+			local row = Instance.new('TextButton')
+			row.Name = 'ServerRow'
+			row.Size = UDim2.new(1, -4, 0, friendLine ~= '' and 52 or 40)
+			row.BackgroundColor3 = Color3.fromRGB(36, 40, 48)
+			row.BorderSizePixel = 0
+			row.AutoButtonColor = true
+			row.Font = Enum.Font.GothamMedium
+			row.TextSize = 12
+			row.TextXAlignment = Enum.TextXAlignment.Left
+			row.TextYAlignment = Enum.TextYAlignment.Top
+			row.TextColor3 = Color3.fromRGB(235, 238, 245)
+			row.Text = ('  %d/%d players%s\n  %s%s'):format(
+				playing,
+				maxP,
+				suffix,
+				job:sub(1, 8) .. '…',
+				friendLine
+			)
+			row.LayoutOrder = rowOrder
+			rowOrder += 1
+			row.Parent = list
+			Instance.new('UICorner', row).CornerRadius = UDim.new(0, 6)
+			row.MouseButton1Click:Connect(function()
+				joinPlaceInstance(rec.placeId, job, label .. ' · ' .. playing .. ' players')
+			end)
+		end
+
+		if gen ~= serverBrowseGen then
+			return
+		end
+
+		if type(cursor) == 'string' and cursor ~= '' then
+			addActionButton('Load more servers…', Color3.fromRGB(55, 60, 72), function()
+				fillServerList(list, rec, cursor, accumulated)
+			end)
+		elseif #accumulated == 0 then
+			local empty = Instance.new('TextLabel')
+			empty.Size = UDim2.new(1, -4, 0, 36)
+			empty.BackgroundTransparency = 1
+			empty.Font = Enum.Font.Gotham
+			empty.TextSize = 12
+			empty.TextXAlignment = Enum.TextXAlignment.Left
+			empty.TextColor3 = Color3.fromRGB(140, 148, 160)
+			empty.Text = 'No public servers listed — try Join random or later.'
+			empty.LayoutOrder = rowOrder
+			empty.Parent = list
+		end
+	end)
+end
+
+local function openServerBrowser(list, rec)
+	if type(getgenv().SB2ServerHopBrowseFloor) == 'function' then
+		return getgenv().SB2ServerHopBrowseFloor(list, rec)
+	end
+	if not list or not rec then
+		return false
+	end
+	setFloorPanelOpen(true)
+	fillServerList(list, rec, nil, {})
+	return true
+end
+
+getgenv().SB2ServerHopOpenServerBrowser = function(target)
+	if not okLoad then
+		okLoad, loadInfo = loadLocations()
+	end
+	finishCatalogLoad()
+	local rec = type(target) == 'table' and target or resolveTarget(tostring(target or ''))
+	if not rec then
+		say('unknown floor — try shlist')
+		return false
+	end
+	ensureFloorGui()
+	setFloorPanelOpen(true)
+	local gui = getgenv().SB2ServerHopGui
+	local list = gui and gui:FindFirstChild('Root') and gui.Root:FindFirstChild('List')
+	if list then
+		openServerBrowser(list, rec)
+		return true
+	end
+	return false
 end
 
 local function joinFromArgs(args)
@@ -769,9 +1288,60 @@ local function setFloorPanelOpen(open)
 	end
 end
 
+local function storyFloorRecords()
+	local out = {}
+	local maxStory = 0
+	for k, rec in pairs(catalog.floors) do
+		if type(k) == 'number' and type(rec) == 'table' and rec.placeId then
+			maxStory = math.max(maxStory, k)
+		end
+	end
+	if maxStory > 0 then
+		for i = 1, maxStory do
+			local rec = catalog.floors[i]
+			if type(rec) == 'table' and rec.placeId then
+				out[#out + 1] = rec
+			end
+		end
+	end
+	if #out > 0 then
+		return out
+	end
+	for _, rec in ipairs(HARD_STORY_FLOORS) do
+		out[#out + 1] = {
+			placeId = rec.placeId,
+			name = rec.name,
+			floor = rec.floor,
+			category = 'Main',
+		}
+	end
+	return out
+end
+
 local function fillFloorList(list)
-	applyHardFloors()
-	applyExtraPlaces()
+	serverBrowseGen += 1
+	getgenv().SB2ServerHopListMode = 'floors'
+	getgenv().SB2ServerHopBrowseRec = nil
+
+	if not okLoad or #catalog.all == 0 then
+		okLoad, loadInfo = loadLocations()
+	end
+	finishCatalogLoad()
+
+	local placeCount = #catalog.all
+	local storyRows = storyFloorRecords()
+	setPanelChrome(
+		list,
+		('Join floor · %d places'):format(placeCount),
+		('Story F1–F%d at top — scroll up if you only see events · Shift+click = random join'):format(
+			math.max(#storyRows, #catalog.floors)
+		)
+	)
+
+	if list then
+		list.CanvasPosition = Vector2.new(0, 0)
+	end
+
 	for _, child in ipairs(list:GetChildren()) do
 		if not child:IsA('UIListLayout') and not child:IsA('UIPadding') then
 			child:Destroy()
@@ -807,11 +1377,24 @@ local function fillFloorList(list)
 		row.LayoutOrder = order
 		row.Parent = list
 		Instance.new('UICorner', row).CornerRadius = UDim.new(0, 6)
-		row.MouseButton1Click:Connect(function()
-			setFloorPanelOpen(false)
-			joinPlace(rec)
-		end)
+		local function onRowActivate()
+			local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+				or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+			if shift then
+				joinPlace(rec)
+				return
+			end
+			local browse = getgenv().SB2ServerHopBrowseFloor
+			if type(browse) ~= 'function' then
+				say('Join UI outdated — PlayerTools → Browse floor servers')
+				return
+			end
+			browse(list, rec)
+		end
+		row.MouseButton1Click:Connect(onRowActivate)
 	end
+
+	getgenv().SB2ServerHopRefillFloors = fillFloorList
 
 	local order = 1
 	if #catalog.floors == 0 and #catalog.all == 0 then
@@ -848,11 +1431,12 @@ local function fillFloorList(list)
 	end
 
 	local storySet = storyPlaceSet()
-	if #catalog.floors > 0 then
-		addHeader('Story floors (F1–F' .. tostring(#catalog.floors) .. ')', order)
+	if #storyRows > 0 then
+		addHeader('Story floors (F1–F' .. tostring(#storyRows) .. ')', order)
 		order += 1
-		for i, rec in ipairs(catalog.floors) do
-			addRow(rec, string.format('F%d  %s', i, rec.name), order)
+		for i, rec in ipairs(storyRows) do
+			local fnum = rec.floor or i
+			addRow(rec, string.format('F%d  %s', fnum, rec.name), order)
 			order += 1
 		end
 	end
@@ -944,6 +1528,14 @@ local function ensureFloorGui()
 			local old = existing:FindFirstChild('Widget')
 			if old then
 				old:Destroy()
+			end
+		end)
+		task.defer(function()
+			local root = existing:FindFirstChild('Root')
+			local list = root and root:FindFirstChild('List')
+			local refill = getgenv().SB2ServerHopRefillFloors
+			if list and type(refill) == 'function' then
+				pcall(refill, list)
 			end
 		end)
 		return existing
@@ -1066,25 +1658,30 @@ local function ensureFloorGui()
 	end)
 
 	local hint = Instance.new('TextLabel')
+	hint.Name = 'Hint'
 	hint.BackgroundTransparency = 1
-	hint.Size = UDim2.new(1, -20, 0, 18)
+	hint.Size = UDim2.new(1, -20, 0, 32)
 	hint.Position = UDim2.fromOffset(12, 34)
 	hint.Font = Enum.Font.Gotham
 	hint.TextSize = 11
+	hint.TextWrapped = true
 	hint.TextXAlignment = Enum.TextXAlignment.Left
+	hint.TextYAlignment = Enum.TextYAlignment.Top
 	hint.TextColor3 = Color3.fromRGB(140, 148, 160)
-	hint.Text = 'Click once to join — also: join F11'
+	hint.Text = 'Pick a floor → public server list · Shift+click = random join'
 	hint.Parent = frame
 
 	local list = Instance.new('ScrollingFrame')
 	list.Name = 'List'
-	list.Size = UDim2.new(1, -20, 1, -64)
-	list.Position = UDim2.fromOffset(10, 56)
+	list.Size = UDim2.new(1, -20, 1, -72)
+	list.Position = UDim2.fromOffset(10, 64)
 	list.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
 	list.BorderSizePixel = 0
 	list.ScrollBarThickness = 5
 	list.CanvasSize = UDim2.new(0, 0, 0, 0)
 	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Active = true
+	list.ScrollingEnabled = true
 	list.Parent = frame
 	Instance.new('UICorner', list).CornerRadius = UDim.new(0, 8)
 
@@ -1107,13 +1704,15 @@ end
 local function showFloorGui()
 	ensureFloorGui()
 	okLoad, loadInfo = loadLocations()
+	finishCatalogLoad()
 	local gui = getgenv().SB2ServerHopGui
 	local list = gui and gui:FindFirstChild('Root') and gui.Root:FindFirstChild('List')
 	if list then
 		fillFloorList(list)
 	end
 	setFloorPanelOpen(true)
-	say(('locations — %d places (%d story)'):format(#catalog.all, #catalog.floors))
+	local storyN = #storyFloorRecords()
+	say(('locations — %d places (%d story)'):format(#catalog.all, storyN))
 end
 
 local function toggleFloorGui()
@@ -1160,6 +1759,112 @@ do
 			pcall(fillFloorList, list)
 		end
 	end)
+end
+
+-- Public browse API (defined last so fillServerList / setFloorPanelOpen / fillFloorList exist).
+do
+	local function normalizeHopRec(rec)
+		if type(rec) ~= 'table' then
+			return nil
+		end
+		local pid = tonumber(rec.placeId or rec.PlaceId)
+		if not pid then
+			return nil
+		end
+		return {
+			placeId = pid,
+			name = tostring(rec.name or rec.Name or ('Place ' .. tostring(pid))),
+			floor = rec.floor,
+			category = rec.category,
+		}
+	end
+
+	local function resolveHopList(maybeList)
+		if maybeList and maybeList.Parent then
+			return maybeList
+		end
+		local gui = getgenv().SB2ServerHopGui
+		local root = gui and gui:FindFirstChild('Root')
+		return root and root:FindFirstChild('List')
+	end
+
+	local browseBusy = false
+	getgenv().SB2ServerHopBrowseFloor = function(list, rec)
+		if browseBusy then
+			return false
+		end
+		rec = normalizeHopRec(rec)
+		if not rec then
+			say('bad floor row (no place id)')
+			return false
+		end
+		list = resolveHopList(list)
+		if not list then
+			say('Join list missing — close & reopen Join panel')
+			return false
+		end
+		browseBusy = true
+		say('Loading servers: ' .. rec.name)
+		local ok, err = pcall(function()
+			setFloorPanelOpen(true)
+			list.CanvasPosition = Vector2.new(0, 0)
+			fillServerList(list, rec, nil, {})
+		end)
+		browseBusy = false
+		if not ok then
+			say('server list: ' .. tostring(err))
+			warn('[Join] server list: ' .. tostring(err))
+		end
+		return ok
+	end
+	getgenv().SB2ServerHopShowServers = getgenv().SB2ServerHopBrowseFloor
+
+	getgenv().SB2ServerHopBrowseCurrentFloor = function()
+		ensureFloorGui()
+		setFloorPanelOpen(true)
+		local pid = tonumber(game.PlaceId)
+		local rec = nil
+		for _, r in ipairs(catalog.all) do
+			if tonumber(r.placeId) == pid then
+				rec = r
+				break
+			end
+		end
+		if not rec and type(catalog.floors) == 'table' then
+			for _, r in ipairs(catalog.floors) do
+				if type(r) == 'table' and tonumber(r.placeId) == pid then
+					rec = r
+					break
+				end
+			end
+		end
+		if not rec then
+			rec = { placeId = pid, name = 'Current floor' }
+		end
+		return getgenv().SB2ServerHopBrowseFloor(nil, rec)
+	end
+
+	getgenv().SB2ServerHopRefillFloors = fillFloorList
+
+	getgenv().SB2ServerHopBackToFloors = function(maybeList)
+		serverBrowseGen += 1
+		getgenv().SB2ServerHopListMode = 'floors'
+		getgenv().SB2ServerHopBrowseRec = nil
+		local hopList = resolveHopList(maybeList)
+		if not hopList then
+			say('Join list missing')
+			return false
+		end
+		local ok, err = pcall(function()
+			hopList.CanvasPosition = Vector2.new(0, 0)
+			fillFloorList(hopList)
+		end)
+		if not ok then
+			say('back to floors: ' .. tostring(err))
+			warn('[Join] back to floors: ' .. tostring(err))
+		end
+		return ok
+	end
 end
 
 local Plugin = {
@@ -1218,6 +1923,19 @@ local Plugin = {
 					end
 				end
 				say('pill dock ready — drag the stack to move Join/WP/JL together')
+			end,
+		},
+		['shbrowse'] = {
+			['ListName'] = 'shbrowse / browse [F11|name]',
+			['Description'] = 'Open public server list for a floor (Join panel)',
+			['Aliases'] = { 'browse', 'servers', 'shservers' },
+			['Function'] = function(args)
+				local raw = args and table.concat(args, ' ') or ''
+				if raw == '' then
+					showFloorGui()
+					return
+				end
+				getgenv().SB2ServerHopOpenServerBrowser(raw)
 			end,
 		},
 		['shstop'] = {

@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Palebrand
+|image=<gallery>
+Palebrand.png | Icon
+Palebrand in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Tribute
+|level=465
+|dmg=Clean: 63,852
+Max: 127,704
+|crit=50%
+|obtain=[[]]
+|abilities=+60% Health Regeneration
++60% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Tribute}} level 465 Rapier, dropped by [[???]] in [[]]. It has a 50% critical chance and does 63,852 damage. When [[Upgrading|upgraded]] to +20, it does 127,704 damage. In addition, it grants the user a +60% health regeneration buff and +60% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Tributes]]

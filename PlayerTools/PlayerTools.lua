@@ -88,6 +88,33 @@ do
 	getgenv().SB2RefreshPlayerTools = nil
 end
 
+-- Full reload from disk (re-reads PlayerTools_Obsidian). SB2RefreshPlayerTools does NOT.
+getgenv().SB2FullReloadPlayerTools = function()
+	getgenv().SB2ForceFullReload = true
+	getgenv().SB2PlayerToolsManualUnload = nil
+	getgenv().SB2PlayerTools = false
+	getgenv().SB2RefreshPlayerTools = nil
+	getgenv().SB2PlayerToolsCode = nil
+	local gui = getgenv().SB2PlayerToolsGui
+	if typeof(gui) == 'Instance' then
+		pcall(function()
+			gui:Destroy()
+		end)
+	end
+	getgenv().SB2PlayerToolsGui = nil
+	for _, path in ipairs({ 'PlayerTools/PlayerTools.lua', 'PlayerTools.lua' }) do
+		if type(isfile) == 'function' and isfile(path) then
+			local src = readfile(path)
+			local fn, err = compile(src, path)
+			if not fn then
+				error('[PlayerTools] full reload compile failed: ' .. tostring(err))
+			end
+			return fn()
+		end
+	end
+	error('[PlayerTools] PlayerTools.lua missing')
+end
+
 for _, path in ipairs({ 'PlayerTools/launch.lua', 'launch.lua' }) do
 	if type(isfile) == 'function' and isfile(path) then
 		local src = readfile(path)

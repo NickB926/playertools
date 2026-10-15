@@ -1,0 +1,19 @@
+{{Item infobox
+|name=Warden Vanguard
+|image=<gallery>
+Warden Vanguard.png | Icon
+Warden Vanguard in-game.png | In-game
+</gallery>
+|type=Armor
+|rarity=Legendary
+|level=285
+|def=Clean: 175,000
+Max: 245,000
+|obtain=[[]]
+|abilities=+25% Health Regeneration
++25% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 285 armor, dropped by [[???]] in [[]]. At base, it provides the player with 175,000 defenses, and when [[Upgrading|upgraded]] to +20, it provides the player with 245,000 defense. In addition, it grants the user a +25% health regeneration buff and +25% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

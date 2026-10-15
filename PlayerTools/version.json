@@ -1,8 +1,7 @@
 {
-    "version":  "1.0.23",
-    "message":  "Boss kills: full Locations/Mobs/Drops boss + miniboss list",
+    "version":  "1.0.21",
+    "message":  "Ataraxia: library anti-AFK, account profiles, toast stacking, per-script version label",
     "files":  [
-                  "Ataraxia.lua",
                   "PlayerTools/launch.lua",
                   "PlayerTools/PlayerTools.lua",
                   "PlayerTools/init.lua",

@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Fracture Fang
+|image=<gallery>
+Fracture Fang.png | Icon
+Fracture Fang in-game.png | In-game
+</gallery>
+|type=Longsword (Longsword)
+|rarity=Rare
+|level=100
+|dmg=Clean: 1,460
+Max: 2,920
+|crit=16%
+|obtain=[[]]
+|abilities=+10% Health Regeneration
++10% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Rare}} level 100 Longsword, dropped by [[???]] in [[]]. It has a 16% critical chance and does 1,460 damage. When [[Upgrading|upgraded]] to +20, it does 2,920 damage. In addition, it grants the user a +10% health regeneration buff and +10% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Rares]]

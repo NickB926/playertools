@@ -5,6 +5,8 @@
 	Custom titles: local UIGradient / UIStroke / Icon / optional loops (client-only).
 ]]
 
+getgenv().SB2TitlingBuild = 'titling-specialalias-v6'
+
 return function(env)
 	local WikiTab = env.WikiTab or env.ItemsTab
 	local Library = env.Library
@@ -22,6 +24,10 @@ return function(env)
 	local CUSTOM_PRESETS_PATH = 'PlayerTools/custom_titles.json'
 	local DEFAULT_SPARK_IMAGE = 'rbxassetid://8310516210'
 	local DEFAULT_ICON_IMAGE = 'rbxassetid://2607452359'
+	local RENDER_GAME = 'Game module (animated)'
+	local RENDER_CUSTOM = 'Custom editor (approximate)'
+	-- Set when importing a game title; Apply uses real SpecialAlias / AnimatedRarities when render mode is game.
+	local lastImportedGameTitleKey = nil
 
 	local TitlingBox = WikiTab:AddLeftGroupbox('Titling')
 	assert(TitlingBox, 'Titling groupbox nil')
@@ -40,6 +46,64 @@ return function(env)
 	local savedPlates = {}
 	local activeFx = {} -- [label] = { token = number, conns = {..} }
 
+	-- Dev Colors[userId] + Community Staff CommunityStaffIndex (StaffColors[1..3])
+	local TITLE_VARIANTS = {
+		['Dev - Gold'] = { base = 'Dev', userId = 478848349 }, -- Vienyx
+		['Dev - Green'] = { base = 'Dev', userId = 1801714748 }, -- BGMDev
+		['Dev - Blue'] = { base = 'Dev', userId = 309775741 }, -- Ayanakojj
+		['Community Staff - Purple'] = { base = 'Community Staff', staffIndex = 1 },
+		['Community Staff - Blue'] = { base = 'Community Staff', staffIndex = 2 },
+		['Community Staff - Red'] = { base = 'Community Staff', staffIndex = 3 },
+	}
+	-- Tri-color themes when SpecialAlias .new leaves a plain white Tag (common on nameplates).
+	local COMMUNITY_STAFF_TRI_COLORS = {
+		[1] = {
+			Color3.fromRGB(210, 95, 255),
+			Color3.fromRGB(150, 210, 255),
+			Color3.fromRGB(255, 130, 210),
+		},
+		[2] = {
+			Color3.fromRGB(70, 165, 255),
+			Color3.fromRGB(210, 245, 255),
+			Color3.fromRGB(255, 120, 190),
+		},
+		[3] = {
+			Color3.fromRGB(255, 85, 110),
+			Color3.fromRGB(255, 195, 120),
+			Color3.fromRGB(195, 95, 255),
+		},
+	}
+	local VARIANT_ORDER = {
+		'Dev - Gold',
+		'Dev - Green',
+		'Dev - Blue',
+		'Community Staff - Purple',
+		'Community Staff - Blue',
+		'Community Staff - Red',
+	}
+	-- Bare entries have no color context — use the variants above.
+	local VARIANT_BASE_HIDDEN = {
+		Dev = true,
+		['Community Staff'] = true,
+	}
+
+	local function tagUsesBehideSibling(tag, baseTitleName)
+		if not tag then
+			return false
+		end
+		if baseTitleName == 'Plasmatic' or baseTitleName == "Blossom's Solstice" then
+			return true
+		end
+		if tag:FindFirstChild('Symbol') then
+			return true
+		end
+		local t = tostring(tag.Text or '')
+		if t:find('Plasmatic', 1, true) then
+			return true
+		end
+		return false
+	end
+
 	local function stopCustomFx(label)
 		local fx = label and activeFx[label]
 		if not fx then
@@ -56,11 +120,113 @@ return function(env)
 		activeFx[label] = nil
 	end
 
+	-- Plasmatic parents green Smoke to a sibling BehideFrame (not under Tag).
+	-- Deferred CreateSmoke can respawn that frame briefly after a Tag swap.
+	local TITLE_PURGE_GEN_ATTR = 'SB2TitlePurgeGen'
+
+	local function bumpTitlePurgeGen(host)
+		if not host then
+			return 0
+		end
+		local g = (tonumber(host:GetAttribute(TITLE_PURGE_GEN_ATTR)) or 0) + 1
+		host:SetAttribute(TITLE_PURGE_GEN_ATTR, g)
+		return g
+	end
+
+	local function hostHasLiveGameTitleFx(host)
+		if not host then
+			return false
+		end
+		local tag = host:FindFirstChild('Tag')
+		if not tag then
+			return false
+		end
+		if tag:FindFirstChild('Symbol') or tostring(tag.Text):find('Plasmatic', 1, true) then
+			return true
+		end
+		if tag:FindFirstChildWhichIsA('UIGradient') or tag:FindFirstChildWhichIsA('UIStroke') then
+			return true
+		end
+		for _, ch in ipairs(tag:GetChildren()) do
+			if ch:IsA('ImageLabel') or ch:IsA('ImageButton') then
+				return true
+			end
+		end
+		for _, t in ipairs(CollectionService:GetTags(tag)) do
+			if type(t) == 'string' and t ~= '' then
+				return true
+			end
+		end
+		if tagUsesBehideSibling(tag) then
+			for _, ch in ipairs(host:GetChildren()) do
+				if ch ~= tag and (ch.Name == 'BehideFrame' or ch.Name:match('^Behide') or ch.Name == 'Smoke') then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local function forcePurgeBehideSiblings(host, keepTag)
+		if not host then
+			return
+		end
+		for _, child in ipairs(host:GetChildren()) do
+			if child ~= keepTag then
+				local n = child.Name
+				if n == 'BehideFrame' or n:match('^Behide') or n == 'Smoke' or n == 'Spark' then
+					pcall(function()
+						child:Destroy()
+					end)
+				end
+			end
+		end
+	end
+
+	local function purgeOrphanTitleFx(host)
+		if not host then
+			return
+		end
+		local tag = host:FindFirstChild('Tag')
+		if tagUsesBehideSibling(tag) and hostHasLiveGameTitleFx(host) then
+			return
+		end
+		for _, child in ipairs(host:GetChildren()) do
+			local n = child.Name
+			if n == 'BehideFrame' or n:match('^Behide') or n == 'Smoke' or n == 'Spark' then
+				pcall(function()
+					child:Destroy()
+				end)
+			end
+		end
+	end
+
+	local function scheduleOrphanTitleFxPurge(host, expectedGen)
+		if not host then
+			return
+		end
+		expectedGen = expectedGen or tonumber(host:GetAttribute(TITLE_PURGE_GEN_ATTR)) or 0
+		for _, delaySec in ipairs({ 0.05, 0.2, 0.5, 1.2, 2.3 }) do
+			task.delay(delaySec, function()
+				if not host.Parent then
+					return
+				end
+				if (tonumber(host:GetAttribute(TITLE_PURGE_GEN_ATTR)) or 0) ~= expectedGen then
+					return
+				end
+				if hostHasLiveGameTitleFx(host) then
+					return
+				end
+				purgeOrphanTitleFx(host)
+			end)
+		end
+	end
+
 	-- SpecialAlias loops (Blossom/Plasmatic/custom sparks) keep a hard ref to the Tag
 	-- TextLabel and keep parenting Image overlays after we only Destroy children.
 	-- Replacing the Tag instance makes those loops see Parent==nil and exit.
 	local function resetNameplateTag(oldLabel)
-		if not oldLabel or not oldLabel.Parent then
+		if not oldLabel then
 			return nil
 		end
 		stopCustomFx(oldLabel)
@@ -70,11 +236,13 @@ return function(env)
 			end
 		end)
 		local parent = oldLabel.Parent
-		local behide = parent:FindFirstChild('BehideFrame')
-		if behide then
-			pcall(function()
-				behide:Destroy()
-			end)
+		-- Detach first so Plasmatic/Blossom while-loops exit before we rebuild.
+		pcall(function()
+			oldLabel.Name = '_TagDead'
+			oldLabel.Parent = nil
+		end)
+		if parent then
+			purgeOrphanTitleFx(parent)
 		end
 
 		local fresh = Instance.new('TextLabel')
@@ -120,16 +288,23 @@ return function(env)
 				fresh:SetAttribute(attr, oldLabel:GetAttribute(attr))
 			end)
 		end
-		fresh.Name = oldLabel.Name
+		fresh.Name = 'Tag'
 		fresh.TextColor3 = Color3.new(1, 1, 1)
 		fresh.RichText = false
+		fresh.ZIndex = 1
 
 		local order = oldLabel.LayoutOrder
 		pcall(function()
 			oldLabel:Destroy()
 		end)
+		if not parent then
+			return nil
+		end
 		fresh.Parent = parent
 		fresh.LayoutOrder = order
+		purgeOrphanTitleFx(parent)
+		local purgeGen = bumpTitlePurgeGen(parent)
+		scheduleOrphanTitleFxPurge(parent, purgeGen)
 		return fresh
 	end
 
@@ -170,27 +345,145 @@ return function(env)
 		return names
 	end
 
+	local function getCardinalServices()
+		local cc = ReplicatedStorage:FindFirstChild('CardinalClient')
+		local main = cc and cc:FindFirstChild('MainModule')
+		return main and main:FindFirstChild('Services')
+	end
+
+	-- Graphics is a ModuleScript — never use graphics.SpecialAlias (invalid member).
+	local function getSpecialAliasFolder()
+		local cached = getgenv().SB2SpecialAliasFolder
+		if typeof(cached) == 'Instance' and cached.Parent then
+			return cached
+		end
+		local function pick(inst)
+			if inst and inst.Parent then
+				getgenv().SB2SpecialAliasFolder = inst
+				return inst
+			end
+			return nil
+		end
+		local services = getCardinalServices()
+		local graphics = services and services:FindFirstChild('Graphics')
+		if graphics then
+			local alias = graphics:FindFirstChild('SpecialAlias')
+			if alias then
+				return pick(alias)
+			end
+		end
+		local cc = ReplicatedStorage:FindFirstChild('CardinalClient')
+		local main = cc and cc:FindFirstChild('MainModule')
+		if main then
+			for _, inst in ipairs(main:GetDescendants()) do
+				if inst.Name == 'SpecialAlias' and (inst:IsA('Folder') or inst:IsA('ModuleScript')) then
+					local fn = inst:GetFullName()
+					if fn:find('Graphics', 1, true) then
+						return pick(inst)
+					end
+				end
+			end
+		end
+		for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
+			if inst.Name == 'SpecialAlias' and (inst:IsA('Folder') or inst:IsA('ModuleScript')) then
+				return pick(inst)
+			end
+		end
+		return nil
+	end
+
 	local function findSpecialAliasModule(tagName)
 		if type(tagName) ~= 'string' or tagName == '' then
 			return nil
 		end
 		if type(getloadedmodules) == 'function' then
 			for _, mod in ipairs(getloadedmodules()) do
-				if mod.Name == tagName and mod:GetFullName():find('SpecialAlias', 1, true) then
+				if mod:IsA('ModuleScript')
+					and mod.Name == tagName
+					and mod:GetFullName():find('SpecialAlias', 1, true)
+				then
 					return mod
 				end
 			end
 		end
+		local alias = getSpecialAliasFolder()
+		if alias then
+			local direct = alias:FindFirstChild(tagName)
+			if direct and direct:IsA('ModuleScript') then
+				return direct
+			end
+		end
 		local cc = ReplicatedStorage:FindFirstChild('CardinalClient')
 		local main = cc and cc:FindFirstChild('MainModule')
-		local services = main and main:FindFirstChild('Services')
-		local graphics = services and services:FindFirstChild('Graphics')
-		local alias = graphics and graphics:FindFirstChild('SpecialAlias')
-		local mod = alias and alias:FindFirstChild(tagName)
-		if mod and mod:IsA('ModuleScript') then
-			return mod
+		if main then
+			for _, inst in ipairs(main:GetDescendants()) do
+				if inst:IsA('ModuleScript')
+					and inst.Name == tagName
+					and inst:GetFullName():find('SpecialAlias', 1, true)
+				then
+					return inst
+				end
+			end
 		end
 		return nil
+	end
+
+	local TAGGED_UI_STYLE_FOLDERS = { 'AliasEffect', 'AnimatedRarities' }
+
+	local function findTaggedUiStyleModule(tagName)
+		if type(tagName) ~= 'string' or tagName == '' then
+			return nil
+		end
+		local services = getCardinalServices()
+		local tagged = services and services:FindFirstChild('Tagged')
+		local uiRoot = tagged and tagged:FindFirstChild('UI')
+		if not uiRoot then
+			return nil
+		end
+		for _, folderName in ipairs(TAGGED_UI_STYLE_FOLDERS) do
+			local folder = uiRoot:FindFirstChild(folderName)
+			local mod = folder and folder:FindFirstChild(tagName)
+			if mod and mod:IsA('ModuleScript') then
+				return mod
+			end
+		end
+		return nil
+	end
+
+	local function findTitleStyleModule(tagName)
+		return findSpecialAliasModule(tagName) or findTaggedUiStyleModule(tagName)
+	end
+
+	local function getCosmeticTagsUi()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local cardinal = pg and pg:FindFirstChild('CardinalUI')
+		local playerUi = cardinal and cardinal:FindFirstChild('PlayerUI')
+		local main = playerUi and playerUi:FindFirstChild('MainFrame')
+		local tabs = main and main:FindFirstChild('TabFrames')
+		local settings = tabs and tabs:FindFirstChild('Settings')
+		local attachments = settings and settings:FindFirstChild('Attachments')
+		return attachments and attachments:FindFirstChild('CosmeticTags')
+	end
+
+	local function getCosmeticTagUiRow(tagName)
+		if type(tagName) ~= 'string' or tagName == '' then
+			return nil
+		end
+		local ui = getCosmeticTagsUi()
+		return ui and ui:FindFirstChild(tagName)
+	end
+
+	local function canImportGameTitle(tagName)
+		if type(tagName) ~= 'string' or tagName == '' or tagName == NONE then
+			return false
+		end
+		if TITLE_VARIANTS[tagName] then
+			return findTitleStyleModule(resolveTitleSelection(tagName, LocalPlayer.UserId)) ~= nil
+		end
+		if findTitleStyleModule(tagName) then
+			return true
+		end
+		return getCosmeticTagUiRow(tagName) ~= nil
 	end
 
 	local function listTitleNames()
@@ -198,6 +491,9 @@ return function(env)
 		local seen = {}
 		local function add(n)
 			if type(n) ~= 'string' or n == '' or n == NONE or seen[n] then
+				return
+			end
+			if VARIANT_BASE_HIDDEN[n] then
 				return
 			end
 			seen[n] = true
@@ -227,10 +523,113 @@ return function(env)
 				end
 			end
 		end
+		-- Always expose Dev / Community Staff color variants (even if modules not loaded yet).
+		for _, variantName in ipairs(VARIANT_ORDER) do
+			add(variantName)
+		end
 		table.sort(names, function(a, b)
 			return a:lower() < b:lower()
 		end)
 		return names, seen
+	end
+
+	local function listImportTitleNames()
+		local names = {}
+		local seen = {}
+		local function add(n)
+			if type(n) ~= 'string' or n == '' or n == NONE or seen[n] then
+				return
+			end
+			if VARIANT_BASE_HIDDEN[n] then
+				return
+			end
+			seen[n] = true
+			names[#names + 1] = n
+		end
+		local alias = getSpecialAliasFolder()
+		if alias then
+			for _, child in ipairs(alias:GetChildren()) do
+				if child:IsA('ModuleScript') then
+					add(child.Name)
+				end
+			end
+		end
+		local services = getCardinalServices()
+		local tagged = services and services:FindFirstChild('Tagged')
+		local uiRoot = tagged and tagged:FindFirstChild('UI')
+		if uiRoot then
+			for _, folderName in ipairs(TAGGED_UI_STYLE_FOLDERS) do
+				local folder = uiRoot:FindFirstChild(folderName)
+				if folder then
+					for _, child in ipairs(folder:GetChildren()) do
+						if child:IsA('ModuleScript') then
+							add(child.Name)
+						end
+					end
+				end
+			end
+		end
+		local ui = getCosmeticTagsUi()
+		if ui then
+			for _, child in ipairs(ui:GetChildren()) do
+				if child:IsA('GuiObject') and child.Name ~= 'UIPadding' and child.Name ~= 'UIListLayout' then
+					add(child.Name)
+				end
+			end
+		end
+		for _, variantName in ipairs(VARIANT_ORDER) do
+			add(variantName)
+		end
+		table.sort(names, function(a, b)
+			return a:lower() < b:lower()
+		end)
+		return names
+	end
+
+	local function syncStaffIndexForPreview(previewPlayerName, staffIndex)
+		if type(staffIndex) ~= 'number' then
+			return
+		end
+		local plr = nil
+		if type(previewPlayerName) == 'string' and previewPlayerName ~= '' then
+			plr = Players:FindFirstChild(previewPlayerName)
+		end
+		plr = plr or LocalPlayer
+		pcall(function()
+			plr:SetAttribute('CommunityStaffIndex', staffIndex)
+		end)
+		local profiles = getProfilesFolder()
+		local prof = profiles and profiles:FindFirstChild(plr.Name)
+		if prof then
+			pcall(function()
+				prof:SetAttribute('CommunityStaffIndex', staffIndex)
+			end)
+			local iv = prof:FindFirstChild('CommunityStaffIndex')
+			if iv and iv:IsA('IntValue') then
+				iv.Value = staffIndex
+			end
+		end
+	end
+
+	local function resolveTitleSelection(titleName, fallbackUserId, previewPlayerName)
+		local variant = TITLE_VARIANTS[titleName]
+		if not variant then
+			return titleName, fallbackUserId, nil
+		end
+		local userId = variant.userId or fallbackUserId
+		if variant.staffIndex then
+			syncStaffIndexForPreview(previewPlayerName, variant.staffIndex)
+			local plr = nil
+			if type(previewPlayerName) == 'string' and previewPlayerName ~= '' then
+				plr = Players:FindFirstChild(previewPlayerName)
+			end
+			if not plr and userId then
+				plr = Players:GetPlayerByUserId(userId)
+			end
+			plr = plr or LocalPlayer
+			userId = plr.UserId
+		end
+		return variant.base, userId, variant
 	end
 
 	local function resolveCharacter(name)
@@ -334,50 +733,66 @@ return function(env)
 		end)
 	end
 
-	local function applyTitleToLabel(label, tagName, knownSet, userId)
-		if not label or type(tagName) ~= 'string' or tagName == '' then
-			return false, 'missing label/tag', nil
+	local function invokeTitleModule(modScript, label, effectUserId, variant)
+		if not modScript or not label then
+			return false, 'missing module/label'
 		end
-		label = resetNameplateTag(label)
-		if not label then
-			return false, 'could not reset nameplate tag', nil
-		end
-
-		local modScript = findSpecialAliasModule(tagName)
-		if not modScript then
-			label.Text = '[' .. tagName .. ']'
-			return true, 'text-only (no SpecialAlias module)', label
-		end
-
 		local okReq, mod = pcall(require, modScript)
-		if not okReq or type(mod) ~= 'table' then
-			label.Text = '[' .. tagName .. ']'
-			return true, 'text-only (require failed)', label
+		if not okReq then
+			return false, 'require failed'
 		end
-
-		label.Text = '[' .. tagName .. ']'
-		local effectData = { UserId = userId }
-		if type(mod.new) == 'function' then
-			local okNew = pcall(mod.new, label, effectData)
-			if okNew then
-				pcall(function()
-					CollectionService:AddTag(label, tagName)
-				end)
-				local hasFx = false
-				for _, child in ipairs(label:GetChildren()) do
-					if child:IsA('UIGradient') or child:IsA('UIStroke') or child:IsA('ImageLabel') then
-						hasFx = true
-						break
-					end
-				end
-				if hasFx then
-					return true, 'SpecialAlias.new', label
-				end
+		local effectData = { UserId = effectUserId }
+		if variant and variant.staffIndex then
+			effectData.CommunityStaffIndex = variant.staffIndex
+			effectData.StaffIndex = variant.staffIndex
+		end
+		local tried = false
+		local lastErr = nil
+		local function tryCall(fn, ...)
+			tried = true
+			local ok, err = pcall(fn, ...)
+			if not ok then
+				lastErr = err
+			end
+			return ok
+		end
+		if type(mod) == 'table' and type(mod.new) == 'function' then
+			if tryCall(mod.new, label, effectData) then
+				return true
 			end
 		end
+		if type(mod) == 'table' and type(mod.AddInstance) == 'function' then
+			if tryCall(mod.AddInstance, mod, label) then
+				return true
+			end
+		end
+		if type(mod) == 'function' then
+			if tryCall(mod, label, effectData) then
+				return true
+			end
+		end
+		if type(mod) == 'table' and type(mod.Apply) == 'function' then
+			if tryCall(mod.Apply, label, effectData) then
+				return true
+			end
+		end
+		if type(mod) == 'table' and type(mod.apply) == 'function' then
+			if tryCall(mod.apply, label, effectData) then
+				return true
+			end
+		end
+		if not tried then
+			return false, 'no entry point'
+		end
+		return false, lastErr or 'invoke failed'
+	end
 
+	local function cloneModuleTitleDecor(modScript, label)
+		if not modScript or not label then
+			return 0
+		end
 		local cloned = 0
-		for _, child in ipairs(modScript:GetChildren()) do
+		for _, child in ipairs(modScript:GetDescendants()) do
 			if child:IsA('UIGradient')
 				or child:IsA('UIStroke')
 				or child:IsA('UIPadding')
@@ -392,11 +807,144 @@ return function(env)
 				end
 			end
 		end
+		return cloned
+	end
+
+	local function tidyNameplateHost(host)
+		if not host then
+			return
+		end
+		for _, d in ipairs(host:GetDescendants()) do
+			if d:IsA('TextLabel') and d.Name ~= 'Tag' and tostring(d.Text):lower() == 'no' then
+				pcall(function()
+					d.Visible = false
+				end)
+			end
+		end
+	end
+
+	local function applySampledTitleFallback(label, displayName, baseName, variant)
+		local cfg = sampleTitleFromModule(displayName)
+		if not cfg then
+			return false, 'sample failed', label
+		end
+		cfg.text = baseName
+		cfg.brackets = true
+		if variant and variant.staffIndex then
+			local cols = COMMUNITY_STAFF_TRI_COLORS[variant.staffIndex]
+			if cols then
+				cfg.c1, cfg.c2, cfg.c3 = cols[1], cols[2], cols[3]
+			end
+			if cfg.anim == 'None' or cfg.anim == nil or cfg.anim == '' then
+				cfg.anim = 'Gradient slide'
+			end
+		end
+		if variant and variant.userId then
+			local altMod = findSpecialAliasModule(tostring(variant.userId))
+			if altMod then
+				local c1, c2, c3, stroke, thick, hasGrad = sampleModuleAssetColors(altMod)
+				if hasGrad then
+					cfg.c1, cfg.c2, cfg.c3 = c1, c2, c3
+					cfg.stroke = stroke
+					cfg.thickness = thick
+					cfg.anim = cfg.anim == 'None' and 'Gradient slide' or cfg.anim
+				end
+			end
+		end
+		return applyCustomToLabel(label, cfg)
+	end
+
+	local function labelHasTitleFx(label)
+		if not label then
+			return false
+		end
+		for _, child in ipairs(label:GetChildren()) do
+			if child:IsA('UIGradient') or child:IsA('UIStroke') or child:IsA('ImageLabel') then
+				return true
+			end
+		end
+		local host = label.Parent
+		if host then
+			for _, ch in ipairs(host:GetChildren()) do
+				if ch ~= label and (ch.Name == 'BehideFrame' or ch.Name:match('^Behide') or ch.Name == 'Smoke') then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local function applyTitleToLabel(label, tagName, knownSet, userId, previewPlayerName)
+		if not label or type(tagName) ~= 'string' or tagName == '' then
+			return false, 'missing label/tag', nil
+		end
+		if VARIANT_BASE_HIDDEN[tagName] then
+			return false, 'Pick a color variant (e.g. Dev - Gold, Community Staff - Purple)', nil
+		end
+		local displayName = tagName
+		local baseName, effectUserId, variant =
+			resolveTitleSelection(tagName, userId, previewPlayerName)
+		tagName = baseName
+
+		label = resetNameplateTag(label)
+		if not label then
+			return false, 'could not reset nameplate tag', nil
+		end
+
+		local modScript = findTitleStyleModule(tagName)
+		if not modScript then
+			label.Text = '[' .. tagName .. ']'
+			return true, 'text-only (no SpecialAlias module)', label
+		end
+
+		label.Text = '[' .. tagName .. ']'
+		label.TextColor3 = Color3.new(1, 1, 1)
+		local okInvoke = invokeTitleModule(modScript, label, effectUserId or userId, variant)
 		pcall(function()
 			CollectionService:AddTag(label, tagName)
 		end)
-		if cloned > 0 then
+		local host = label.Parent
+		if host then
+			-- Cancel deferred purges from resetNameplateTag (they were deleting BehideFrame/Smoke).
+			bumpTitlePurgeGen(host)
+			if not tagUsesBehideSibling(label, tagName) then
+				forcePurgeBehideSiblings(host, label)
+			end
+			tidyNameplateHost(host)
+		end
+		if okInvoke then
+			for _ = 1, 12 do
+				if labelHasTitleFx(label) or (host and hostHasLiveGameTitleFx(host)) then
+					local how = 'game module'
+					if variant then
+						how = how .. ' (' .. displayName .. ')'
+					end
+					return true, how, label
+				end
+				task.wait(0.08)
+			end
+		end
+
+		local cloned = cloneModuleTitleDecor(modScript, label)
+		if cloned > 0 and labelHasTitleFx(label) then
 			return true, 'cloned-assets', label
+		end
+
+		if variant and (tagName == 'Community Staff' or tagName == 'Dev') then
+			local okFb, howFb, labFb = applySampledTitleFallback(label, displayName, tagName, variant)
+			if okFb then
+				if host then
+					tidyNameplateHost(host)
+				end
+				return true, howFb or ('sampled ' .. displayName), labFb
+			end
+		end
+		-- Dev with wrong UserId returns early from .new with no FX — tell the user.
+		if tagName == 'Dev' and not variant then
+			return true, 'Dev needs a color variant (Gold/Green/Blue) or a matching Dev UserId', label
+		end
+		if tagName == 'Community Staff' and not variant then
+			return true, 'Community Staff needs Purple/Blue/Red variant', label
 		end
 		return true, 'text-only', label
 	end
@@ -498,6 +1046,11 @@ return function(env)
 				ColorSequenceKeypoint.new(1, c2),
 			})
 			ig.Parent = icon
+		end
+
+		local host = label.Parent
+		if host then
+			bumpTitlePurgeGen(host)
 		end
 
 		local fx = { token = 1, conns = {} }
@@ -664,7 +1217,7 @@ return function(env)
 			end)
 			local originalName = tostring(snap.text or ''):match('%[(.-)%]') or (snap.tags and snap.tags[1])
 			if originalName and originalName ~= '' then
-				applyTitleToLabel(label, originalName, knownSet, resolveUserId(key))
+				applyTitleToLabel(label, originalName, knownSet, resolveUserId(key), key)
 			elseif snap.tags then
 				for _, tag in ipairs(snap.tags) do
 					pcall(function()
@@ -778,14 +1331,36 @@ return function(env)
 		return nil
 	end
 
+	local function resolveGameTitleKeyForApply(displayText)
+		if type(lastImportedGameTitleKey) == 'string' and lastImportedGameTitleKey ~= '' then
+			return lastImportedGameTitleKey
+		end
+		local store = loadStore()
+		local draft = store.draft
+		if type(draft) == 'table' and type(draft.gameTitleKey) == 'string' and draft.gameTitleKey ~= '' then
+			return draft.gameTitleKey
+		end
+		local text = tostring(displayText or ''):gsub('^%s+', ''):gsub('%s+$', '')
+		if text == '' then
+			return nil
+		end
+		local baseName = resolveTitleSelection(text, LocalPlayer.UserId)
+		if findTitleStyleModule(baseName) then
+			return text
+		end
+		return nil
+	end
+
 	local function gatherCustomCfg()
 		local text = Options.TitlingCustomText and Options.TitlingCustomText.Value or 'Custom'
 		local icon = Options.TitlingCustomIcon and Options.TitlingCustomIcon.Value or ''
 		local spark = Options.TitlingCustomSpark and Options.TitlingCustomSpark.Value or ''
 		local anim = Options.TitlingCustomAnim and Options.TitlingCustomAnim.Value or 'None'
+		local renderMode = Options.TitlingRenderMode and Options.TitlingRenderMode.Value or RENDER_GAME
 		if spark == '' then
 			spark = DEFAULT_SPARK_IMAGE
 		end
+		local gameKey = resolveGameTitleKeyForApply(text)
 		return {
 			text = tostring(text),
 			brackets = true,
@@ -797,7 +1372,35 @@ return function(env)
 			icon = tostring(icon or ''),
 			spark = tostring(spark or ''),
 			anim = tostring(anim or 'None'),
+			gameTitleKey = gameKey,
+			renderMode = tostring(renderMode),
 		}
+	end
+
+	local function inferModuleAnimHint(modScript, tagName)
+		if tagName == 'Cursed One' then
+			return 'Cursed Full'
+		end
+		if type(decompile) ~= 'function' or not modScript then
+			return nil
+		end
+		local ok, src = pcall(decompile, modScript)
+		if not ok or type(src) ~= 'string' then
+			return nil
+		end
+		if src:find('StartLoop', 1, true) and src:find('"_"', 1, true) then
+			return 'Cursed Full'
+		end
+		local hasTween = src:find('TweenService', 1, true) ~= nil
+		local hasRun = src:find('RunService', 1, true) ~= nil
+		local hasSpawn = src:find('ImageLabel', 1, true) or src:find('ParticleEmitter', 1, true)
+		if hasTween or hasRun then
+			if hasSpawn then
+				return 'Full'
+			end
+			return 'Gradient slide'
+		end
+		return nil
 	end
 
 	local function assetIdOnly(img)
@@ -998,10 +1601,68 @@ return function(env)
 		return ids
 	end
 
+	local function sampleTitleFromCosmeticUiRow(displayName)
+		local row = getCosmeticTagUiRow(displayName)
+		if not row then
+			return nil, 'Cosmetic Titles row not loaded — open Settings → Cosmetic Titles, then Refresh lists'
+		end
+		local holder = Instance.new('ScreenGui')
+		holder.Name = 'SB2TitleUiSample'
+		holder.ResetOnSpawn = false
+		holder.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		pcall(function()
+			holder.Parent = LocalPlayer:FindFirstChild('PlayerGui')
+		end)
+		if not holder.Parent then
+			pcall(function()
+				holder.Parent = game:GetService('CoreGui')
+			end)
+		end
+		local clone = row:Clone()
+		clone.Parent = holder
+		local lab = clone:FindFirstChild('Tag', true)
+			or clone:FindFirstChildWhichIsA('TextLabel', true)
+		if not lab then
+			pcall(function()
+				holder:Destroy()
+			end)
+			return nil, 'Cosmetic Titles row has no preview label'
+		end
+		-- Run the real game module on the preview Tag (animated), then sample colors/assets.
+		pcall(function()
+			applyTitleToLabel(lab, displayName, nil, LocalPlayer.UserId, LocalPlayer.Name)
+		end)
+		task.wait(0.45)
+		local cfg = sampleTitleFromLabel(lab)
+		pcall(function()
+			holder:Destroy()
+		end)
+		if not cfg then
+			return nil, 'Could not read colors from Cosmetic Titles row'
+		end
+		cfg.text = displayName
+		cfg.name = displayName
+		cfg.brackets = true
+		cfg.gameTitleKey = displayName
+		cfg.renderMode = RENDER_GAME
+		local modScript = findTitleStyleModule(displayName)
+		local hint = inferModuleAnimHint(modScript, displayName)
+		if hint then
+			cfg.anim = hint
+		end
+		return cfg
+	end
+
 	local function sampleTitleFromModule(tagName)
-		local modScript = findSpecialAliasModule(tagName)
+		local baseName, effectUserId, variant =
+			resolveTitleSelection(tagName, LocalPlayer.UserId, LocalPlayer.Name)
+		local modScript = findTitleStyleModule(baseName)
 		if not modScript then
-			return nil, 'no SpecialAlias module for "' .. tostring(tagName) .. '"'
+			local uiCfg, uiErr = sampleTitleFromCosmeticUiRow(tagName)
+			if uiCfg then
+				return uiCfg
+			end
+			return nil, uiErr or ('no SpecialAlias module for "' .. tostring(tagName) .. '"')
 		end
 
 		-- ModuleScript Gradient/Stroke is authoritative for colors (live .new sometimes
@@ -1010,43 +1671,40 @@ return function(env)
 			sampleModuleAssetColors(modScript)
 
 		local cfg
-		local okReq, mod = pcall(require, modScript)
-		if okReq and type(mod) == 'table' and type(mod.new) == 'function' then
-			local holder = Instance.new('ScreenGui')
-			holder.Name = 'SB2TitleSample'
-			holder.ResetOnSpawn = false
-			holder.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		local holder = Instance.new('ScreenGui')
+		holder.Name = 'SB2TitleSample'
+		holder.ResetOnSpawn = false
+		holder.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		pcall(function()
+			holder.Parent = LocalPlayer:FindFirstChild('PlayerGui')
+		end)
+		if not holder.Parent then
 			pcall(function()
-				holder.Parent = LocalPlayer:FindFirstChild('PlayerGui')
-			end)
-			if not holder.Parent then
-				pcall(function()
-					holder.Parent = game:GetService('CoreGui')
-				end)
-			end
-			local lab = Instance.new('TextLabel')
-			lab.Name = 'Tag'
-			lab.BackgroundTransparency = 1
-			lab.Size = UDim2.fromOffset(420, 52)
-			lab.Position = UDim2.fromOffset(20, 20)
-			lab.Text = '[' .. tagName .. ']'
-			lab.TextColor3 = Color3.new(1, 1, 1)
-			lab.TextScaled = true
-			lab.Parent = holder
-			local okNew = pcall(mod.new, lab, { UserId = LocalPlayer.UserId })
-			if okNew then
-				task.wait(0.15)
-				cfg = sampleTitleFromLabel(lab)
-			end
-			pcall(function()
-				holder:Destroy()
+				holder.Parent = game:GetService('CoreGui')
 			end)
 		end
+		local lab = Instance.new('TextLabel')
+		lab.Name = 'Tag'
+		lab.BackgroundTransparency = 1
+		lab.Size = UDim2.fromOffset(420, 52)
+		lab.Position = UDim2.fromOffset(20, 20)
+		lab.Text = '[' .. baseName .. ']'
+		lab.TextColor3 = Color3.new(1, 1, 1)
+		lab.TextScaled = true
+		lab.Parent = holder
+		local okInvoke = invokeTitleModule(modScript, lab, effectUserId or LocalPlayer.UserId, variant)
+		if okInvoke then
+			task.wait(0.45)
+			cfg = sampleTitleFromLabel(lab)
+		end
+		pcall(function()
+			holder:Destroy()
+		end)
 
 		if not cfg then
 			cfg = {
-				text = tagName,
-				name = tagName,
+				text = baseName,
+				name = baseName,
 				brackets = true,
 				c1 = assetC1,
 				c2 = assetC2,
@@ -1058,8 +1716,8 @@ return function(env)
 				anim = hasAssetGrad and 'Gradient slide' or 'None',
 			}
 		else
-			cfg.text = tagName
-			cfg.name = tagName
+			cfg.text = baseName
+			cfg.name = baseName
 			cfg.brackets = true
 			-- Always prefer module gradient when present (avoids pink/white guess).
 			if hasAssetGrad or not cfg.hasColors or colorsLookLikeFallback(cfg.c1, cfg.c2, cfg.c3) then
@@ -1102,15 +1760,23 @@ return function(env)
 		cfg.icon = assetIdOnly(cfg.icon)
 		cfg.spark = assetIdOnly(cfg.spark)
 
-		local isGlitch = tagName == 'Cursed One'
-		if not isGlitch and type(decompile) == 'function' then
-			local okD, src = pcall(decompile, modScript)
-			if okD and type(src) == 'string' and src:find('StartLoop', 1, true) and src:find('"_"', 1, true) then
-				isGlitch = true
+		cfg.gameTitleKey = tagName
+		cfg.renderMode = RENDER_GAME
+		if variant and variant.staffIndex then
+			local cols = COMMUNITY_STAFF_TRI_COLORS[variant.staffIndex]
+			if cols then
+				cfg.c1, cfg.c2, cfg.c3 = cols[1], cols[2], cols[3]
+				if cfg.anim == 'None' or not cfg.anim then
+					cfg.anim = 'Gradient slide'
+				end
 			end
 		end
+		local animHint = inferModuleAnimHint(modScript, baseName)
+		local isGlitch = animHint == 'Cursed Full' or tagName == 'Cursed One'
 		if isGlitch then
 			cfg.anim = (cfg.icon ~= '' or cfg.spark ~= '') and 'Cursed Full' or 'Glitch text'
+		elseif animHint and (cfg.anim == 'None' or not cfg.anim or cfg.anim == 'Gradient slide') then
+			cfg.anim = animHint
 		elseif cfg.anim == 'None' or not cfg.anim then
 			local hasIcon = cfg.icon ~= ''
 			local hasSpark = cfg.spark ~= ''
@@ -1169,6 +1835,12 @@ return function(env)
 		setColor(Options.TitlingStrokeCol, cfg.stroke)
 		setOpt(Options.TitlingCustomIcon, tostring(cfg.icon or ''))
 		setOpt(Options.TitlingCustomAnim, tostring(cfg.anim or 'None'))
+		if cfg.gameTitleKey then
+			lastImportedGameTitleKey = cfg.gameTitleKey
+		end
+		if cfg.renderMode and Options.TitlingRenderMode then
+			setOpt(Options.TitlingRenderMode, tostring(cfg.renderMode))
+		end
 		return true
 	end
 
@@ -1185,6 +1857,8 @@ return function(env)
 			icon = cfg.icon,
 			spark = cfg.spark,
 			anim = cfg.anim,
+			gameTitleKey = cfg.gameTitleKey,
+			renderMode = cfg.renderMode,
 		}
 	end
 
@@ -1212,6 +1886,8 @@ return function(env)
 			icon = row.icon or '',
 			spark = row.spark or '',
 			anim = row.anim or 'None',
+			gameTitleKey = row.gameTitleKey,
+			renderMode = row.renderMode,
 		}
 	end
 
@@ -1270,7 +1946,7 @@ return function(env)
 		Values = { NONE },
 		AllowNull = true,
 		Searchable = true,
-		Tooltip = 'From SpecialAlias + CosmeticTags',
+		Tooltip = 'SpecialAlias + CosmeticTags. Dev/Community Staff include Gold/Green/Blue and Purple/Blue/Red color variants.',
 	})
 
 	local statusLabel = TitlingBox:AddLabel('Pick a player + title, then Apply preview')
@@ -1306,10 +1982,14 @@ return function(env)
 		end
 		local keep = Options.TitlingTitle and Options.TitlingTitle.Value
 		local keepImport = Options.TitlingImportTitle and Options.TitlingImportTitle.Value
+		local importNames = listImportTitleNames()
+		if #importNames == 0 then
+			importNames = { NONE }
+		end
 		if type(setDropdown) == 'function' then
 			setDropdown(Options.TitlingTitle, names, keep)
 			if Options.TitlingImportTitle then
-				setDropdown(Options.TitlingImportTitle, names, keepImport or keep)
+				setDropdown(Options.TitlingImportTitle, importNames, keepImport or keep)
 			end
 		elseif titleDrop and type(titleDrop.SetValues) == 'function' then
 			titleDrop:SetValues(names)
@@ -1344,7 +2024,13 @@ return function(env)
 		end
 		snapshotPlate(playerName, label)
 		local _, knownSet = listTitleNames()
-		local ok, how = applyTitleToLabel(label, titleName, knownSet, resolveUserId(playerName))
+		local ok, how = applyTitleToLabel(
+			label,
+			titleName,
+			knownSet,
+			resolveUserId(playerName),
+			playerName
+		)
 		if ok then
 			setStatus(('[%s] on %s - %s'):format(titleName, playerName, tostring(how)))
 			Library:Notify(('Title preview: %s on %s'):format(titleName, playerName), 5)
@@ -1378,9 +2064,14 @@ return function(env)
 			return
 		end
 		snapshotPlate(playerName, label)
+		local parent = label.Parent
 		label = resetNameplateTag(label)
 		if label then
 			label.Text = ''
+		end
+		if parent then
+			purgeOrphanTitleFx(parent)
+			scheduleOrphanTitleFxPurge(parent)
 		end
 		setStatus('Cleared title on ' .. tostring(playerName))
 	end)
@@ -1427,8 +2118,15 @@ return function(env)
 		Placeholder = 'Asset id - blank = text only',
 	})
 
+	CustomBox:AddDropdown('TitlingRenderMode', {
+		Text = 'Apply mode',
+		Values = { RENDER_GAME, RENDER_CUSTOM },
+		Default = RENDER_GAME,
+		Tooltip = 'Game module = real SpecialAlias / AnimatedRarities loops. Custom = PlayerTools fake tweens only.',
+	})
+
 	CustomBox:AddDropdown('TitlingCustomAnim', {
-		Text = 'Animation',
+		Text = 'Animation (custom mode only)',
 		Values = {
 			'None',
 			'Gradient slide',
@@ -1439,7 +2137,7 @@ return function(env)
 			'Cursed Full',
 		},
 		Default = 'Full',
-		Tooltip = 'Glitch text = Cursed One; Cursed Full = glitch + slide + sparks',
+		Tooltip = 'Only used when Apply mode is Custom editor. Import sets game module mode automatically.',
 	})
 
 	local suppressPresetLoad = false
@@ -1503,6 +2201,14 @@ return function(env)
 			Library:Notify('Pick a game title to import', 6, true)
 			return false
 		end
+		if not canImportGameTitle(listed) then
+			Library:Notify(
+				'Cannot import "' .. listed .. '" — open Settings → Cosmetic Titles (or pick a title with a game module)',
+				8,
+				true
+			)
+			return false
+		end
 		Library:Notify('Importing "' .. listed .. '"...', 3)
 		local cfg, err = sampleTitleFromModule(listed)
 		if not cfg then
@@ -1510,10 +2216,19 @@ return function(env)
 			setCustomStatus('Import failed: ' .. tostring(err))
 			return false
 		end
+		lastImportedGameTitleKey = listed
+		cfg.gameTitleKey = listed
+		cfg.renderMode = RENDER_GAME
 		pushCfgToCustomUi(cfg)
 		saveDraftFromUi()
-		setCustomStatus(('Imported [%s] - anim %s'):format(listed, tostring(cfg.anim)))
-		Library:Notify('Imported "' .. listed .. '"', 5)
+		setCustomStatus(
+			('Imported [%s] — use Apply mode "%s" (editor anim %s is color reference only)'):format(
+				listed,
+				RENDER_GAME,
+				tostring(cfg.anim)
+			)
+		)
+		Library:Notify('Imported "' .. listed .. '" (game module apply)', 6)
 		return true
 	end
 
@@ -1522,6 +2237,8 @@ return function(env)
 			importDrop:OnChanged(function(value)
 				if type(value) == 'string' and value ~= '' and value ~= NONE then
 					importGameTitle(value)
+				elseif value == NONE or value == nil or value == '' then
+					lastImportedGameTitleKey = nil
 				end
 			end)
 		end
@@ -1562,10 +2279,32 @@ return function(env)
 		end
 		snapshotPlate(playerName, label)
 		local cfg = gatherCustomCfg()
-		local ok, how = applyCustomToLabel(label, cfg)
+		local useGame = cfg.renderMode == RENDER_GAME
+			and type(cfg.gameTitleKey) == 'string'
+			and cfg.gameTitleKey ~= ''
+		local ok, how
+		if useGame then
+			local _, knownSet = listTitleNames()
+			ok, how = applyTitleToLabel(
+				label,
+				cfg.gameTitleKey,
+				knownSet,
+				resolveUserId(playerName),
+				playerName
+			)
+		else
+			if cfg.renderMode == RENDER_GAME then
+				Library:Notify(
+					'Apply mode is Game module but no linked title — use Import game title or Titling → Apply preview',
+					8,
+					true
+				)
+			end
+			ok, how = applyCustomToLabel(label, cfg)
+		end
 		saveDraftFromUi()
 		if ok then
-			setCustomStatus(('Applied [%s] on %s'):format(cfg.text, playerName))
+			setCustomStatus(('Applied [%s] on %s (%s)'):format(cfg.text, playerName, tostring(how)))
 			Library:Notify(('Applied on %s'):format(playerName), 5)
 		else
 			Library:Notify('Apply failed: ' .. tostring(how), 6, true)

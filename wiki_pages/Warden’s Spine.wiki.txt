@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Warden’s Spine
+|image=<gallery>
+Warden’s Spine.png | Icon
+Warden’s Spine in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Legendary
+|level=300
+|dmg=Clean: 12,000
+Max: 24,000
+|crit=28%
+|obtain=[[]]
+|abilities=+25% Health Regeneration
++25% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 300 Rapier, dropped by [[???]] in [[]]. It has a 28% critical chance and does 12,000 damage. When [[Upgrading|upgraded]] to +20, it does 24,000 damage. In addition, it grants the user a +25% health regeneration buff and +25% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

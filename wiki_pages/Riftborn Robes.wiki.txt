@@ -1,0 +1,19 @@
+{{Item infobox
+|name=Riftborn Robes
+|image=<gallery>
+Riftborn Robes.png | Icon
+Riftborn Robes in-game.png | In-game
+</gallery>
+|type=Armor
+|rarity=Legendary
+|level=100
+|def=Clean: 11,015
+Max: 15,421
+|obtain=[[]]
+|abilities=+20% Health Regeneration
++8% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 100 armor, dropped by [[???]] in [[]]. At base, it provides the player with 11,015 defenses, and when [[Upgrading|upgraded]] to +20, it provides the player with 15,421 defense. In addition, it grants the user a +20% health regeneration buff and +8% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

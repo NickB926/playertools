@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Stormpiercer
+|image=<gallery>
+Stormpiercer.png | Icon
+Stormpiercer in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Tribute
+|level=350
+|dmg=Clean: 23,600
+Max: 47,200
+|crit=36%
+|obtain=[[]]
+|abilities=+40% Health Regeneration
++38% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Tribute}} level 350 Rapier, dropped by [[???]] in [[]]. It has a 36% critical chance and does 23,600 damage. When [[Upgrading|upgraded]] to +20, it does 47,200 damage. In addition, it grants the user a +40% health regeneration buff and +38% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Tributes]]

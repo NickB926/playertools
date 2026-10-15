@@ -1,0 +1,19 @@
+{{Item infobox
+|name=Nythrane Robes
+|image=<gallery>
+Nythrane Robes.png | Icon
+Nythrane Robes in-game.png | In-game
+</gallery>
+|type=Armor
+|rarity=Legendary
+|level=300
+|def=Clean: 272,400
+Max: 381,360
+|obtain=[[]]
+|abilities=+35% Health Regeneration
++20% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Legendary}} level 300 armor, dropped by [[???]] in [[]]. At base, it provides the player with 272,400 defenses, and when [[Upgrading|upgraded]] to +20, it provides the player with 381,360 defense. In addition, it grants the user a +35% health regeneration buff and +20% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Legendaries]]

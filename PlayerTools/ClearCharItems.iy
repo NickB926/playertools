@@ -30,6 +30,7 @@
     - Does not touch mouse cursor / CoreGui
 
     Install: workspace/CCI.iy (or ClearCharItems.iy) → IY Plugins → Add → CCI
+    Toggle: PlayerTools Settings → CCI (writes PlayerTools/cci; default on)
     Commands: setexposure [value] | maxzoom [num|off] | sensitivity [num|off] | cci | ccioff | clearbats | clearhits | clearmobfx | clearclones | clearlava | clearvel | clearanims | cleardeath | clearparticles | perfmode | openinv | fixmouse | clearblur | 2022materials | un2022materials | autohideiyon | autohideiyoff | antilag
 ]]
 
@@ -44,6 +45,7 @@ local DEFAULT_MAX_ZOOM = 4000
 local DEFAULT_MOUSE_SENSITIVITY = 0.2
 local CCI_LOAD_DELAY = 10 -- seconds after plugin add before heavy binds / antilag
 local AUTOHIDE_IY_PATH = 'PlayerTools/autohide_iy'
+local CCI_FILE = 'PlayerTools/cci'
 
 local Players = game:GetService('Players')
 local Lighting = game:GetService('Lighting')
@@ -2250,7 +2252,7 @@ local function bindOptimizedGameWind(root)
 	end)
 end
 
-local function stopPlugin()
+local function stopPlugin(silent)
 	cciLoadToken += 1
 	getgenv().SB2CciLoadToken = cciLoadToken
 	enabled = false
@@ -2373,9 +2375,11 @@ local function stopPlugin()
 		getgenv().SB2MouseSensLockConn = nil
 	end
 	getgenv().SB2MouseSensLock = false
-	getgenv().SB2ClearCharItemsStop = nil
+	getgenv().SB2CciOn = false
 	restoreMouse()
-	say('stopped')
+	if not silent then
+		say('stopped')
+	end
 end
 
 getgenv().SB2ClearCharItemsStop = stopPlugin
@@ -2932,9 +2936,45 @@ local function restorePerfUi()
 	end
 end
 
+local function cciFileOn()
+	if type(isfile) == 'function' and type(readfile) == 'function' then
+		local ok, exists = pcall(isfile, CCI_FILE)
+		if ok and exists then
+			local okRead, body = pcall(readfile, CCI_FILE)
+			if okRead and tostring(body) == 'false' then
+				return false
+			end
+		end
+	end
+	return true
+end
+
+local function writeCciFile(on)
+	pcall(function()
+		if type(makefolder) == 'function' then
+			local ok, has = pcall(isfolder, 'PlayerTools')
+			if not ok or not has then
+				makefolder('PlayerTools')
+			end
+		end
+		if type(writefile) == 'function' then
+			writefile(CCI_FILE, on and 'true' or 'false')
+		end
+	end)
+end
+
 -- Heavy runtime starts after CCI_LOAD_DELAY so join/stream can settle (FPS).
 local function startCciRuntime()
+	if enabled then
+		return
+	end
 	enabled = true
+	velEnabled = true
+	mobAnimEnabled = true
+	deathFxEnabled = true
+	particlesEnabled = true
+	perfEnabled = true
+	getgenv().SB2CciOn = true
 
 	bindAllNow()
 	bindPerfMode()
@@ -3059,30 +3099,76 @@ local function startCciRuntime()
 	))
 end
 
+local settlePending = false
+
+local function setCciEnabled(on, silent)
+	on = on == true
+	writeCciFile(on)
+	getgenv().SB2CciOn = on
+	if on then
+		if enabled or settlePending then
+			return
+		end
+		startCciRuntime()
+		return
+	end
+	settlePending = false
+	if enabled then
+		stopPlugin(silent)
+		return
+	end
+	cciLoadToken += 1
+	getgenv().SB2CciLoadToken = cciLoadToken
+	if not silent then
+		say('off (Settings toggle)')
+	end
+end
+
+getgenv().SB2SetCci = function(on, silent)
+	setCciEnabled(on == true, silent == true)
+end
+getgenv().SB2GetCci = function()
+	return enabled == true
+end
+getgenv().SB2CciIyOwner = true
+
 cciLoadToken += 1
 local myLoadToken = cciLoadToken
 getgenv().SB2CciLoadToken = myLoadToken
-say(('CCI waiting %ss for game to settle…'):format(tostring(CCI_LOAD_DELAY)))
-task.delay(CCI_LOAD_DELAY, function()
-	if getgenv().SB2CciLoadToken ~= myLoadToken then
-		return
-	end
-	if getgenv().SB2ClearCharItemsStop ~= stopPlugin then
-		return
-	end
-	startCciRuntime()
-end)
+if cciFileOn() then
+	settlePending = true
+	say(('CCI waiting %ss for game to settle…'):format(tostring(CCI_LOAD_DELAY)))
+	task.delay(CCI_LOAD_DELAY, function()
+		settlePending = false
+		if getgenv().SB2CciLoadToken ~= myLoadToken then
+			return
+		end
+		if getgenv().SB2ClearCharItemsStop ~= stopPlugin then
+			return
+		end
+		if not cciFileOn() then
+			getgenv().SB2CciOn = false
+			say('CCI off (Settings toggle)')
+			return
+		end
+		startCciRuntime()
+	end)
+else
+	getgenv().SB2CciOn = false
+	say('CCI off (Settings toggle)')
+end
 
 local Plugin = {
 	['PluginName'] = 'CCI',
-	['PluginDescription'] = 'CharacterItems + Character hats + FX wipe; one-shot exposure/zoom/Invisicam/sens; loopfb, CCI antilag (keeps icons), 2022 materials, auto hideiy',
+	['PluginDescription'] = 'CharacterItems + Character hats + FX wipe; Settings toggle (PlayerTools/cci); one-shot exposure/zoom/Invisicam/sens; loopfb, CCI antilag (keeps icons), 2022 materials, auto hideiy',
 	['Commands'] = {
 		['cci'] = {
 			['ListName'] = 'cci / clearcharitems',
 			['Description'] = 'Re-scan CharacterItems VFX + Character hats + effect folders + Vel + mob anims + death FX (keeps weapons; never ResetEffect)',
 			['Aliases'] = { 'clearcharitems' },
 			['Function'] = function()
-				enabled = true
+				settlePending = false
+				setCciEnabled(true, true)
 				getgenv().SB2ClearDeathFxBound = nil
 
 				local root = workspace:FindFirstChild('CharacterItems')
@@ -3311,10 +3397,10 @@ local Plugin = {
 		},
 		['ccioff'] = {
 			['ListName'] = 'ccioff',
-			['Description'] = 'Stop CCI wiping / effect clear / exposure pinning',
+			['Description'] = 'Stop CCI wiping / effect clear / exposure pinning (same as Settings toggle off)',
 			['Aliases'] = { 'clearcharitemsoff' },
 			['Function'] = function()
-				stopPlugin()
+				setCciEnabled(false)
 			end,
 		},
 		['clearblur'] = {

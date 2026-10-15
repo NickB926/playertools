@@ -1,0 +1,20 @@
+{{Item infobox
+|name=Depthpiercer
+|image=<gallery>
+Depthpiercer.png | Icon
+Depthpiercer in-game.png | In-game
+</gallery>
+|type=Rapier (Rapier)
+|rarity=Rare
+|level=240
+|dmg=Clean: 5,556
+Max: 11,112
+|crit=18%
+|obtain=[[]]
+|abilities=+14% Health Regeneration
++14% Stamina Regeneration
+}}
+== Overview ==
+'''{{PAGENAME}}''' is a {{Rare}} level 240 Rapier, dropped by [[???]] in [[]]. It has a 18% critical chance and does 5,556 damage. When [[Upgrading|upgraded]] to +20, it does 11,112 damage. In addition, it grants the user a +14% health regeneration buff and +14% stamina regeneration buff.
+The drop rate for this item is '''???'''.
+[[Category:Rares]]

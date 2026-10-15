@@ -28,6 +28,7 @@ return function(env)
 		local scanLiveTags, loadTagsKnownSet, saveTagsKnownFromLive, writeTagScanStatus
 		local getTagModule, getTagProbe, dumpWikiTag, tagRecordByName
 		local forgetTagNames, pickRandomKnownTags, buildTagVariations
+		local buildTitleWikiCss, buildAllTitlesWikiCss, pickPrimaryTextGradient
 
 		do -- tag scan (Luau local limit)
 		writeWikiTagsDump = function(text)
@@ -142,21 +143,41 @@ return function(env)
 		end
 
 		local function getSpecialAliasFolder()
-			local function fromCardinalPath()
-				local cc = game:GetService('ReplicatedStorage'):FindFirstChild('CardinalClient')
-				local main = cc and cc:FindFirstChild('MainModule')
-				local services = main and main:FindFirstChild('Services')
-				local graphics = services and services:FindFirstChild('Graphics')
-				return graphics and graphics:FindFirstChild('SpecialAlias')
+			local cached = getgenv().SB2SpecialAliasFolder
+			if typeof(cached) == 'Instance' and cached.Parent then
+				return cached
 			end
-			local folder = fromCardinalPath()
-			if folder then
-				return folder
+			local function pick(inst)
+				if inst and inst.Parent then
+					getgenv().SB2SpecialAliasFolder = inst
+					return inst
+				end
+				return nil
 			end
 			local rs = game:GetService('ReplicatedStorage')
+			local cc = rs:FindFirstChild('CardinalClient')
+			local main = cc and cc:FindFirstChild('MainModule')
+			local services = main and main:FindFirstChild('Services')
+			local graphics = services and services:FindFirstChild('Graphics')
+			if graphics then
+				local alias = graphics:FindFirstChild('SpecialAlias')
+				if alias then
+					return pick(alias)
+				end
+			end
+			if main then
+				for _, inst in ipairs(main:GetDescendants()) do
+					if inst.Name == 'SpecialAlias' and (inst:IsA('Folder') or inst:IsA('ModuleScript')) then
+						local fn = inst:GetFullName()
+						if fn:find('Graphics', 1, true) then
+							return pick(inst)
+						end
+					end
+				end
+			end
 			for _, inst in ipairs(rs:GetDescendants()) do
-				if inst.Name == 'SpecialAlias' and inst:IsA('Folder') then
-					return inst
+				if inst.Name == 'SpecialAlias' and (inst:IsA('Folder') or inst:IsA('ModuleScript')) then
+					return pick(inst)
 				end
 			end
 			return nil
@@ -1014,6 +1035,175 @@ return function(env)
 			return table.concat(compact, ', ')
 		end
 
+		local function slugifyTitle(name)
+			local s = string.lower(tostring(name or ''))
+			s = s:gsub('[^%w]+', '-')
+			s = s:gsub('^%-+', ''):gsub('%-+$', '')
+			if s == '' then
+				return 'title'
+			end
+			return s
+		end
+
+		local function gradientCssStopsPercent(keypoints)
+			if type(keypoints) ~= 'table' or #keypoints == 0 then
+				return nil
+			end
+			local parts = {}
+			for i, kp in ipairs(keypoints) do
+				if type(kp.hex) == 'string' and kp.hex ~= '' then
+					if i == 1 or i == #keypoints then
+						parts[#parts + 1] = kp.hex
+					else
+						local pct = math.floor((tonumber(kp.time) or 0) * 100 + 0.5)
+						parts[#parts + 1] = string.format('%s %d%%', kp.hex, pct)
+					end
+				end
+			end
+			if #parts == 0 then
+				return nil
+			end
+			return table.concat(parts, ', ')
+		end
+
+		local function directionForWikiCss(rotation)
+			local rot = tonumber(rotation) or 0
+			local r = ((rot % 360) + 360) % 360
+			if r >= 75 and r <= 105 then
+				return 'to bottom', 'Y', '100% 200%'
+			end
+			if (r >= 255 and r <= 285) or math.abs(rot + 90) < 20 then
+				return 'to top', 'Y', '100% 200%'
+			end
+			if r <= 10 or r >= 350 then
+				return 'to right', 'X', '200% 100%'
+			end
+			if math.abs(r - 180) < 15 then
+				return 'to left', 'X', '200% 100%'
+			end
+			return string.format('%.0fdeg', r), 'DIAG', '200% 200%'
+		end
+
+		pickPrimaryTextGradient = function(probe)
+			if not probe then
+				return nil
+			end
+			for _, gr in ipairs(probe.gradients or {}) do
+				if gr.parentClass ~= 'UIStroke' then
+					return gr
+				end
+			end
+			if #(probe.gradients or {}) > 0 then
+				return probe.gradients[1]
+			end
+			if #(probe.decompileGradients or {}) > 0 then
+				return probe.decompileGradients[1]
+			end
+			return nil
+		end
+
+		local function keyframesForMode(mode)
+			if mode == 'X' then
+				return '@keyframes ctTitleX {\n    from { background-position: 40% 0%; }\n    to   { background-position: 0% 0%; }\n}'
+			end
+			if mode == 'DIAG' then
+				return '@keyframes ctTitleDiag {\n    from { background-position: 40% 40%; }\n    to   { background-position: 0% 0%; }\n}'
+			end
+			return '@keyframes ctTitleY {\n    from { background-position: 0% 40%; }\n    to   { background-position: 0% 0%; }\n}'
+		end
+
+		local function animNameForMode(mode)
+			if mode == 'X' then
+				return 'ctTitleX'
+			end
+			if mode == 'DIAG' then
+				return 'ctTitleDiag'
+			end
+			return 'ctTitleY'
+		end
+
+		buildTitleWikiCss = function(displayName, probe)
+			local gr = pickPrimaryTextGradient(probe)
+			if not gr or type(gr.keypoints) ~= 'table' then
+				return nil, 'No UIGradient on this title'
+			end
+			local stops = gradientCssStopsPercent(gr.keypoints)
+			if not stops then
+				return nil, 'Gradient has no color stops'
+			end
+			local dir, mode, size = directionForWikiCss(gr.rotation)
+			local slug = slugifyTitle(displayName)
+			local anim = animNameForMode(mode)
+			local css = string.format(
+				'.ct-card[data-title-color="%s"] .ct-name-label {\n'
+					.. '    display: inline-block;\n'
+					.. '    background: linear-gradient(%s, %s);\n'
+					.. '    background-size: %s;\n'
+					.. '    background-position: 0%% 0%%;\n'
+					.. '    -webkit-background-clip: text;\n'
+					.. '    background-clip: text;\n'
+					.. '    -webkit-text-fill-color: transparent;\n'
+					.. '    filter:\n'
+					.. '        drop-shadow(1px 0px 0px #000)\n'
+					.. '        drop-shadow(-1px 0px 0px #000)\n'
+					.. '        drop-shadow(0px 1px 0px #000)\n'
+					.. '        drop-shadow(0px -1px 0px #000)\n'
+					.. '        drop-shadow(1px 1px 0px #000);\n'
+					.. '    animation: %s 1.8s ease-in-out infinite alternate;\n'
+					.. '}\n\n%s',
+				slug,
+				dir,
+				stops,
+				size,
+				anim,
+				keyframesForMode(mode)
+			)
+			return css, nil
+		end
+
+		buildAllTitlesWikiCss = function()
+			if #tagLiveNames == 0 then
+				scanLiveTags()
+			end
+			local shared = '.ct-card .ct-name-label {\n'
+				.. '    display: inline-block;\n'
+				.. '    -webkit-background-clip: text;\n'
+				.. '    background-clip: text;\n'
+				.. '    -webkit-text-fill-color: transparent;\n'
+				.. '    filter:\n'
+				.. '        drop-shadow(1px 0px 0px #000)\n'
+				.. '        drop-shadow(-1px 0px 0px #000)\n'
+				.. '        drop-shadow(0px 1px 0px #000)\n'
+				.. '        drop-shadow(0px -1px 0px #000)\n'
+				.. '        drop-shadow(1px 1px 0px #000);\n'
+				.. '}\n\n'
+				.. '@keyframes ctTitleY {\n    from { background-position: 0% 40%; }\n    to   { background-position: 0% 0%; }\n}\n'
+				.. '@keyframes ctTitleX {\n    from { background-position: 40% 0%; }\n    to   { background-position: 0% 0%; }\n}\n'
+				.. '@keyframes ctTitleDiag {\n    from { background-position: 40% 40%; }\n    to   { background-position: 0% 0%; }\n}'
+			local parts = { shared, '' }
+			local okCount = 0
+			for _, name in ipairs(tagLiveNames) do
+				local rec = tagLiveCache[name]
+				if rec then
+					local probe = getTagProbe(rec)
+					if probe then
+						local css = buildTitleWikiCss(name, probe)
+						if css then
+							local body = css:gsub('\r?\n@keyframes ctTitle[%w]+%s*%b{}', '')
+							parts[#parts + 1] = body
+							parts[#parts + 1] = ''
+							okCount += 1
+						end
+					end
+				end
+			end
+			if okCount == 0 then
+				return nil, 'No title gradients found — Scan tags / open Cosmetic Titles'
+			end
+			return table.concat(parts, '\n'), okCount
+		end
+
+
 		local function pickPrimaryTextLabel(probe)
 			if not probe or #probe.textLabels == 0 then
 				return nil
@@ -1828,6 +2018,53 @@ return function(env)
 				return
 			end
 			copyWikiTag(text)
+		end)
+
+		TagsSearchBox:AddButton('Copy CSS: selected title', function()
+			local name = currentSelectedTagName()
+			if not name then
+				Library:Notify('Pick a title from All / Search first', 6)
+				return
+			end
+			local rec = tagRecordByName(name)
+			if not rec then
+				Library:Notify('Tag not found — Scan tags first', 6)
+				return
+			end
+			local probe = getTagProbe(rec)
+			if not probe then
+				Library:Notify('Could not probe title UI — open Settings → Cosmetic Titles?', 7)
+				return
+			end
+			local css, err = buildTitleWikiCss(name, probe)
+			if not css then
+				Library:Notify(err or 'No gradient CSS', 6)
+				return
+			end
+			if type(writefile) == 'function' then
+				pcall(writefile, 'PlayerTools/title_gradient_css.txt', css)
+			end
+			if copyText(css) then
+				Library:Notify('Copied wiki CSS for ' .. name, 6)
+			else
+				Library:Notify('Wrote PlayerTools/title_gradient_css.txt (clipboard unavailable)', 7)
+			end
+		end)
+
+		TagsSearchBox:AddButton('Copy CSS: ALL titles', function()
+			local css, nOrErr = buildAllTitlesWikiCss()
+			if not css then
+				Library:Notify(tostring(nOrErr), 7)
+				return
+			end
+			if type(writefile) == 'function' then
+				pcall(writefile, 'PlayerTools/title_gradients_all.css', css)
+			end
+			if copyText(css) then
+				Library:Notify(('Copied wiki CSS for %d titles'):format(nOrErr), 7)
+			else
+				Library:Notify('Wrote PlayerTools/title_gradients_all.css (clipboard unavailable)', 7)
+			end
 		end)
 
 		TagsSearchBox:AddButton('Copy tag module name', function()
