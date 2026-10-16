@@ -1,7 +1,7 @@
 --[[
 	Split from PlayerTools_Obsidian.lua (Luau 200-local register cap).
 ]]
-getgenv().SB2WaveKillBuild = 'wave-kill-phantom-v3'
+getgenv().SB2WaveKillBuild = 'wave-kill-phantom-v4'
 
 return function(env)
 	local WdBox = env.WdBox
@@ -209,6 +209,35 @@ return function(env)
 		return nil
 	end
 
+	-- Real phantom in a special wave wears a yellow/orange glow. Tiny solid
+	-- neon (eyes, weapon studs) does not count.
+	local function waveKillYellowGlowScore(mob)
+		local score = 0
+		for _, d in ipairs(mob:GetDescendants()) do
+			if d:IsA('BasePart') then
+				local c = d.Color
+				local yellow = c.R > 0.72 and c.G >= 0.45 and c.B < 0.4 and c.G > c.B + 0.2
+				local vol = d.Size.X * d.Size.Y * d.Size.Z
+				local glow = d.Material == Enum.Material.Neon or d.Material == Enum.Material.ForceField
+				if yellow and glow and d.Transparency >= 0.15 and d.Transparency < 0.92 and vol >= 1.5 then
+					score += vol
+				end
+			elseif d:IsA('Light') and d.Enabled then
+				local c = d.Color
+				if c.R > 0.72 and c.G >= 0.45 and c.B < 0.4 and d.Brightness >= 1 then
+					score += 8
+				end
+			elseif d:IsA('ParticleEmitter') and d.Enabled and d.Rate >= 8 then
+				local kp = d.Color.Keypoints
+				local c = kp[1] and kp[1].Value
+				if c and c.R > 0.72 and c.G >= 0.45 and c.B < 0.4 then
+					score += d.Rate
+				end
+			end
+		end
+		return score
+	end
+
 	local function findWaveKillTargetMob(origin)
 		local folder = waveKillTargetFolder()
 		if not folder then
@@ -237,6 +266,23 @@ return function(env)
 			return candidates[1].mob
 		end
 
+		-- Phantom special waves flash Highlight on several models. The one to kill
+		-- is the yellowish glow, not the earliest spawn.
+		if phantomWave then
+			local glowBest, glowRow = 0, nil
+			for _, row in ipairs(candidates) do
+				local glow = waveKillYellowGlowScore(row.mob)
+				row.glow = glow
+				if glow > glowBest or (glow == glowBest and glowRow and row.priority < glowRow.priority) then
+					glowBest = glow
+					glowRow = row
+				end
+			end
+			if glowRow and glowBest >= 1.5 then
+				return glowRow.mob
+			end
+		end
+
 		local prev = getgenv().SB2WaveKillTargetTracked
 		if prev and prev.Parent then
 			for _, row in ipairs(candidates) do
@@ -246,8 +292,6 @@ return function(env)
 			end
 		end
 
-		-- Phantom special waves: several models can flash Highlight at once — kill order
-		-- follows spawn index + strongest outline, not distance to you.
 		if phantomWave then
 			table.sort(candidates, function(a, b)
 				if a.priority ~= b.priority then
@@ -632,8 +676,8 @@ return function(env)
 
 	WdBox:AddToggle('WaveKillTarget', {
 		Text = 'Highlight ordered kill (WD)',
-		Default = false,
-		Tooltip = 'Wave Defense special / phantom order: picks the active Highlight under Workspace.Mobs (phantoms use kill-order index + outline strength, not nearest). Skips SystemFrozen on mob/Entity/Humanoid. Tracer, chams, KILL NEXT label.',
+		Default = true,
+		Tooltip = 'Wave Defense special / phantom order: picks the active Highlight under Workspace.Mobs. Phantom waves target the yellowish glow, not the nearest or earliest spawn. Skips SystemFrozen. Tracer, chams, KILL NEXT label.',
 	}):OnChanged(function(value)
 		getgenv().SB2WaveKillTargetOn = value == true
 		getgenv().SB2WaveKillTargetLastName = nil

@@ -522,7 +522,8 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'wd-panel-fix-v1'
+getgenv().SB2PlayerToolsLocalBuild = 'wave-kill-yellow-v1'
+getgenv().SB2WaveKillTargetUILoaded = false
 pcall(function()
 	warn(('[PlayerTools] local build %s | %s'):format(
 		tostring(getgenv().SB2PlayerToolsLocalBuild),
@@ -9698,6 +9699,13 @@ local ok, err = pcall(function()
 						keepMap = collectMultiSkillMap(getgenv().SB2LastCombatOptions.FarmSupportSkillName)
 					end
 				end
+				-- Empty combat support means Cursed Enhancement, unless the user cleared it.
+				if option == Options.SupportSkillName
+					and not next(keepMap)
+					and getgenv().SB2SupportSkillUserCleared ~= true
+				then
+					keepMap = { ['Cursed Enhancement'] = true }
+				end
 				for name in pairs(keepMap) do
 					if name and name ~= '(none)' and not seen[name] then
 						seen[name] = true
@@ -11231,21 +11239,24 @@ local ok, err = pcall(function()
 					if type(src) == 'string' and src ~= '' then
 						local fn, err = compile(src, modPath)
 						if fn then
-							local ok, runErr = pcall(fn, {
-								WdBox = WdBox,
-								RunService = RunService,
-								Library = Library,
-								LocalPlayer = LocalPlayer,
-								Toggles = Toggles,
-								isToggleOn = isToggleOn,
-								getMyCharacterModel = getMyCharacterModel,
-								getMyBringPart = getMyBringPart,
-							})
+							local ok, result = pcall(fn)
+							if ok and type(result) == 'function' then
+								ok, result = pcall(result, {
+									WdBox = WdBox,
+									RunService = RunService,
+									Library = Library,
+									LocalPlayer = LocalPlayer,
+									Toggles = Toggles,
+									isToggleOn = isToggleOn,
+									getMyCharacterModel = getMyCharacterModel,
+									getMyBringPart = getMyBringPart,
+								})
+							end
 							if ok then
 								getgenv().SB2WaveKillTargetUILoaded = true
 								return true
 							end
-							warn('[WaveKillTarget] init failed: ', runErr)
+							warn('[WaveKillTarget] init failed: ', result)
 						else
 							warn('[WaveKillTarget] compile failed: ', err)
 						end
@@ -11658,6 +11669,17 @@ local ok, err = pcall(function()
 					end
 				end
 
+				local waveKillMob = nil
+				local findWaveKill = getgenv().SB2FindWaveKillTargetMob
+				if type(findWaveKill) == 'function' then
+					local okWave, waveMob = pcall(findWaveKill, origin)
+					if okWave then
+						waveKillMob = waveMob
+					end
+				end
+				if not waveKillMob then
+					waveKillMob = getgenv().SB2WaveKillTargetTracked
+				end
 				local mobList = {}
 				for _, mob in mobsRoot:GetChildren() do
 					if not isKillauraTargetMob(mob) then
@@ -11681,6 +11703,9 @@ local ok, err = pcall(function()
 						distSq = liveSq
 					end
 					local maxSq = priority and bossRangeSq or rangeSq
+					if mob == waveKillMob then
+						maxSq = math.max(maxSq, bossRangeSq)
+					end
 					if pistolMode then
 						maxSq = rangeSq
 					end
@@ -11700,6 +11725,11 @@ local ok, err = pcall(function()
 				table.sort(mobList, function(a, b)
 					if a.rewardChest ~= b.rewardChest then
 						return a.rewardChest
+					end
+					local aWave = waveKillMob ~= nil and a.mob == waveKillMob
+					local bWave = waveKillMob ~= nil and b.mob == waveKillMob
+					if aWave ~= bWave then
+						return aWave
 					end
 					if a.hitLives ~= b.hitLives then
 						return a.hitLives
@@ -11841,19 +11871,22 @@ local ok, err = pcall(function()
 					if type(src) == 'string' and src ~= '' then
 						local fn, err = compile(src, modPath)
 						if fn then
-							local ok, runErr = pcall(fn, {
-								CombatBox = CombatBox,
-								RunService = RunService,
-								LocalPlayer = LocalPlayer,
-								Toggles = Toggles,
-								isToggleOn = isToggleOn,
-								isLocalAlive = isLocalAlive,
-								getMyCharacterModel = getMyCharacterModel,
-							})
+							local ok, result = pcall(fn)
+							if ok and type(result) == 'function' then
+								ok, result = pcall(result, {
+									CombatBox = CombatBox,
+									RunService = RunService,
+									LocalPlayer = LocalPlayer,
+									Toggles = Toggles,
+									isToggleOn = isToggleOn,
+									isLocalAlive = isLocalAlive,
+									getMyCharacterModel = getMyCharacterModel,
+								})
+							end
 							if ok then
 								break
 							end
-							warn('[AutoFloorDodge] init failed: ', runErr)
+							warn('[AutoFloorDodge] init failed: ', result)
 						else
 							warn('[AutoFloorDodge] compile failed: ', err)
 						end
@@ -13052,11 +13085,25 @@ local ok, err = pcall(function()
 			end
 		end
 
+		-- These are called from hover/write above their real definitions.
+		-- A later `local function` would be a different local and stay nil here.
+		local diveClampGoal
+		local diveClampAboveArena
+		local divePreviewGroundY
+		local diveFarmZone
+		local divePosInFarmZone
+		local diveClampToFarmZone
+		local diveFarmZoneCenter
+
 		local function diveWriteCFrame(hrp, dest, lookAt, writeOpts)
 			if not hrp or typeof(dest) ~= 'Vector3' then
 				return false
 			end
 			writeOpts = writeOpts or {}
+			local lavaHoverY = getgenv().SB2LavaHoverY
+			if typeof(lavaHoverY) == 'number' then
+				dest = Vector3.new(dest.X, math.max(dest.Y, lavaHoverY), dest.Z)
+			end
 			-- Reject absurd blinks (boss respawn / void) that explode physics.
 			local fromPos = hrp.Position
 			local jump = (dest - fromPos).Magnitude
@@ -13601,7 +13648,7 @@ local ok, err = pcall(function()
 			return base.Y
 		end
 
-		local function divePreviewGroundY(xzPos)
+		divePreviewGroundY = function(xzPos)
 			local fn = getgenv().SB2DivePreviewGroundY
 			if type(fn) == 'function' then
 				local y = fn(xzPos)
@@ -13620,7 +13667,7 @@ local ok, err = pcall(function()
 		end
 
 		-- Noclip fly: never let fight/hover Y sit below streamed arena floor (void fall).
-		local function diveClampAboveArena(pos, refY)
+		diveClampAboveArena = function(pos, refY)
 			if getgenv().SB2DiveUnderMap == true then
 				return pos
 			end
@@ -13903,7 +13950,7 @@ local ok, err = pcall(function()
 		end
 
 		-- Never chase client-flinged boss parts into the skybox / void.
-		local function diveClampGoal(goalPos, anchor, opts)
+		diveClampGoal = function(goalPos, anchor, opts)
 			opts = opts or {}
 			if typeof(goalPos) ~= 'Vector3' or typeof(anchor) ~= 'Vector3' then
 				return goalPos
@@ -13991,7 +14038,7 @@ local ok, err = pcall(function()
 			return pid
 		end
 
-		local function diveFarmZone()
+		diveFarmZone = function()
 			return DIVE_FARM_ZONES[diveEffectivePlaceId()]
 		end
 
@@ -14016,7 +14063,7 @@ local ok, err = pcall(function()
 			return nil
 		end
 
-		local function divePosInFarmZone(pos)
+		divePosInFarmZone = function(pos)
 			local zone = diveFarmZone()
 			if not zone or typeof(pos) ~= 'Vector3' then
 				return true
@@ -14036,7 +14083,7 @@ local ok, err = pcall(function()
 			return true
 		end
 
-		local function diveClampToFarmZone(pos)
+		diveClampToFarmZone = function(pos)
 			local zone = diveFarmZone()
 			if not zone or typeof(pos) ~= 'Vector3' then
 				return pos
@@ -14067,7 +14114,7 @@ local ok, err = pcall(function()
 			return out
 		end
 
-		local function diveFarmZoneCenter(y)
+		diveFarmZoneCenter = function(y)
 			local zone = diveFarmZone()
 			if not zone then
 				return nil
@@ -14085,6 +14132,13 @@ local ok, err = pcall(function()
 		local function diveRoamFarmPos(hrp)
 			local zone = diveFarmZone()
 			if not zone or not hrp then
+				return diveIdleHoverPos(hrp)
+			end
+			local spanX = zone.maxX - zone.minX
+			local spanZ = zone.maxZ - zone.minZ
+			-- The Between pad is a 5000-stud placeholder. A random point in it is a
+			-- map corner or the void, not the floor the wave is actually on.
+			if spanX > 700 or spanZ > 700 then
 				return diveIdleHoverPos(hrp)
 			end
 			local groundY = divePreviewGroundY(hrp.Position)
@@ -15683,9 +15737,52 @@ local ok, err = pcall(function()
 			end
 
 			-- Long-hop blink chain toward mobs (AutoFarm-style), without dumping on floor feet.
+			local function diveGoalOnFloor(goal, fromPos)
+				if typeof(goal) ~= 'Vector3' then
+					return false
+				end
+				local floorRef = tonumber(getgenv().SB2DiveFloorRefY)
+				local gy = divePreviewGroundY(goal)
+				if type(gy) == 'number' and floorRef and (gy < floorRef - 40 or gy > floorRef + 90) then
+					return false
+				end
+				if typeof(fromPos) == 'Vector3' then
+					local dx = goal.X - fromPos.X
+					local dz = goal.Z - fromPos.Z
+					if (dx * dx + dz * dz) <= (100 * 100) then
+						return true
+					end
+				end
+				local mobsRoot = workspace:FindFirstChild('Mobs')
+				if not mobsRoot then
+					return typeof(fromPos) ~= 'Vector3'
+				end
+				for _, mob in ipairs(mobsRoot:GetChildren()) do
+					local root = getMobRoot(mob)
+					if root then
+						local mx = root.Position.X - goal.X
+						local mz = root.Position.Z - goal.Z
+						if (mx * mx + mz * mz) <= (90 * 90) then
+							return true
+						end
+					end
+				end
+				return false
+			end
+
+			-- Long-hop blink chain toward mobs (AutoFarm-style), without dumping on floor feet.
 			local function diveApproachMob(hrp, goalPos, lookAt, clampOpts)
 				if not stillActive() or not hrp or not hrp.Parent or typeof(goalPos) ~= 'Vector3' then
 					return false
+				end
+				if not diveGoalOnFloor(goalPos, hrp.Position) then
+					local hover = diveIdleHoverPos(hrp)
+					if typeof(hover) == 'Vector3' then
+						goalPos = hover
+						lookAt = hover
+					else
+						return false
+					end
 				end
 				clampOpts = clampOpts or {
 					yRef = goalPos.Y,
@@ -17006,18 +17103,23 @@ local ok, err = pcall(function()
 				end
 			end)
 			--#endregion
-			if isToggleOn('DiveFarm') then
+			if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
 				local hrp = getMyBringPart()
-				-- Idle preview only (fight loop applies sticky Y from slider live).
-				if not (getgenv().SB2DiveFarmOn and diveStickRoot and diveStickRoot.Parent) then
-					local dest = diveIdleHoverPos(hrp)
-					if hrp and dest then
-						pcall(function()
-							local cf = CFrame.new(dest) * (hrp.CFrame - hrp.CFrame.Position)
-							hrp.CFrame = cf
+				local dest = hrp and diveIdleHoverPos(hrp)
+				if hrp and dest then
+					-- Hold loop snaps back to diveHoldPos every frame. Update it or the
+					-- slider moves you for one frame and then puts you back.
+					diveHoldPos = dest
+					getgenv().SB2DivePinPos = dest
+					pcall(function()
+						local cf = CFrame.new(dest) * (hrp.CFrame - hrp.CFrame.Position)
+						hrp.CFrame = cf
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						hrp.AssemblyAngularVelocity = Vector3.zero
+						if diveLinVel then
 							diveLinVel.VectorVelocity = Vector3.zero
-						end)
-					end
+						end
+					end)
 				end
 			end
 		end)
@@ -17348,8 +17450,12 @@ local ok, err = pcall(function()
 		do
 			local skillValues = getAvailableSkills()
 			local supportValues = getAvailableSupportSkills()
-			-- Fresh UI / no profile: none. SaveManager still restores a saved skill after load.
+			-- Fresh UI / no profile: weapon skill stays none. Support starts on Cursed Enhancement.
 			local defaultSkill = '(none)'
+			local defaultSupport = 'Cursed Enhancement'
+			if not table.find(supportValues, defaultSupport) then
+				table.insert(supportValues, 1, defaultSupport)
+			end
 			CombatBox:AddDropdown('SkillName', {
 				Text = 'Skill (held weapon)',
 				Values = skillValues,
@@ -17360,7 +17466,7 @@ local ok, err = pcall(function()
 			CombatBox:AddDropdown('SupportSkillName', {
 				Text = 'Support skills (buffs)',
 				Values = supportValues,
-				Default = {},
+				Default = { defaultSupport },
 				Multi = true,
 				AllowNull = true,
 				Searchable = true,
@@ -17419,6 +17525,7 @@ local ok, err = pcall(function()
 						return
 					end
 					local map = collectMultiSkillMap(value)
+					getgenv().SB2SupportSkillUserCleared = not next(map)
 					local order = syncMultiSkillOrder('SB2SupportSkillOrder', map)
 					rememberPickedSkills(nil, order)
 				end)
@@ -17533,6 +17640,14 @@ local ok, err = pcall(function()
 				end
 				getgenv().SB2AutoAttackOn = enabled
 				getgenv().SB2AutoSkillOn = enabled
+				if enabled then
+					pcall(function()
+						local support = Toggles.SupportSkill
+						if type(support) == 'table' and type(support.SetValue) == 'function' and support.Value ~= true then
+							support:SetValue(true)
+						end
+					end)
+				end
 				if diving or isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
 					getgenv().SB2CombatAnchorOn = false
 					pcall(function()
@@ -17995,7 +18110,7 @@ local ok, err = pcall(function()
 		SoloBox:AddToggle('SoloCombatResume', {
 			Text = 'Resume',
 			Default = false,
-			Tooltip = 'When a stranger joins: Auto skill / Auto attack / Anchor / Event dive turn OFF. Resume stays on — when only you/alts remain, TP to WP and turn combat back on. Saved with your profile.',
+			Tooltip = 'When a stranger joins: Auto skill / Auto attack / Anchor / Event dive turn OFF. Resume stays on — when only you/alts remain, TP to WP, turn combat back on, and turn on Auto support skill. Saved with your profile.',
 		}):OnChanged(function(value)
 			-- Autoload Default=false must not wipe the sidecar / leave Resume off after profile load.
 			if getgenv().SB2ConfigLoading then
@@ -23950,6 +24065,47 @@ local ok, err = pcall(function()
 		StationsBox:AddButton('Open crystal forge', function()
 			openUiStation('openCrystalForge', 'Crystal forge')
 		end)
+		StationsBox:AddButton('Open Ancient Shrine', function()
+			local fn = getgenv().SB2OpenAncientShrine
+			if type(fn) ~= 'function' then
+				Library:Notify('Shrine helper not loaded — reload PlayerTools')
+				return
+			end
+			local ok, how = fn(false)
+			if ok then
+				Library:Notify(
+					how == 'upgrade' and 'Opened Upgrade UI (crystals)' or 'Opened Ancient Shrine / Blessings UI',
+					5
+				)
+			end
+		end)
+		StationsBox:AddButton('Open weapon upgrade (crystals)', function()
+			local fn = getgenv().SB2OpenWeaponUpgradeUi or getgenv().SB2OpenAncientShrine
+			if type(fn) == 'function' then
+				local ok = fn(true)
+				if ok ~= false then
+					Library:Notify('Opened weapon Upgrade UI', 4)
+				end
+			else
+				openUiStation('openUpgrade', 'Upgrade')
+			end
+		end)
+		StationsBox:AddButton('Refresh shrine blessing display', function()
+			local fn = getgenv().SB2RefreshBlessingDisplay
+			if type(fn) ~= 'function' then
+				Library:Notify('Shrine helper not loaded — reload PlayerTools')
+				return
+			end
+			local ok = fn(nil, false)
+			if ok then
+				Library:Notify('Refreshed current / rolled blessing on shrine UI', 4)
+			end
+		end)
+		StationsBox:AddButton('Close stuck upgrade UI', function()
+			closeUpgradeUiHard()
+			Library:Notify('Closed upgrade / result overlays')
+		end)
+		StationsBox:AddLabel('Ancient Shrine: equip right-hand weapon first; hub must stream Shrine.')
 
 		local UpgradeBox = InvTab:AddLeftGroupbox('Remote upgrade')
 		assert(UpgradeBox, 'Remote upgrade groupbox nil')
@@ -24510,11 +24666,6 @@ local ok, err = pcall(function()
 			local after = item:FindFirstChild('Upgrade') and item.Upgrade.Value or 0
 			return after ~= beforeLevel, after
 		end
-
-		StationsBox:AddButton('Close stuck upgrade UI', function()
-			closeUpgradeUiHard()
-			Library:Notify('Closed upgrade / result overlays')
-		end)
 
 		local function readUpgradeBatchSizes()
 			local batchCrystals = Options.RemoteUpgradeCrystals and Options.RemoteUpgradeCrystals.Value or 25
@@ -31032,22 +31183,44 @@ end
 		gear._SB2BlessPatch = true
 
 		local function ensureBlessContext()
-			local shrine = workspace:FindFirstChild('Shrine')
-			if shrine and (gear.ShrineModel == nil or not gear.ShrineModel.Parent) then
-				gear.ShrineModel = shrine
-			end
+			-- Do NOT assign gear.ShrineModel here — BlessingGear.IsEnabled() is truthy when
+			-- ShrineModel is set, and Open() then returns before SetupModel / TrackRightItem.
 			local cam = workspace.CurrentCamera
 			if cam and (gear.Camera == nil or not gear.Camera.Parent) then
 				gear.Camera = cam
 			end
 		end
 
-		local function wrap(name)
+		-- BlessingGear captures Profiles[player] once at require (u1). If profile loaded late,
+		-- TrackRightItem never wires reroll buttons (Connections stays 0).
+		local function rebindBlessingProfileUpvalue(fn)
+			if type(fn) ~= 'function' or type(debug.setupvalue) ~= 'function' then
+				return false
+			end
+			local LP = game:GetService('Players').LocalPlayer
+			local prof = RS:FindFirstChild('Profiles') and RS.Profiles:FindFirstChild(LP.Name)
+			if not prof then
+				return false
+			end
+			for i = 1, 16 do
+				local name = debug.getupvalue(fn, i)
+				if name == 'u1' then
+					debug.setupvalue(fn, i, prof)
+					return true
+				end
+			end
+			return false
+		end
+
+		local function wrapBlessFn(name, rebindProfile)
 			local fn = gear[name]
 			if type(fn) ~= 'function' then
 				return
 			end
 			gear[name] = function(...)
+				if rebindProfile then
+					rebindBlessingProfileUpvalue(fn)
+				end
 				ensureBlessContext()
 				local okCall, result = pcall(fn, ...)
 				if not okCall then
@@ -31065,13 +31238,17 @@ end
 			end
 		end
 
+		local function wrap(name)
+			wrapBlessFn(name, false)
+		end
+
+		wrapBlessFn('Open', true)
+		wrapBlessFn('TrackRightItem', true)
 		for _, name in ipairs({
-			'Open',
 			'Float',
 			'UpdateModel',
 			'CacheOpenPositions',
 			'CreateSpinningModel',
-			'TrackRightItem',
 			'SetEffects',
 			'SetConfirmation',
 			'AnimateOut',
@@ -31079,8 +31256,255 @@ end
 		}) do
 			wrap(name)
 		end
+
+		local function fixBlessingEntryVisible(entry)
+			if not entry or not entry.Parent then
+				return
+			end
+			entry.Visible = true
+			local pad = entry:FindFirstChild('Padding')
+			if pad and pad:IsA('UIPadding') then
+				pad.PaddingTop = UDim.new(0, 0)
+			end
+		end
+
+		for _, pair in ipairs({ { 'UpdateCurrentBlessing', 'BlessingEntry' }, { 'UpdateRolledBlessing', 'RolledEntry' } }) do
+			local fname, entryKey = pair[1], pair[2]
+			local fn = gear[fname]
+			if type(fn) == 'function' then
+				gear[fname] = function(...)
+					rebindBlessingProfileUpvalue(fn)
+					ensureBlessContext()
+					local okCall, result = pcall(fn, ...)
+					fixBlessingEntryVisible(gear[entryKey])
+					if not okCall then
+						notifyBlessErr('Blessing UI: ' .. tostring(result))
+						return nil
+					end
+					task.defer(function()
+						fixBlessingEntryVisible(gear[entryKey])
+						fixBlessingGearUiVisible(gear)
+					end)
+					return result
+				end
+			end
+		end
 		return true
 	end
+
+	local function fixBlessingEntryVisible(entry)
+		if not entry or not entry.Parent then
+			return
+		end
+		entry.Visible = true
+		local pad = entry:FindFirstChild('Padding')
+		if pad and pad:IsA('UIPadding') then
+			pad.PaddingTop = UDim.new(0, 0)
+		end
+		for _, d in ipairs(entry:GetDescendants()) do
+			if d:IsA('UIPadding') and d.Name == 'Padding' then
+				d.PaddingTop = UDim.new(0, 0)
+			elseif d:IsA('GuiObject') then
+				d.Visible = true
+			end
+		end
+	end
+
+	local function fixBlessingTemplateFrame(tpl)
+		if not tpl or not tpl:IsA('GuiObject') then
+			return
+		end
+		tpl.Visible = true
+		for _, d in ipairs(tpl:GetDescendants()) do
+			if d:IsA('UIPadding') and d.Name == 'Padding' then
+				d.PaddingTop = UDim.new(0, 0)
+			elseif d:IsA('GuiObject') then
+				d.Visible = true
+			end
+		end
+		local sy = tpl.Size.Y
+		if sy.Scale == 0 and sy.Offset == 0 then
+			tpl.AutomaticSize = Enum.AutomaticSize.Y
+			tpl.Size = UDim2.new(tpl.Size.X.Scale, tpl.Size.X.Offset, 0, 0)
+		end
+	end
+
+	local function fixBlessingGearUiVisible(gear)
+		if type(gear) ~= 'table' then
+			return
+		end
+		fixBlessingEntryVisible(gear.BlessingEntry)
+		fixBlessingEntryVisible(gear.RolledEntry)
+		local uiRoot = gear.UI
+		if uiRoot then
+			for _, name in ipairs({ 'CurrentBlessing', 'RolledBlessing', 'BlessingHolder', 'RolledHolder' }) do
+				local frame = uiRoot:FindFirstChild(name, true)
+				if frame and frame:IsA('GuiObject') then
+					frame.Visible = true
+					for _, tplName in ipairs({ 'BlessingTemplate', 'RolledTemplate' }) do
+						fixBlessingTemplateFrame(frame:FindFirstChild(tplName))
+					end
+				end
+			end
+		end
+	end
+
+	local function blessingSlotHasContent(slot)
+		if not slot then
+			return false
+		end
+		for _, ch in ipairs(slot:GetChildren()) do
+			if ch:IsA('GuiObject') and not ch:IsA('UILayout') and not ch:IsA('UIPadding') then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function getEquippedBlessingItemFields(item)
+		if not item then
+			return nil, nil
+		end
+		local blessId, potential
+		if type(item) == 'table' then
+			blessId = tonumber(item.BlessingID)
+			potential = item.BlessingPotential
+		elseif typeof(item) == 'Instance' then
+			blessId = tonumber(item:GetAttribute('BlessingID'))
+			potential = item:GetAttribute('BlessingPotential')
+			if blessId == nil then
+				local ch = item:FindFirstChild('BlessingID')
+				blessId = ch and tonumber(ch.Value)
+			end
+			if potential == nil then
+				local ch = item:FindFirstChild('BlessingPotential')
+				potential = ch and ch.Value
+			end
+		end
+		return blessId, potential
+	end
+
+	local function ensureBlessingSlotFilled(gear, item, slotName, useRolledRatio)
+		if type(gear) ~= 'table' or item == nil then
+			return
+		end
+		local uiRoot = gear.UI
+		local slot = uiRoot and uiRoot:FindFirstChild(slotName, true)
+		if not slot then
+			return
+		end
+		local tpl = slot:FindFirstChild('BlessingTemplate') or slot:FindFirstChild('RolledTemplate')
+		if tpl or blessingSlotHasContent(slot) then
+			fixBlessingTemplateFrame(tpl)
+			return
+		end
+		local blessId = select(1, getEquippedBlessingItemFields(item))
+		if not blessId or blessId <= 0 then
+			return
+		end
+		local RS = game:GetService('ReplicatedStorage')
+		local uiMod = RS:FindFirstChild('CardinalClient')
+		uiMod = uiMod and uiMod:FindFirstChild('MainModule')
+		uiMod = uiMod and uiMod:FindFirstChild('Services')
+		uiMod = uiMod and uiMod:FindFirstChild('UI')
+		if not uiMod then
+			return
+		end
+		local okUi, UI = pcall(require, uiMod)
+		if not okUi or type(UI.CreateBlessing) ~= 'function' then
+			return
+		end
+		local _, potential = getEquippedBlessingItemFields(item)
+		local ratio = gear.RolledRatio
+		if useRolledRatio ~= true then
+			ratio = potential or ratio
+		end
+		local okEntry, entry = pcall(UI.CreateBlessing, { item }, useRolledRatio == true, ratio)
+		if okEntry and entry then
+			entry.Parent = slot
+			fixBlessingEntryVisible(entry)
+		end
+	end
+
+	local function getBlessingRightItem()
+		local RS = game:GetService('ReplicatedStorage')
+		local LP = game:GetService('Players').LocalPlayer
+		local prof = RS:FindFirstChild('Profiles') and RS.Profiles:FindFirstChild(LP.Name)
+		local right = prof and prof:FindFirstChild('Equip') and prof.Equip:FindFirstChild('Right')
+		if not right then
+			return nil
+		end
+		local uiInv = RS:FindFirstChild('CardinalClient')
+		uiInv = uiInv and uiInv:FindFirstChild('MainModule')
+		uiInv = uiInv and uiInv:FindFirstChild('Services')
+		uiInv = uiInv and uiInv:FindFirstChild('UI')
+		uiInv = uiInv and uiInv:FindFirstChild('Inventory')
+		if not uiInv then
+			return nil
+		end
+		local okInv, Inv = pcall(require, uiInv)
+		if not okInv or type(Inv.GetItemById) ~= 'function' then
+			return nil
+		end
+		return Inv.GetItemById(right.Value)
+	end
+
+	local function refreshBlessingDisplay(gear, silent)
+		if type(gear) ~= 'table' then
+			local RS = game:GetService('ReplicatedStorage')
+			local mod = RS:FindFirstChild('CardinalClient')
+			mod = mod and mod:FindFirstChild('MainModule')
+			mod = mod and mod:FindFirstChild('Services')
+			mod = mod and mod:FindFirstChild('BlessingGear')
+			if mod then
+				local ok, g = pcall(require, mod)
+				gear = ok and g or nil
+			end
+		end
+		if not gear then
+			return false
+		end
+		local item = getBlessingRightItem()
+		if not item then
+			if not silent then
+				notifyBlessErr('Equip a weapon (right slot) to show blessings')
+			end
+			return false
+		end
+		if type(gear.TrackRightItem) == 'function' then
+			pcall(gear.TrackRightItem)
+		end
+		if type(gear.UpdateCurrentBlessing) == 'function' then
+			pcall(gear.UpdateCurrentBlessing, item, true)
+		end
+		ensureBlessingSlotFilled(gear, item, 'CurrentBlessing', false)
+		if type(gear.UpdateRolledBlessing) == 'function' then
+			pcall(gear.UpdateRolledBlessing, item, true)
+		end
+		ensureBlessingSlotFilled(gear, item, 'RolledBlessing', true)
+		fixBlessingGearUiVisible(gear)
+		if type(gear.TrackCurrency) == 'function' then
+			pcall(gear.TrackCurrency)
+		end
+		return true
+	end
+
+	local function syncBlessingUiAfterOpen(gear)
+		if type(gear) ~= 'table' then
+			return
+		end
+		task.defer(function()
+			refreshBlessingDisplay(gear, true)
+		end)
+		for _, delaySec in ipairs({ 0.12, 0.35, 0.7 }) do
+			task.delay(delaySec, function()
+				refreshBlessingDisplay(gear, true)
+			end)
+		end
+	end
+
+	getgenv().SB2SyncBlessingUiAfterOpen = syncBlessingUiAfterOpen
+	getgenv().SB2RefreshBlessingDisplay = refreshBlessingDisplay
 
 	local function runPatch()
 		pcall(patchBlessingGear)
@@ -31096,6 +31520,137 @@ end
 		end)
 	end)
 	getgenv().SB2PatchBlessingGear = patchBlessingGear
+
+	local function findShrineModel()
+		local shrine = workspace:FindFirstChild('Shrine')
+		if shrine and shrine:IsA('Model') then
+			return shrine
+		end
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			if inst.Name == 'Shrine' and inst:IsA('Model') then
+				return inst
+			end
+		end
+		return nil
+	end
+
+	-- Ancient Shrine bless UI + fallback to crystal upgrade UI from anywhere.
+	local function openAncientShrineMenu(preferUpgrade)
+		patchBlessingGear()
+		local LP = game:GetService('Players').LocalPlayer
+		local RS = game:GetService('ReplicatedStorage')
+		local services = RS:FindFirstChild('CardinalClient')
+		services = services and services:FindFirstChild('MainModule')
+		services = services and services:FindFirstChild('Services')
+		if not services then
+			notifyBlessErr('Game services not loaded yet')
+			return false, 'no services'
+		end
+
+		local function tryUpgradeUi()
+			local uiScript = services:FindFirstChild('UI')
+			if not uiScript then
+				return false, 'UI module missing'
+			end
+			local okReq, ui = pcall(require, uiScript)
+			if not okReq or type(ui) ~= 'table' then
+				return false, 'UI require failed'
+			end
+			local fn = ui.openUpgrade
+			if type(fn) ~= 'function' then
+				return false, 'openUpgrade missing'
+			end
+			local ok, err = pcall(fn)
+			if not ok then
+				return false, tostring(err)
+			end
+			return true, 'upgrade'
+		end
+
+		if preferUpgrade == true then
+			local ok, how = tryUpgradeUi()
+			if ok then
+				return true, how
+			end
+			notifyBlessErr('Upgrade UI: ' .. tostring(how))
+		end
+
+		local modScript = services:FindFirstChild('BlessingGear')
+		if not modScript then
+			local ok, how = tryUpgradeUi()
+			if ok then
+				notifyBlessErr('Shrine model unavailable — opened Upgrade UI instead')
+				return true, how
+			end
+			notifyBlessErr('BlessingGear missing (not at shrine / map not streamed?)')
+			return false, 'no BlessingGear'
+		end
+		local okReq, gear = pcall(require, modScript)
+		if not okReq or type(gear) ~= 'table' then
+			return false, 'BlessingGear require failed'
+		end
+		local shrine = findShrineModel()
+		if not shrine then
+			notifyBlessErr('Shrine not streamed — go to hub / Ancient Shrine area first')
+			local ok, how = tryUpgradeUi()
+			if ok then
+				return true, how
+			end
+			return false, 'no Shrine model'
+		end
+		local profile = RS:FindFirstChild('Profiles') and RS.Profiles:FindFirstChild(LP.Name)
+		local equip = profile and profile:FindFirstChild('Equip')
+		local rightSlot = equip and equip:FindFirstChild('Right')
+		local rightId = rightSlot and rightSlot.Value
+		if rightId == nil or rightId == 0 or rightId == '' then
+			notifyBlessErr('Equip a weapon in your right slot first, then open Ancient Shrine again')
+		end
+		if type(gear.Close) == 'function' then
+			pcall(gear.Close)
+		end
+		gear.ShrineModel = nil
+		local pg = LP:FindFirstChild('PlayerGui')
+		if pg then
+			local blessGui = pg:FindFirstChild('Blessings')
+			if blessGui and blessGui:IsA('ScreenGui') then
+				blessGui.Enabled = true
+			end
+		end
+		if type(gear.Open) ~= 'function' then
+			return false, 'BlessingGear.Open missing'
+		end
+		local okOpen, errOpen = pcall(function()
+			gear.Open(shrine)
+		end)
+		if okOpen then
+			syncBlessingUiAfterOpen(gear)
+			task.defer(function()
+				local connN = type(gear.Connections) == 'table' and #gear.Connections or 0
+				if connN < 2 then
+					notifyBlessErr(
+						'Reroll not wired — close shrine, equip right-hand weapon, reopen Ancient Shrine'
+					)
+				elseif not gear.SpinningModel and not gear.BlessingEntry then
+					notifyBlessErr(
+						'Shrine opened but preview empty — equip right-hand weapon & stand in hub with character loaded'
+					)
+				end
+			end)
+			return true, 'blessings'
+		end
+		local okUp, howUp = tryUpgradeUi()
+		if okUp then
+			notifyBlessErr('Shrine UI failed — opened Upgrade UI. Pick weapon + crystals there.')
+			return true, howUp
+		end
+		notifyBlessErr(tostring(errOpen))
+		return false, tostring(errOpen)
+	end
+
+	getgenv().SB2OpenAncientShrine = openAncientShrineMenu
+	getgenv().SB2OpenWeaponUpgradeUi = function()
+		return openAncientShrineMenu(true)
+	end
 end)()
 
 -- SB2_PLAYERTOOLS_EOF
