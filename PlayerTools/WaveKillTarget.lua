@@ -1,7 +1,7 @@
 --[[
 	Split from PlayerTools_Obsidian.lua (Luau 200-local register cap).
 ]]
-getgenv().SB2WaveKillBuild = 'wave-kill-phantom-v4'
+getgenv().SB2WaveKillBuild = 'wave-kill-phantom-v6'
 
 return function(env)
 	local WdBox = env.WdBox
@@ -170,6 +170,57 @@ return function(env)
 		return false
 	end
 
+	local function waveKillMobDead(mob)
+		if not mob or not mob.Parent then
+			return true
+		end
+		if mob:GetAttribute('Died') == true then
+			return true
+		end
+		local ent = mob:FindFirstChild('Entity')
+		if ent and ent:GetAttribute('Died') == true then
+			return true
+		end
+		local hp = ent and ent:FindFirstChild('Health')
+		if hp and typeof(hp.Value) == 'number' and hp.Value <= 0 then
+			return true
+		end
+		local hum = mob:FindFirstChildOfClass('Humanoid')
+		if hum and hum.Health <= 0 then
+			return true
+		end
+		return false
+	end
+
+	-- Decoy phantoms carry Entity.Immortal. The one you can damage does not.
+	local function waveKillMobImmortal(mob)
+		local ent = mob and mob:FindFirstChild('Entity')
+		if not ent then
+			return false
+		end
+		if ent:GetAttribute('Immortal') == true or mob:GetAttribute('Immortal') == true then
+			return true
+		end
+		local imm = ent:FindFirstChild('Immortal')
+		return imm ~= nil and imm:IsA('BoolValue') and imm.Value == true
+	end
+
+	local function waveKillVisibleParts(mob)
+		local n = 0
+		for _, d in ipairs(mob:GetDescendants()) do
+			if d:IsA('BasePart') and d.Transparency < 0.85 then
+				local name = d.Name
+				if name ~= 'HumanoidRootPart' and name ~= 'HealthPos' and name ~= 'Nameplate' then
+					n += 1
+					if n >= 3 then
+						return n
+					end
+				end
+			end
+		end
+		return n
+	end
+
 	local function waveKillMobIsQueuedTarget(mob)
 		if not mob or not mob:IsA('Model') then
 			return false
@@ -238,6 +289,36 @@ return function(env)
 		return score
 	end
 
+	-- The hittable phantom is the one wrapped in yellow dust. Body glow and the
+	-- game highlight sit on decoys. Any yellow keypoint counts, not only the first.
+	local function waveKillYellowDustScore(mob)
+		local score = 0
+		for _, d in ipairs(mob:GetDescendants()) do
+			if d:IsA('ParticleEmitter') and d.Enabled and d.Rate >= 1 then
+				local yellow = false
+				local keypoints = d.Color and d.Color.Keypoints
+				if keypoints then
+					for _, key in ipairs(keypoints) do
+						local c = key.Value
+						if c and c.R >= 0.65 and c.G >= 0.4 and c.B <= 0.6 and c.G > c.B and (c.R + c.G) > 1.15 then
+							yellow = true
+							break
+						end
+					end
+				end
+				if yellow then
+					local size = 1
+					local sizeKeys = d.Size and d.Size.Keypoints
+					if sizeKeys and sizeKeys[1] then
+						size = math.max(size, sizeKeys[1].Value)
+					end
+					score += d.Rate * (1 + (tonumber(d.LightEmission) or 0)) + size
+				end
+			end
+		end
+		return score
+	end
+
 	local function findWaveKillTargetMob(origin)
 		local folder = waveKillTargetFolder()
 		if not folder then
@@ -245,12 +326,16 @@ return function(env)
 		end
 		local children = folder:GetChildren()
 		local candidates = {}
+		local mortals = {}
 		local phantomWave = false
 		for idx, mob in ipairs(children) do
-			if waveKillMobIsQueuedTarget(mob) then
-				if waveKillIsPhantomMob(mob) then
-					phantomWave = true
+			if waveKillIsPhantomMob(mob) then
+				phantomWave = true
+				if not waveKillMobDead(mob) and not waveKillMobImmortal(mob) then
+					mortals[#mortals + 1] = { mob = mob, idx = idx }
 				end
+			end
+			if waveKillMobIsQueuedTarget(mob) then
 				local hl = waveKillMobHighlight(mob)
 				candidates[#candidates + 1] = {
 					mob = mob,
@@ -258,6 +343,38 @@ return function(env)
 					priority = waveKillHighlightPriority(hl) or 999,
 				}
 			end
+		end
+		-- Yellow dust marks the phantom that has to be hit. Highlighted and
+		-- plainly invisible copies are decoys.
+		if phantomWave then
+			local dustBest, dustMob = 0, nil
+			for _, mob in ipairs(children) do
+				if waveKillIsPhantomMob(mob) and not waveKillMobDead(mob) then
+					local dust = waveKillYellowDustScore(mob)
+					if dust > dustBest then
+						dustBest = dust
+						dustMob = mob
+					end
+				end
+			end
+			if dustMob and dustBest >= 2 then
+				return dustMob
+			end
+		end
+		if phantomWave and #mortals > 0 then
+			if #mortals == 1 then
+				return mortals[1].mob
+			end
+			local best, bestVis, bestIdx = nil, nil, nil
+			for _, row in ipairs(mortals) do
+				local vis = waveKillVisibleParts(row.mob)
+				if not best or vis < bestVis or (vis == bestVis and row.idx < bestIdx) then
+					best = row.mob
+					bestVis = vis
+					bestIdx = row.idx
+				end
+			end
+			return best
 		end
 		if #candidates == 0 then
 			return nil
@@ -676,8 +793,8 @@ return function(env)
 
 	WdBox:AddToggle('WaveKillTarget', {
 		Text = 'Highlight ordered kill (WD)',
-		Default = true,
-		Tooltip = 'Wave Defense special / phantom order: picks the active Highlight under Workspace.Mobs. Phantom waves target the yellowish glow, not the nearest or earliest spawn. Skips SystemFrozen. Tracer, chams, KILL NEXT label.',
+		Default = false,
+		Tooltip = 'Wave Defense kill order. Phantom waves lock onto the copy wrapped in yellow dust, and killaura hits that one first.',
 	}):OnChanged(function(value)
 		getgenv().SB2WaveKillTargetOn = value == true
 		getgenv().SB2WaveKillTargetLastName = nil

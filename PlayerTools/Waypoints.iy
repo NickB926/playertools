@@ -146,6 +146,7 @@ end
 local function loadStore()
 	local path = resolveSavePath()
 	local store = defaultStore()
+	local readFailed = false
 	if type(readfile) == 'function' and type(isfile) == 'function' then
 		local okExists, exists = pcall(isfile, path)
 		if okExists and exists then
@@ -158,13 +159,18 @@ local function loadStore()
 				elseif decoded and type(decoded) == 'table' and decoded[1] then
 					-- legacy array form
 					store.waypoints = decoded
+				else
+					readFailed = true
 				end
+			else
+				readFailed = true
 			end
 		end
 	end
 	getgenv()[GENV_KEY] = {
 		path = path,
 		store = store,
+		readFailed = readFailed,
 	}
 	return store, path
 end
@@ -174,6 +180,10 @@ local function saveStore()
 	if not state or type(state.store) ~= 'table' then
 		loadStore()
 		state = getgenv()[GENV_KEY]
+	end
+	if state.readFailed then
+		say('refusing to save — the waypoint file did not load')
+		return false
 	end
 	local path = state.path or resolveSavePath()
 	state.path = path
@@ -258,9 +268,6 @@ local function teleportTo(cf)
 	end
 	if typeof(cf) ~= 'CFrame' then
 		return false, 'bad cframe'
-	end
-	if cf.Position.Y < -20 then
-		return false, 'void waypoint'
 	end
 	pcall(function()
 		local h = getgenv().SB2Hive

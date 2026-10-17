@@ -481,6 +481,10 @@ local function writeFreshFinder(data)
 	if type(data) ~= 'table' then
 		data = { active = false }
 	end
+	-- Drop a hop that is still holding the table from before the user turned this off.
+	if data.active == true and (tonumber(data.gen) or 0) < (tonumber(getgenv().SB2FreshFinderStoppedGen) or 0) then
+		return
+	end
 	getgenv().SB2FreshServerFinder = data
 	if type(getgenv().SB2WriteFreshServerFinder) == 'function' then
 		pcall(getgenv().SB2WriteFreshServerFinder, data)
@@ -775,7 +779,13 @@ local function startFreshServerHop(reason)
 	local cancelGen = getgenv().SB2FreshFinderCancelGen or 0
 	-- Fresh finder needs transient block runs without flipping the user's autoblock toggle.
 	local placeId = tonumber(game.PlaceId) or game.PlaceId
-	local fsf = readFreshFinder() or { active = true, placeId = placeId, tried = {}, hops = 0 }
+	local fsf = readFreshFinder() or {
+		active = true,
+		gen = tonumber(getgenv().SB2FreshFinderStoppedGen) or 0,
+		placeId = placeId,
+		tried = {},
+		hops = 0,
+	}
 	if fsf.active ~= true then
 		return false
 	end
@@ -2314,6 +2324,7 @@ end
 getgenv().SB2StopFreshServerFinder = function(msg)
 	local prev = readFreshFinder()
 	local wasActive = type(prev) == 'table' and prev.active == true
+	getgenv().SB2FreshFinderStoppedGen = (tonumber(getgenv().SB2FreshFinderStoppedGen) or 0) + 1
 	bumpFreshFinderCancel()
 	writeFreshFinder({ active = false, placeId = game.PlaceId, tried = {}, hops = 0 })
 	writeHop({ active = false, phase = 'off' })
@@ -2480,6 +2491,7 @@ local Plugin = {
 				local targetPlace = tonumber(game.PlaceId) or game.PlaceId
 				writeFreshFinder({
 					active = true,
+					gen = tonumber(getgenv().SB2FreshFinderStoppedGen) or 0,
 					placeId = targetPlace,
 					placeName = 'Current floor',
 					tried = { [tostring(game.JobId or '')] = true },

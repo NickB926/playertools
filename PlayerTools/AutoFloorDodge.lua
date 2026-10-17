@@ -1,7 +1,7 @@
 --[[
 	Split from PlayerTools_Obsidian.lua (Luau 200-local register cap).
 ]]
-getgenv().SB2AutoFloorDodgeBuild = 'floor-dodge-v4'
+getgenv().SB2AutoFloorDodgeBuild = 'floor-dodge-v10'
 
 return function(env)
 	local CombatBox = env.CombatBox
@@ -64,10 +64,13 @@ return function(env)
 			end
 			local dist, px, pz = segDistXZ(origin, a0.WorldPosition, a1.WorldPosition)
 			local half = beam.Width0 * 0.5
-			if dist >= half + 3 then
+			-- Land well past the beam. 150ms+ ping replicates the jump late, and the
+			-- hit circle is wider than the visible beam, so 8 studs still got clipped.
+			local clear = 26
+			if dist >= half + 16 then
 				return
 			end
-			local push = (half + 8) - dist
+			local push = (half + clear) - dist
 			if not bestPush or push > bestPush then
 				bestPush = push
 				best = Vector3.new(origin.X + px * push, origin.Y, origin.Z + pz * push)
@@ -96,9 +99,16 @@ return function(env)
 	end
 
 	local LAVA_CLEARANCE = 32
+	local BOSS_CLEARANCE = 80
+	local AEGANATOS_CLEARANCE = 300
+	local WENDIGO_BEHIND = 60
 	local lavaStandY = nil
 	local lavaSeenUntil = 0
 	local lavaScanAt = 0
+	local bossSeenUntil = 0
+	local bossScanAt = 0
+	local bossClearanceHeld = nil
+	local BOSS_NEEDLES = { 'aegor', 'vaelith', 'rubricatus', 'nythrane', 'aeganatos' }
 
 	local function uiSaysFloorLava()
 		local pg = LocalPlayer:FindFirstChild('PlayerGui')
@@ -184,6 +194,253 @@ return function(env)
 		return now < lavaSeenUntil
 	end
 
+	pcall(function()
+		local bosses = game:GetService('ReplicatedStorage')
+			.CardinalClient.MainModule.Services.EnemySkills.Skills['Wave Defense'].Bosses
+		for _, c in ipairs(bosses:GetChildren()) do
+			local first = string.lower(tostring(c.Name)):match('^[%a\']+')
+			if first and #first >= 4 then
+				BOSS_NEEDLES[#BOSS_NEEDLES + 1] = first
+			end
+		end
+	end)
+
+	local function mobFlag(inst, name)
+		if not inst then
+			return false
+		end
+		if inst:GetAttribute(name) == true then
+			return true
+		end
+		local child = inst:FindFirstChild(name)
+		if not child then
+			return false
+		end
+		if child:IsA('BoolValue') then
+			return child.Value == true
+		end
+		if child:IsA('Folder') or child:IsA('Configuration') then
+			return true
+		end
+		return false
+	end
+
+	local function mobIsDead(mob)
+		if not mob or not mob.Parent then
+			return true
+		end
+		if mob:GetAttribute('Died') == true then
+			return true
+		end
+		local ent = mob:FindFirstChild('Entity')
+		if ent and ent:GetAttribute('Died') == true then
+			return true
+		end
+		local hp = ent and ent:FindFirstChild('Health')
+		if hp and typeof(hp.Value) == 'number' and hp.Value > 0 then
+			return false
+		end
+		local hum = mob:FindFirstChildOfClass('Humanoid')
+		if hum and hum.Health <= 0 then
+			return true
+		end
+		if hp and typeof(hp.Value) == 'number' and hp.Value <= 0 then
+			return true
+		end
+		return false
+	end
+
+	local function bossNameMatch(text)
+		local lower = string.lower(tostring(text or ''))
+		if lower == '' then
+			return false
+		end
+		local key = string.gsub(lower, '[%p%s]+', '')
+		for i = 1, #BOSS_NEEDLES do
+			if string.find(key, BOSS_NEEDLES[i], 1, true) then
+				return true
+			end
+		end
+		return string.find(lower, 'boss', 1, true) ~= nil
+	end
+
+	local function mobIsBoss(mob)
+		if mobIsDead(mob) then
+			return false
+		end
+		local lower = string.lower(tostring(mob.Name))
+		if string.find(lower, 'chest', 1, true) or string.find(lower, 'reward', 1, true) then
+			return false
+		end
+		if bossNameMatch(mob.Name) then
+			return true
+		end
+		local plate = mob:FindFirstChild('Nameplate')
+		if plate then
+			local label = plate:FindFirstChildWhichIsA('TextLabel', true)
+			if label and bossNameMatch(label.Text) then
+				return true
+			end
+		end
+		local ent = mob:FindFirstChild('Entity')
+		if mobFlag(mob, 'Boss') or mobFlag(ent, 'Boss') or mobFlag(mob, 'IsBoss') or mobFlag(ent, 'IsBoss') or mobFlag(ent, 'Miniboss') then
+			return true
+		end
+		local beh = mob:GetAttribute('EnemyBehavior') or (ent and ent:GetAttribute('EnemyBehavior'))
+		if type(beh) == 'string' and string.find(string.lower(beh), 'boss', 1, true) then
+			return true
+		end
+		local diff = ent and ent:FindFirstChild('Difficulty')
+		if diff and typeof(diff.Value) == 'string' and string.find(string.lower(diff.Value), 'boss', 1, true) then
+			return true
+		end
+		return false
+	end
+
+	local wendigoMob = nil
+	local wendigoScanAt = 0
+
+	local function isEnragedWendigo(mob)
+		if mobIsDead(mob) then
+			return false
+		end
+		local lower = string.lower(tostring(mob.Name))
+		if string.find(lower, 'chest', 1, true) or string.find(lower, 'reward', 1, true) then
+			return false
+		end
+		local key = string.gsub(lower, '[%p%s]+', '')
+		if string.find(key, 'enragedwendigo', 1, true) then
+			return true
+		end
+		if not string.find(key, 'wendigo', 1, true) then
+			return false
+		end
+		local function marked(inst)
+			if not inst then
+				return false
+			end
+			if inst:GetAttribute('Enraged') == true then
+				return true
+			end
+			local variant = inst:GetAttribute('Variant') or inst:GetAttribute('EnemyBehavior')
+			return type(variant) == 'string' and string.find(string.lower(variant), 'enraged', 1, true) ~= nil
+		end
+		return marked(mob) or marked(mob:FindFirstChild('Entity'))
+	end
+
+	local function findEnragedWendigo()
+		local folder = workspace:FindFirstChild('Mobs')
+		if not folder then
+			return nil
+		end
+		for _, mob in ipairs(folder:GetChildren()) do
+			if isEnragedWendigo(mob) then
+				return mob
+			end
+		end
+		return nil
+	end
+
+	local function refreshWendigo(now)
+		if wendigoMob and (not wendigoMob.Parent or not isEnragedWendigo(wendigoMob)) then
+			wendigoMob = nil
+		end
+		if not wendigoMob or now - wendigoScanAt >= 0.2 then
+			wendigoScanAt = now
+			wendigoMob = findEnragedWendigo()
+		end
+		return wendigoMob
+	end
+
+	local function mobFlatLook(mob)
+		local part = mob:FindFirstChild('HumanoidRootPart')
+		if not (part and part:IsA('BasePart')) then
+			part = mob.PrimaryPart
+		end
+		local cf = nil
+		if part and part:IsA('BasePart') then
+			cf = part.CFrame
+		else
+			local ok, pivot = pcall(function()
+				return mob:GetPivot()
+			end)
+			if ok and typeof(pivot) == 'CFrame' then
+				cf = pivot
+			end
+		end
+		if not cf then
+			return nil, nil
+		end
+		local flat = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+		if flat.Magnitude < 0.05 then
+			flat = Vector3.new(0, 0, -1)
+		else
+			flat = flat.Unit
+		end
+		return cf.Position, flat
+	end
+
+	local function bossBarActive()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		if not pg then
+			return false
+		end
+		local bars = pg:FindFirstChild('BossHealthBars', true)
+		if not bars then
+			return false
+		end
+		for _, child in ipairs(bars:GetChildren()) do
+			if child:IsA('GuiObject') and child.Visible then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function mobBossClearance(mob)
+		if not mobIsBoss(mob) then
+			return nil
+		end
+		local key = string.gsub(string.lower(tostring(mob.Name)), '[%p%s]+', '')
+		if string.find(key, 'aeganatos', 1, true) then
+			return AEGANATOS_CLEARANCE
+		end
+		local plate = mob:FindFirstChild('Nameplate')
+		local label = plate and plate:FindFirstChildWhichIsA('TextLabel', true)
+		if label and string.find(string.gsub(string.lower(tostring(label.Text)), '[%p%s]+', ''), 'aeganatos', 1, true) then
+			return AEGANATOS_CLEARANCE
+		end
+		return BOSS_CLEARANCE
+	end
+
+	local function bossHoverActive(now)
+		if now - bossScanAt >= 0.2 then
+			bossScanAt = now
+			local folder = workspace:FindFirstChild('Mobs')
+			local best = nil
+			if folder then
+				for _, mob in ipairs(folder:GetChildren()) do
+					local clearance = mobBossClearance(mob)
+					if clearance and (not best or clearance > best) then
+						best = clearance
+					end
+				end
+			end
+			if not best and bossBarActive() then
+				best = BOSS_CLEARANCE
+			end
+			if best then
+				bossClearanceHeld = best
+				bossSeenUntil = now + 1.2
+			end
+		end
+		if now < bossSeenUntil then
+			return bossClearanceHeld or BOSS_CLEARANCE
+		end
+		bossClearanceHeld = nil
+		return nil
+	end
+
 	local function groundYAt(hrp)
 		local params = RaycastParams.new()
 		params.FilterType = Enum.RaycastFilterType.Exclude
@@ -205,9 +462,14 @@ return function(env)
 		return nil
 	end
 
-	local function writeHeldCF(hrp, dest)
-		local lv = hrp.CFrame.LookVector
-		local flat = Vector3.new(lv.X, 0, lv.Z)
+	local function writeHeldCF(hrp, dest, lookAt)
+		local flat
+		if typeof(lookAt) == 'Vector3' then
+			flat = Vector3.new(lookAt.X - dest.X, 0, lookAt.Z - dest.Z)
+		else
+			local lv = hrp.CFrame.LookVector
+			flat = Vector3.new(lv.X, 0, lv.Z)
+		end
 		local cf = flat.Magnitude >= 0.08 and CFrame.lookAt(dest, dest + flat.Unit) or CFrame.new(dest)
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
@@ -220,12 +482,43 @@ return function(env)
 		elseif getgenv().SB2CombatAnchorOn == true then
 			getgenv().SB2AnchorLockCF = cf
 		end
+		local pin = getgenv().SB2TpPinCFrame
+		local pinNear = typeof(pin) == 'CFrame' and (pin.Position - cf.Position).Magnitude < 3
+		if not pinNear and type(getgenv().SB2PinTeleportCFrame) == 'function' then
+			getgenv().SB2PinTeleportCFrame(cf, 8)
+		end
 	end
+
+	local hoverGroundY = nil
 
 	local function clearLavaHover()
 		getgenv().SB2LavaHoverY = nil
 		lavaStandY = nil
+		hoverGroundY = nil
 		lavaSeenUntil = 0
+		bossSeenUntil = 0
+		bossClearanceHeld = nil
+	end
+
+	local function darknerOrbCenter()
+		local orb = workspace:FindFirstChild('DarknerOrb')
+		if not orb or not orb.Parent then
+			return nil
+		end
+		if orb:IsA('BasePart') then
+			return orb.Position
+		end
+		local ok, pos = pcall(function()
+			if orb:IsA('Model') or orb:IsA('PVInstance') then
+				return orb:GetPivot().Position
+			end
+			local part = orb:FindFirstChildWhichIsA('BasePart', true)
+			return part and part.Position
+		end)
+		if ok and typeof(pos) == 'Vector3' then
+			return pos
+		end
+		return nil
 	end
 
 	local function startAutoFloorDodgeLoop()
@@ -248,15 +541,21 @@ return function(env)
 					getgenv().SB2AutoFloorDodgeConn = nil
 				end
 				clearLavaHover()
+				getgenv().SB2DarknerOrbXZ = nil
+				getgenv().SB2WendigoHold = nil
 				return
 			end
 			-- Event dive fight loop already sidesteps circles (same scanner).
 			-- Floor-is-lava still hovers here so dive cannot plant you in the floor.
-			local lavaNow = floorLavaActive(os.clock())
-			if not lavaNow and getgenv().SB2DiveFarmOn == true and isToggleOn('DiveFarm') then
+			local nowPre = os.clock()
+			local lavaNow = floorLavaActive(nowPre)
+			local bossNow = bossHoverActive(nowPre)
+			local orbEarly = darknerOrbCenter()
+			local wendigoNow = refreshWendigo(nowPre)
+			if not lavaNow and not bossNow and not orbEarly and not wendigoNow and getgenv().SB2DiveFarmOn == true and isToggleOn('DiveFarm') then
 				return
 			end
-			if getgenv().SB2DiveUnderMap == true and not lavaNow then
+			if getgenv().SB2DiveUnderMap == true and not lavaNow and not bossNow and not orbEarly and not wendigoNow then
 				return
 			end
 			if not isLocalAlive() then
@@ -267,13 +566,48 @@ return function(env)
 			if not hrp or not hrp:IsA('BasePart') then
 				return
 			end
+			if wendigoNow then
+				local pos, look = mobFlatLook(wendigoNow)
+				if pos and look then
+					local dx = hrp.Position.X - pos.X
+					local dz = hrp.Position.Z - pos.Z
+					if (dx * dx + dz * dz) <= (800 * 800) then
+						getgenv().SB2DarknerOrbXZ = nil
+						local y = lavaStandY or hrp.Position.Y
+						if lavaStandY ~= nil or getgenv().SB2LavaHoverY ~= nil then
+							clearLavaHover()
+						end
+						local dest = Vector3.new(pos.X - look.X * WENDIGO_BEHIND, y, pos.Z - look.Z * WENDIGO_BEHIND)
+						getgenv().SB2WendigoHold = dest
+						writeHeldCF(hrp, dest, pos)
+						return
+					end
+				end
+			end
+			getgenv().SB2WendigoHold = nil
+			local orb = darknerOrbCenter()
+			if orb then
+				local dx = hrp.Position.X - orb.X
+				local dz = hrp.Position.Z - orb.Z
+				if (dx * dx + dz * dz) <= (220 * 220) then
+					getgenv().SB2DarknerOrbXZ = Vector3.new(orb.X, 0, orb.Z)
+					local y = lavaStandY or hrp.Position.Y
+					if lavaStandY ~= nil or getgenv().SB2LavaHoverY ~= nil then
+						clearLavaHover()
+					end
+					writeHeldCF(hrp, Vector3.new(orb.X, y, orb.Z))
+					return
+				end
+			end
+			getgenv().SB2DarknerOrbXZ = nil
 			local now = os.clock()
-			if lavaNow then
+			local clearance = bossNow or (lavaNow and LAVA_CLEARANCE or nil)
+			if clearance then
 				if lavaStandY == nil then
 					lavaStandY = hrp.Position.Y
+					hoverGroundY = groundYAt(hrp) or (lavaStandY - 3)
 				end
-				local gy = groundYAt(hrp) or (lavaStandY - 3)
-				local hoverY = gy + LAVA_CLEARANCE
+				local hoverY = hoverGroundY + clearance
 				getgenv().SB2LavaHoverY = hoverY
 				writeHeldCF(hrp, Vector3.new(hrp.Position.X, hoverY, hrp.Position.Z))
 				return
@@ -333,7 +667,7 @@ return function(env)
 	CombatBox:AddToggle('AutoFloorDodge', {
 		Text = 'Auto dodge floor circles',
 		Default = true,
-		Tooltip = 'Sidestep floor circles and attack beams. Floor is Lava lifts you 30 studs, then drops you when the wave ends. Map light shafts are ignored.',
+		Tooltip = 'Sidestep floor circles and attack beams. Floor is Lava lifts you 30 studs. A wave boss lifts you 80 studs until it dies. Aeganatos lifts you 300. Darkner orb keeps you in its center. Enraged Wendigo holds you 60 studs behind it until it dies.',
 	}):OnChanged(function(value)
 		getgenv().SB2AutoFloorDodgeOn = value == true
 		local prev = getgenv().SB2AutoFloorDodgeConn
@@ -345,6 +679,8 @@ return function(env)
 		end
 		if not value then
 			clearLavaHover()
+			getgenv().SB2DarknerOrbXZ = nil
+			getgenv().SB2WendigoHold = nil
 			return
 		end
 		startAutoFloorDodgeLoop()

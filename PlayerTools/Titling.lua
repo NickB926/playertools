@@ -5,7 +5,7 @@
 	Custom titles: local UIGradient / UIStroke / Icon / optional loops (client-only).
 ]]
 
-getgenv().SB2TitlingBuild = 'titling-nameplate-fix-v8'
+getgenv().SB2TitlingBuild = 'titling-alias-anim-v1'
 
 return function(env)
 	local WikiTab = env.WikiTab or env.ItemsTab
@@ -813,6 +813,29 @@ return function(env)
 		end)
 	end
 
+	-- AliasEffect titles animate only after the label is tagged. Cloning the
+	-- gradient/star leaves a static nameplate because .new does not exist.
+	local function armAliasEffect(label, tagName, userId, variant)
+		if not label then
+			return false
+		end
+		label:SetAttribute('AliasName', tagName)
+		label:SetAttribute('Visible', true)
+		label:SetAttribute('SB2AliasDriven', true)
+		if type(userId) == 'number' then
+			label:SetAttribute('UserId', userId)
+		end
+		if variant and variant.staffIndex then
+			label:SetAttribute('CommunityStaffIndex', variant.staffIndex)
+			label:SetAttribute('StaffIndex', variant.staffIndex)
+		end
+		pcall(function()
+			CollectionService:AddTag(label, 'AliasEffect')
+			CollectionService:AddTag(label, 'VisibilityTracker')
+		end)
+		return true
+	end
+
 	local function invokeTitleModule(modScript, label, effectUserId, variant)
 		if not modScript or not label then
 			return false, 'missing module/label'
@@ -1022,7 +1045,8 @@ return function(env)
 		if host then
 			tidyNameplateHost(host)
 		end
-		if boostGameTitleAnim then
+		-- AliasEffect already runs the game's shine / star / stroke tweens.
+		if label:GetAttribute('SB2AliasDriven') ~= true and boostGameTitleAnim then
 			boostGameTitleAnim(label, tagName, modScript)
 		end
 		local how = 'game module'
@@ -1065,6 +1089,21 @@ return function(env)
 		pcall(function()
 			CollectionService:AddTag(label, tagName)
 		end)
+		local aliasDriven = modScript:GetFullName():find('AliasEffect', 1, true) ~= nil
+		if aliasDriven then
+			armAliasEffect(label, tagName, effectUserId or userId, variant)
+			local host = label.Parent
+			if host then
+				bumpTitlePurgeGen(host)
+				tidyNameplateHost(host)
+			end
+			for _ = 1, 20 do
+				if labelHasEffectiveTitleFx(label, tagName) then
+					return finishGameTitleApply(label, tagName, modScript, displayName, variant, host)
+				end
+				task.wait(0.08)
+			end
+		end
 		local okInvoke = invokeTitleModule(modScript, label, effectUserId or userId, variant)
 		local host = label.Parent
 		if host then
@@ -2167,7 +2206,7 @@ return function(env)
 		if type(t) == 'table' and t.Value ~= nil then
 			return t.Value == true
 		end
-		return getgenv().SB2TitlingAutoFixNameplate ~= false
+		return getgenv().SB2TitlingAutoFixNameplate == true
 	end
 
 	local function tryAutoFixNameplate(playerName)
@@ -2250,7 +2289,7 @@ return function(env)
 
 	TitlingBox:AddToggle('TitlingAutoFixNameplate', {
 		Text = 'Auto-fix equipped title on nameplate',
-		Default = true,
+		Default = false,
 		Tooltip = 'When the game leaves a plain white gradient on Nameplate.Tag (common for Dev / Community Staff), re-apply proper colors from your equipped CurrentTag.',
 	}):OnChanged(function(on)
 		getgenv().SB2TitlingAutoFixNameplate = on == true
@@ -2260,7 +2299,6 @@ return function(env)
 			end
 		end
 	end)
-	getgenv().SB2TitlingAutoFixNameplate = true
 
 	local function setStatus(text)
 		pcall(function()

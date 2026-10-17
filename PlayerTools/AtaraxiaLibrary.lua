@@ -1385,8 +1385,10 @@ function Library:BuildSettingsTab(Window, info)
 
 	local scriptBox = tab:AddLeftGroupbox('Script')
 	scriptBox:AddLabel('Home hides/shows this window (same as PlayerTools).')
+	tab.ScriptBox = scriptBox
 
 	local profileBox = tab:AddRightGroupbox('Profiles')
+	tab.ProfileBox = profileBox
 
 	-- Script-specific rows (e.g. Auto inject) before shared chrome controls.
 	if type(info.SettingsExtras) == 'function' then
@@ -2558,6 +2560,15 @@ Library.Config = (function()
 	local function apply(data)
 		if type(data) ~= 'table' then
 			return 0
+		end
+		api.LastData = data
+		-- A saved off wins over a sticky flag left from an older session.
+		if data.SoloCombatResume == false then
+			getgenv().SB2StickyResumeWanted = false
+			getgenv().SB2ForceResumeWanted = false
+			getgenv().SB2ResumeAssertUntil = 0
+			getgenv().SB2ResumeGuardUntil = 0
+			getgenv().SB2ResumeAfterConfig = false
 		end
 		suspended = true
 		local notify = Library.Notify

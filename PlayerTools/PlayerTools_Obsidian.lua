@@ -522,7 +522,7 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'wave-kill-yellow-v1'
+getgenv().SB2PlayerToolsLocalBuild = 'rapid-inventory-use-v3-shadow-only'
 getgenv().SB2WaveKillTargetUILoaded = false
 pcall(function()
 	warn(('[PlayerTools] local build %s | %s'):format(
@@ -604,6 +604,7 @@ local OWN_ALT_USERIDS = {
 	[11416183253] = true, -- Wa_TheCurious
 	[11025682106] = true, -- SB2ButOnlyTrading
 	[285463210] = true, -- 62qx
+	[1099119770] = true, -- aormai
 }
 local function normalizeAltKey(raw)
 	-- Only for per-account profile filenames — whitelist itself is UserId-based.
@@ -765,6 +766,9 @@ local unloadExisting = function()
 		end
 		if type(getgenv().SB2WeaponModCleanup) == 'function' then
 			getgenv().SB2WeaponModCleanup()
+		end
+		if type(getgenv().SB2WeaponAuraPreviewClear) == 'function' then
+			pcall(getgenv().SB2WeaponAuraPreviewClear)
 		end
 		local cam = workspace.CurrentCamera
 		if cam then
@@ -1051,7 +1055,20 @@ end
 -- leave this true and make later injects silently no-op.
 getgenv().SB2PlayerToolsLoading = true
 getgenv().SB2PlayerToolsLoadingSince = os.clock()
-getgenv().SB2CombatBootGraceUntil = os.clock() + 15
+do
+	local grace = 0.75
+	pcall(function()
+		local lp = game:GetService('Players').LocalPlayer
+		local chars = workspace:FindFirstChild('Characters')
+		local model = (chars and lp and chars:FindFirstChild(lp.Name)) or (lp and lp.Character)
+		local hrp = model and model:FindFirstChild('HumanoidRootPart')
+		local hum = model and model:FindFirstChildOfClass('Humanoid')
+		if hrp and hrp:IsA('BasePart') and hrp.Position.Y > -20 and hum and hum.Health > 0 then
+			grace = 0
+		end
+	end)
+	getgenv().SB2CombatBootGraceUntil = os.clock() + grace
+end
 
 -- Intentional launch (Potassium execute) clears a prior Unload Script block.
 do
@@ -1149,6 +1166,35 @@ local ok, err = pcall(function()
 		return tonumber(raw)
 	end
 	getgenv().SB2ReadNextPlaceId = readWorkspaceNextPlaceId
+	local WD_HUB_PLACE = '121252145396212'
+	local function isWaveDefenseRunPlaceId(placeId)
+		placeId = tonumber(placeId)
+		return placeId == 540240728 or placeId == 580239979
+	end
+	local function isWaveDefenseHubLobby()
+		if isWaveDefenseRunPlaceId(game.PlaceId) then
+			return false
+		end
+		local diveFn = getgenv().SB2DiveFarmZone
+		if type(diveFn) == 'function' then
+			local ok, inDive = pcall(diveFn)
+			if ok and inDive == true then
+				return false
+			end
+		end
+		local nextId = readWorkspaceNextPlaceId()
+		if isWaveDefenseRunPlaceId(nextId) then
+			return false
+		end
+		if idStr(game.PlaceId) == WD_HUB_PLACE then
+			return true
+		end
+		if idStr(game.GameId) == '8460001097' then
+			return true
+		end
+		return false
+	end
+	getgenv().SB2IsWaveDefenseHubLobby = isWaveDefenseHubLobby
 	local wdMode = workspace:GetAttribute('WaveDefenseMode')
 	local nextPlace = readWorkspaceNextPlaceId()
 	getgenv().SB2WaveDefensePlace = idStr(game.PlaceId) == '121252145396212'
@@ -1288,13 +1334,13 @@ local ok, err = pcall(function()
 		end
 		getgenv().SB2SetGameplayPausedUi = setGameplayPausedUi
 		getgenv().SB2HideGameplayPausedUi = hideGameplayPausedUi
-		if getgenv().SB2HideGameplayPaused ~= false then
+		if getgenv().SB2HideGameplayPaused == true then
 			hideGameplayPausedUi()
 			if not getgenv().SB2GameplayPausedUiWatch then
 				getgenv().SB2GameplayPausedUiWatch = true
 				task.spawn(function()
 					while getgenv()[CONFIG.GenvKey] and getgenv().SB2GameplayPausedUiWatch do
-						if getgenv().SB2HideGameplayPaused ~= false then
+						if getgenv().SB2HideGameplayPaused == true then
 							hideGameplayPausedUi()
 						end
 						task.wait(15)
@@ -1466,12 +1512,12 @@ local ok, err = pcall(function()
 			local ok, exists = pcall(isfile, ANTIAFK_PATH)
 			if ok and exists then
 				local okRead, body = pcall(readfile, ANTIAFK_PATH)
-				if okRead and tostring(body) == 'false' then
-					return false
+				if okRead and tostring(body):lower():gsub('%s+', '') == 'true' then
+					return true
 				end
 			end
 		end
-		return true
+		return false
 	end
 
 	local function writeAntiafkFile(on)
@@ -1602,12 +1648,12 @@ local ok, err = pcall(function()
 				local ok, exists = pcall(isfile, PATH)
 				if ok and exists then
 					local okRead, body = pcall(readfile, PATH)
-					if okRead and tostring(body) == 'false' then
-						return false
+					if okRead and tostring(body):lower():gsub('%s+', '') == 'true' then
+						return true
 					end
 				end
 			end
-			return true
+			return false
 		end
 
 		local function writeFile(on)
@@ -2229,7 +2275,7 @@ local ok, err = pcall(function()
 
 		getgenv().SB2StartFarmFps = startFarmFps
 		getgenv().SB2StopFarmFps = stopFarmFps
-		if getgenv().SB2FarmFpsOn ~= false then
+		if getgenv().SB2FarmFpsOn == true then
 			startFarmFps()
 		end
 
@@ -2601,19 +2647,6 @@ local ok, err = pcall(function()
 			return
 		end
 		cf = uprightWorldCFrame(cf)
-		-- Never pin into the void (boss WP saved under the map → 0 damage AA).
-		if cf.Position.Y < -20 then
-			-- #region agent log
-			if type(getgenv().SB2DbgFling) == 'function' then
-				pcall(getgenv().SB2DbgFling, 'A', 'pinTeleportCFrame', 'pin_void_reject', {
-					y = cf.Position.Y,
-					x = cf.Position.X,
-					z = cf.Position.Z,
-				})
-			end
-			-- #endregion
-			return
-		end
 		local model = getMyCharacterModel() or LocalPlayer.Character
 		if not model then
 			return
@@ -2720,9 +2753,6 @@ local ok, err = pcall(function()
 			return
 		end
 		cf = uprightWorldCFrame(cf)
-		if cf.Position.Y < -20 then
-			return
-		end
 		local model = getMyCharacterModel() or LocalPlayer.Character
 		local hrp = model and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
 		if not hrp or not hrp:IsA('BasePart') then
@@ -3579,12 +3609,16 @@ local ok, err = pcall(function()
 		local rawNotify = Library.Notify
 		if type(rawNotify) == 'function' then
 			Library.Notify = function(self, text, duration, force)
-				if type(Library.IsNotifyEnabled) == 'function' and Library:IsNotifyEnabled() ~= true then
-					return
-				end
 				local now = os.clock()
 				local dur = tonumber(duration) or 5
 				local important = force == true or dur >= 8
+				if
+					not important
+					and type(Library.IsNotifyEnabled) == 'function'
+					and Library:IsNotifyEnabled() ~= true
+				then
+					return
+				end
 				local function fire()
 					local ok, err = pcall(showBigToast, text, duration)
 					if not ok then
@@ -4775,6 +4809,11 @@ local ok, err = pcall(function()
 				getgenv().SB2UiKeeperQuietUntil = os.clock() + 25
 				getgenv().SB2MenuWantOpen = true
 				getgenv().SB2UiOrphanFails = 0
+				task.defer(function()
+					if type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
+						pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'place-hop')
+					end
+				end)
 				-- #region agent log
 				pcall(function()
 					local payload = game:GetService('HttpService'):JSONEncode({
@@ -5788,6 +5827,66 @@ local ok, err = pcall(function()
 	end
 
 	local blitzWeaponsRunning = false
+	-- Names already owned when recording finished. Blitz only equips weapons
+	-- that show up after that snapshot.
+	local blitzKnown = {
+		file = 'PlayerTools/blitz_known.json',
+		names = nil,
+		ready = false,
+	}
+
+	function blitzKnown.load()
+		if blitzKnown.names then
+			return blitzKnown.names
+		end
+		blitzKnown.names = {}
+		if type(readfile) ~= 'function' or type(isfile) ~= 'function' then
+			return blitzKnown.names
+		end
+		local okExists, exists = pcall(isfile, blitzKnown.file)
+		if not (okExists and exists) then
+			return blitzKnown.names
+		end
+		local okRead, body = pcall(readfile, blitzKnown.file)
+		if not (okRead and type(body) == 'string' and body ~= '') then
+			blitzKnown.ready = true
+			return blitzKnown.names
+		end
+		local okDec, data = pcall(function()
+			return game:GetService('HttpService'):JSONDecode(body)
+		end)
+		if okDec and type(data) == 'table' then
+			for name, on in pairs(data) do
+				if on and type(name) == 'string' then
+					blitzKnown.names[name] = true
+				end
+			end
+		end
+		blitzKnown.ready = true
+		return blitzKnown.names
+	end
+
+	function blitzKnown.save()
+		if type(writefile) ~= 'function' then
+			return false
+		end
+		local okEnc, body = pcall(function()
+			return game:GetService('HttpService'):JSONEncode(blitzKnown.names or {})
+		end)
+		if not okEnc then
+			return false
+		end
+		return pcall(writefile, blitzKnown.file, body)
+	end
+
+	function blitzKnown.mark(name)
+		if type(name) ~= 'string' or name == '' then
+			return
+		end
+		blitzKnown.load()
+		blitzKnown.names[name] = true
+		blitzKnown.save()
+	end
 
 	local rememberMeasuredTool = function(weaponName, tool)
 		local catalog = loadWeaponLengthCatalog()
@@ -5834,18 +5933,46 @@ local ok, err = pcall(function()
 		return lower == 'fist' or lower == 'unarmed'
 	end
 
+	function blitzKnown.snapshot()
+		blitzKnown.load()
+		if blitzKnown.ready then
+			return 0
+		end
+		local profile = myProfileFolder()
+		local inv = profile and profile:FindFirstChild('Inventory')
+		local database = game:GetService('ReplicatedStorage'):FindFirstChild('Database')
+		local itemsDb = database and database:FindFirstChild('Items')
+		if not inv or not itemsDb then
+			return 0
+		end
+		local added = 0
+		for _, item in ipairs(inv:GetChildren()) do
+			if item:IsA('ValueBase') and not blitzKnown.names[item.Name] and not blitzSkipWeaponName(item.Name) then
+				local entry = itemsDb:FindFirstChild(item.Name)
+				local typ = entry and entry:FindFirstChild('Type')
+				if typ and typ.Value == 'Weapon' then
+					blitzKnown.names[item.Name] = true
+					added = added + 1
+				end
+			end
+		end
+		blitzKnown.ready = true
+		blitzKnown.save()
+		return added
+	end
+
 	local unrecordedInventoryWeapons = function()
 		local profile = myProfileFolder()
 		local inv = profile and profile:FindFirstChild('Inventory')
 		local database = game:GetService('ReplicatedStorage'):FindFirstChild('Database')
 		local itemsDb = database and database:FindFirstChild('Items')
-		local catalog = loadWeaponLengthCatalog()
+		local known = blitzKnown.load()
 		local picked = {}
 		if not inv or not itemsDb then
 			return {}
 		end
 		for _, item in ipairs(inv:GetChildren()) do
-			if item:IsA('ValueBase') and not picked[item.Name] and catalog[item.Name] == nil then
+			if item:IsA('ValueBase') and not picked[item.Name] and not known[item.Name] then
 				if blitzSkipWeaponName(item.Name) then
 					continue
 				end
@@ -6303,7 +6430,9 @@ local ok, err = pcall(function()
 
 	local showPlayerStatsNotify = function()
 		local name = getSelectedProfileName()
+			or (Players.LocalPlayer and Players.LocalPlayer.Name)
 		local player = getSelectedPlayer()
+			or Players.LocalPlayer
 		-- #region agent log
 		pcall(function()
 			local payload = game:GetService('HttpService'):JSONEncode({
@@ -6751,8 +6880,12 @@ local ok, err = pcall(function()
 			end
 			getgenv().SB2RecordWeaponLengthsWanted = false
 			recordLoopGen = recordLoopGen + 1
+			local stored = blitzKnown.snapshot()
 			local ok, total = pcall(catalogCount)
 			setRecordStatus(ok and ('Recorded: ' .. tostring(total) .. ' weapons') or 'Recorded: 0 weapons')
+			if stored > 0 then
+				Library:Notify(('Stored %d current weapons. Blitz will only equip new ones.'):format(stored))
+			end
 			return
 		end
 		getgenv().SB2RecordWeaponLengthsWanted = true
@@ -6788,9 +6921,14 @@ local ok, err = pcall(function()
 			return
 		end
 		task.spawn(function()
+			local stored = blitzKnown.snapshot()
 			local list = unrecordedInventoryWeapons()
 			if #list == 0 then
-				Library:Notify('Closet already measured. Nothing new to try on.')
+				if stored > 0 then
+					Library:Notify(('Stored %d current weapons. Blitz will only equip new ones.'):format(stored))
+				else
+					Library:Notify('No new weapons.')
+				end
 				if Toggles.BlitzWeapons then
 					Toggles.BlitzWeapons:SetValue(false)
 				end
@@ -6812,14 +6950,14 @@ local ok, err = pcall(function()
 				if blitzStatus then
 					blitzStatus.Text = ('Blitz %d/%d · %s'):format(i, #list, item.Name)
 				end
-				if loadWeaponLengthCatalog()[item.Name] == nil then
-					local fired = equipMyWeapon(item)
-					local tool = fired and waitForMyWeaponTool(item.Name, 1.6) or nil
-					if tool and rememberMeasuredTool(item.Name, tool) then
-						caught = caught + 1
-					else
-						missed = missed + 1
-					end
+				local fired = equipMyWeapon(item)
+				local tool = fired and waitForMyWeaponTool(item.Name, 1.6) or nil
+				if tool then
+					rememberMeasuredTool(item.Name, tool)
+					blitzKnown.mark(item.Name)
+					caught = caught + 1
+				else
+					missed = missed + 1
 				end
 			end
 			blitzWeaponsRunning = false
@@ -6834,6 +6972,9 @@ local ok, err = pcall(function()
 				blitzStatus.Text = ('Blitz: caught %d, missed %d'):format(caught, missed)
 			end
 		end)
+	end)
+	task.defer(function()
+		pcall(blitzKnown.snapshot)
 	end)
 
 	end
@@ -11465,6 +11606,66 @@ local ok, err = pcall(function()
 			end
 		end)
 
+		pcall(function()
+			local prevSwing = getgenv().SB2AutoSwingConn
+			if prevSwing then
+				prevSwing:Disconnect()
+				getgenv().SB2AutoSwingConn = nil
+			end
+			local actions = getgenv().SB2RequiredServices and getgenv().SB2RequiredServices.Actions
+			if actions and type(actions.StopSwing) == 'function' then
+				actions.StopSwing()
+			end
+		end)
+
+		CombatBox:AddToggle('AutoSwing', {
+			Text = 'Auto swing',
+			Default = false,
+			Tooltip = 'Holds swing the whole time it is on, even with no mobs nearby.',
+		}):OnChanged(function(enabled)
+			local prev = getgenv().SB2AutoSwingConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+				getgenv().SB2AutoSwingConn = nil
+			end
+			local function combatActions()
+				local svc = getgenv().SB2RequiredServices
+				local actions = svc and svc.Actions
+				if type(actions) == 'table' then
+					return actions
+				end
+				return nil
+			end
+			if enabled ~= true then
+				local actions = combatActions()
+				if actions and type(actions.StopSwing) == 'function' then
+					pcall(actions.StopSwing)
+				end
+				return
+			end
+			local acc = 0
+			getgenv().SB2AutoSwingConn = game:GetService('RunService').Heartbeat:Connect(function(dt)
+				if not isToggleOn('AutoSwing') then
+					return
+				end
+				acc = acc + (tonumber(dt) or 0)
+				if acc < 0.25 then
+					return
+				end
+				acc = 0
+				if type(isLocalAlive) == 'function' and not isLocalAlive() then
+					return
+				end
+				local actions = combatActions()
+				if actions and type(actions.StartSwing) == 'function' then
+					-- StartSwing holds until StopSwing. Calling it again is a no-op while that loop is running.
+					task.spawn(actions.StartSwing)
+				end
+			end)
+		end)
+
 		CombatBox:AddToggle('AutoAttack', {
 			Text = 'Killaura',
 			Tooltip = 'DealDamage/Attack nearby (and streamed) mobs. Pair with Auto skill for UseSkill + skill-tagged hits.',
@@ -11683,6 +11884,17 @@ local ok, err = pcall(function()
 				local mobList = {}
 				for _, mob in mobsRoot:GetChildren() do
 					if not isKillauraTargetMob(mob) then
+						continue
+					end
+					if waveKillMob
+						and mob ~= waveKillMob
+						and isPhantomMob(waveKillMob)
+						and isPhantomMob(mob)
+						and mob:FindFirstChild('Entity')
+						and mob.Entity:FindFirstChild('Immortal')
+						and mob.Entity.Immortal:IsA('BoolValue')
+						and mob.Entity.Immortal.Value == true
+					then
 						continue
 					end
 					local root = getMobRoot(mob)
@@ -13103,6 +13315,12 @@ local ok, err = pcall(function()
 			local lavaHoverY = getgenv().SB2LavaHoverY
 			if typeof(lavaHoverY) == 'number' then
 				dest = Vector3.new(dest.X, math.max(dest.Y, lavaHoverY), dest.Z)
+			end
+			if typeof(getgenv().SB2DarknerOrbXZ) == 'Vector3' then
+				dest = Vector3.new(getgenv().SB2DarknerOrbXZ.X, dest.Y, getgenv().SB2DarknerOrbXZ.Z)
+			end
+			if typeof(getgenv().SB2WendigoHold) == 'Vector3' then
+				dest = getgenv().SB2WendigoHold
 			end
 			-- Reject absurd blinks (boss respawn / void) that explode physics.
 			local fromPos = hrp.Position
@@ -17601,8 +17819,61 @@ local ok, err = pcall(function()
 			return n
 		end
 
+		local WD_HUB_LOBBY_OFF = {
+			AutoAttack = true,
+			AutoSkill = true,
+			CombatAnchor = true,
+			DiveFarm = true,
+			SupportSkill = true,
+			AutoSwing = true,
+			BossWaypointRoute = true,
+		}
+
+		local function applyWaveDefenseHubLobbyQuiet(reason)
+			local isLobby = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+				and getgenv().SB2IsWaveDefenseHubLobby()
+			if not isLobby then
+				getgenv().SB2WdHubLobbyQuiet = false
+				return false
+			end
+			getgenv().SB2WdHubLobbyQuiet = true
+			getgenv().SB2ForceResumeWanted = false
+			getgenv().SB2ResumeAssertUntil = 0
+			getgenv().SB2ResumeGuardUntil = 0
+			getgenv().SB2ResumeAfterConfig = nil
+			getgenv().SB2BossRouteWanted = false
+			getgenv().SB2DiveFarmOn = false
+			for name in pairs(WD_HUB_LOBBY_OFF) do
+				pcall(function()
+					local toggle = Toggles[name]
+					if type(toggle) == 'table' and type(toggle.SetValue) == 'function' and toggle.Value == true then
+						toggle:SetValue(false)
+					end
+				end)
+			end
+			setCombatTrio(false)
+			pcall(function()
+				if type(getgenv().SB2SyncDiveFarmFromToggle) == 'function' then
+					getgenv().SB2SyncDiveFarmFromToggle()
+				end
+			end)
+			if reason and reason ~= 'poll' then
+				pcall(function()
+					Library:Notify('Wave Defense lobby — combat/farm options off', 4)
+				end)
+			end
+			return true
+		end
+		getgenv().SB2ApplyWaveDefenseHubLobbyQuiet = applyWaveDefenseHubLobbyQuiet
+
 		local function setCombatTrio(enabled)
 			enabled = enabled == true
+			if enabled
+				and type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+				and getgenv().SB2IsWaveDefenseHubLobby()
+			then
+				enabled = false
+			end
 			local diving = isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true
 			task.spawn(function()
 				for _, name in ipairs(COMBAT_TRIO) do
@@ -17632,7 +17903,6 @@ local ok, err = pcall(function()
 							-- Yield between flips so a deferred false cannot win the race.
 							if toggle.Value == enabled then
 								toggle:SetValue(not enabled)
-								task.wait()
 							end
 							toggle:SetValue(enabled)
 						end)
@@ -17688,12 +17958,50 @@ local ok, err = pcall(function()
 		end
 
 		local function armCombatTrioIfSolo()
+			if type(getgenv().SB2IsWaveDefenseHubLobby) == 'function' and getgenv().SB2IsWaveDefenseHubLobby() then
+				return false
+			end
 			if otherPlayersPresent() then
 				return false
 			end
 			setCombatTrio(true)
 			return true
 		end
+
+		task.spawn(function()
+			local lastLobby = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+				and getgenv().SB2IsWaveDefenseHubLobby()
+			if lastLobby then
+				task.defer(function()
+					applyWaveDefenseHubLobbyQuiet('boot')
+				end)
+			end
+			while getgenv()[CONFIG.GenvKey] do
+				task.wait(0.45)
+				local now = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+					and getgenv().SB2IsWaveDefenseHubLobby()
+				if now and not lastLobby then
+					applyWaveDefenseHubLobbyQuiet('enter-lobby')
+				end
+				lastLobby = now
+			end
+		end)
+		workspace:GetAttributeChangedSignal('NextPlaceId'):Connect(function()
+			task.defer(function()
+				if type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
+					pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'next-place')
+				end
+			end)
+		end)
+		pcall(function()
+			workspace:GetAttributeChangedSignal('WaveDefenseMode'):Connect(function()
+				task.defer(function()
+					if type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
+						pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'wd-mode')
+					end
+				end)
+			end)
+		end)
 
 		local function listSoloWaypoints()
 			local names = { WP_NONE }
@@ -17817,19 +18125,6 @@ local ok, err = pcall(function()
 			if type(gate) == 'table' and gate.block == true then
 				return false, 'tp blocked'
 			end
-			-- Never TP into the void — every alt ended up dealing 0 damage out of range.
-			if typeof(cf) == 'CFrame' and cf.Position.Y < -20 then
-				-- #region agent log
-				if type(getgenv().SB2DbgFling) == 'function' then
-					pcall(getgenv().SB2DbgFling, 'A', 'applyCharacterCFrame', 'tp_void_reject', {
-						y = cf.Position.Y,
-						x = cf.Position.X,
-						z = cf.Position.Z,
-					})
-				end
-				-- #endregion
-				return false, 'void destination'
-			end
 			-- Zombie boss-route loops ignore the new toggle. Never CFrame onto boss pads
 			-- unless the route is actually wanted (or Resume is using that pad).
 			if getgenv().SB2BossRouteWanted ~= true and not isToggleOn('SoloCombatResume') then
@@ -17919,6 +18214,10 @@ local ok, err = pcall(function()
 		-- TP still requires no non-alt players, except the explicit "Resume now" button.
 		local function resumeSoloCombat(reason, force)
 			if getgenv().SB2AutoBlockHopping and game.PlaceId == 542351431 then
+				return
+			end
+			if type(getgenv().SB2IsWaveDefenseHubLobby) == 'function' and getgenv().SB2IsWaveDefenseHubLobby() then
+				setCombatTrio(false)
 				return
 			end
 			if not force and not isToggleOn('SoloCombatResume') then
@@ -18385,6 +18684,11 @@ local ok, err = pcall(function()
 
 		local function writeFreshFinderState(data)
 			data = type(data) == 'table' and data or { active = false }
+			-- A hop that already started keeps the old table. After you turn the
+			-- finder off, that table must not be written back as active.
+			if data.active == true and (tonumber(data.gen) or 0) < (tonumber(getgenv().SB2FreshFinderStoppedGen) or 0) then
+				return
+			end
 			getgenv().SB2FreshServerFinder = data
 			if type(writefile) == 'function' then
 				pcall(function()
@@ -18466,6 +18770,8 @@ local ok, err = pcall(function()
 
 		local function stopFreshServerFinder(msg)
 			freshFinderBusy = false
+			getgenv().SB2FreshFinderStoppedGen = (tonumber(getgenv().SB2FreshFinderStoppedGen) or 0) + 1
+			getgenv().SB2FreshFinderCancelGen = (tonumber(getgenv().SB2FreshFinderCancelGen) or 0) + 1
 			paintFreshFinder('Fresh finder: off')
 			syncFreshFinderToggle(false)
 			if type(getgenv().SB2StopFreshServerFinder) == 'function' then
@@ -18632,6 +18938,7 @@ local ok, err = pcall(function()
 			getgenv().SB2FreshFinderCancelGen = (getgenv().SB2FreshFinderCancelGen or 0) + 1
 			writeFreshFinderState({
 				active = true,
+				gen = tonumber(getgenv().SB2FreshFinderStoppedGen) or 0,
 				placeId = targetPlace,
 				placeName = targetName,
 				tried = { [tostring(game.JobId or '')] = true },
@@ -18688,15 +18995,12 @@ local ok, err = pcall(function()
 			return true
 		end
 
-		local freshFinderDefault = false
-		do
-			local st = readFreshFinderState()
-			freshFinderDefault = type(st) == 'table' and st.active == true
-		end
-		freshFinderLabel = SoloBox:AddLabel(freshFinderDefault and 'Fresh finder: on' or 'Fresh finder: off')
+		-- Profile owns this switch. The sidecar file used to be the default, so a
+		-- reload painted the toggle back on after a saved "off".
+		freshFinderLabel = SoloBox:AddLabel('Fresh finder: off')
 		SoloBox:AddToggle('FreshServerFinder', {
 			Text = 'Fresh server finder',
-			Default = freshFinderDefault,
+			Default = false,
 			Tooltip = 'Block & hop on this floor until the server is empty (you + alts only). Needs AutoBlock.iy.',
 		}):OnChanged(function(value)
 			if freshFinderSyncing then
@@ -18824,7 +19128,7 @@ local ok, err = pcall(function()
 					if wpName ~= WP_NONE then
 						local rec = findSoloWaypointRec(wpName)
 						-- Skip under-map WPs (e.g. limor saved at Y=-337) — they zero damage.
-						if rec and (tonumber(rec.y) or 0) >= -20 then
+						if rec then
 							for _, def in ipairs(BOSS_ROUTE_DEFS) do
 								if wpKeyHit(wpName, def.keys) and not found[def.order] then
 									found[def.order] = {
@@ -18835,15 +19139,6 @@ local ok, err = pcall(function()
 									break
 								end
 							end
-						elseif rec and (tonumber(rec.y) or 0) < -20 then
-							-- #region agent log
-							if type(getgenv().SB2DbgFling) == 'function' then
-								pcall(getgenv().SB2DbgFling, 'A', 'collectBossRouteStops', 'boss_wp_void_skip', {
-									name = wpName,
-									y = tonumber(rec.y),
-								})
-							end
-							-- #endregion
 						end
 					end
 				end
@@ -18904,17 +19199,6 @@ local ok, err = pcall(function()
 					return false, 'missing waypoint'
 				end
 				local wy = tonumber(wp.y) or 0
-				if wy < -20 then
-					-- #region agent log
-					if type(getgenv().SB2DbgFling) == 'function' then
-						pcall(getgenv().SB2DbgFling, 'A', 'teleportBossRouteWp', 'boss_tp_void_wp', {
-							name = wpName,
-							y = wy,
-						})
-					end
-					-- #endregion
-					return false, 'void waypoint — re-save ' .. tostring(wpName)
-				end
 				local setter = getgenv().SB2WaypointsSetSelected
 				if type(setter) == 'function' then
 					pcall(setter, wpName, true)
@@ -20326,7 +20610,7 @@ local ok, err = pcall(function()
 				AnimEnabled = false,
 				AnimPack = '(default)',
 				CustomEnabled = false,
-				HideOriginal = true,
+				HideOriginal = false,
 				DesignName = 'My Weapon',
 			}
 			local state = getgenv().SB2WeaponModState
@@ -23632,7 +23916,7 @@ local ok, err = pcall(function()
 			end)
 			ModelLibBox:AddToggle('WeaponModelHideOriginal', {
 				Text = 'Hide original meshes',
-				Default = state.HideOriginal ~= false,
+				Default = state.HideOriginal == true,
 			}):OnChanged(function(on)
 				state.HideOriginal = on == true
 				local d = getCustomDesign()
@@ -24036,6 +24320,56 @@ local ok, err = pcall(function()
 					applyAll()
 				end
 			end)
+		end
+
+		do
+			getgenv().SB2WeaponAuraPreviewApply = nil
+			getgenv().SB2WeaponAuraPreviewClear = nil
+			getgenv().SB2WeaponAuraPreviewBuild = nil
+			local function loadWeaponAuraPreviewModule()
+				local paths = {
+					'PlayerTools/WeaponAuraPreview.lua',
+					'WeaponAuraPreview.lua',
+				}
+				for _, p in ipairs(paths) do
+					if type(readfile) == 'function' and type(isfile) == 'function' and isfile(p) then
+						local okRead, src = pcall(readfile, p)
+						if okRead and type(src) == 'string' and src ~= '' then
+							if not string.find(src, 'weapon-aura-preview-v6', 1, true) then
+								warn('[WeaponAuraPreview] stale WeaponAuraPreview.lua (expected v6) path=', p)
+							end
+							local fn, err = (loadstring or load)(src, p)
+							if fn then
+								local okRun, result = pcall(fn)
+								if okRun and type(result) == 'function' then
+									return result
+								end
+							else
+								warn('[WeaponAuraPreview] compile failed: ', err)
+							end
+						end
+					end
+				end
+				return nil
+			end
+			local auraPreviewInit = loadWeaponAuraPreviewModule()
+			if auraPreviewInit then
+				local okAura, auraErr = pcall(auraPreviewInit, {
+					Library = Library,
+					Options = Options,
+					InvTab = InvTab,
+					NONE = '(none)',
+				})
+				if not okAura then
+					warn('[WeaponAuraPreview] init failed: ', auraErr)
+					Library:Notify('Weapon aura preview failed to load — see console', 6)
+				end
+			else
+				warn('[WeaponAuraPreview] WeaponAuraPreview.lua not found in executor workspace')
+				InvTab:AddRightGroupbox('Weapon aura preview'):AddLabel(
+					'Missing PlayerTools/WeaponAuraPreview.lua — copy from repo, then reload Ataraxia.'
+				)
+			end
 		end
 
 		-- Stations + remote upgrade (CardinalUI Upgrade remote / openUpgrade).
@@ -25238,6 +25572,57 @@ local ok, err = pcall(function()
 		task.defer(function()
 			refreshDismantleNameList('', true)
 		end)
+
+		do
+			getgenv().SB2RapidInventoryUseBuild = nil
+			getgenv().SB2RapidInventoryUseStop = nil
+			getgenv().SB2RapidInventoryUseStart = nil
+			getgenv().SB2RapidInventoryUseItem = nil
+			local function loadRapidInventoryUseModule()
+				local paths = {
+					'PlayerTools/RapidInventoryUse.lua',
+					'RapidInventoryUse.lua',
+				}
+				for _, p in ipairs(paths) do
+					if type(readfile) == 'function' and type(isfile) == 'function' and isfile(p) then
+						local okRead, src = pcall(readfile, p)
+						if okRead and type(src) == 'string' and src ~= '' then
+							if not string.find(src, 'rapid-inventory-use-v2-shadow-only', 1, true) then
+								warn('[RapidInventoryUse] stale RapidInventoryUse.lua (expected v2 shadow-only) path=', p)
+							end
+							local fn, err = (loadstring or load)(src, p)
+							if fn then
+								local okRun, result = pcall(fn)
+								if okRun and type(result) == 'function' then
+									return result
+								end
+							else
+								warn('[RapidInventoryUse] compile failed: ', err)
+							end
+						end
+					end
+				end
+				return nil
+			end
+			local rapidInit = loadRapidInventoryUseModule()
+			if rapidInit then
+				local okRapid, rapidErr = pcall(rapidInit, {
+					Library = Library,
+					Options = Options,
+					InvTab = InvTab,
+					getInventoryFolder = getInventoryFolder,
+				})
+				if not okRapid then
+					warn('[RapidInventoryUse] init failed: ', rapidErr)
+					Library:Notify('Rapid stackable use failed to load — see console', 6)
+				end
+			else
+				warn('[RapidInventoryUse] RapidInventoryUse.lua not found in executor workspace')
+				InvTab:AddRightGroupbox('Shadow Shard rapid use'):AddLabel(
+					'Missing PlayerTools/RapidInventoryUse.lua — copy from repo, then reload Ataraxia.'
+				)
+			end
+		end
 	end)()
 
 	-- ── Items: snapshot Database.Items so a patch only shows NEW names ──
@@ -26445,12 +26830,50 @@ local ok, err = pcall(function()
 			return abilities, proseTail
 		end
 
+		-- MatchBest / ScaleByLevel. The client tooltip uses Damage when that
+		-- stat exists, otherwise Defense. MatchBest is a percent of your highest
+		-- base copy of that stat. ScaleByLevel adds that much of the stat per
+		-- level. Those items keep a placeholder flat stat (usually 1), so the
+		-- per-level rate replaces it. The third return is the per-level amount.
+		local function wikiStatScale(folder)
+			local statsFolder = folder and folder:FindFirstChild('Stats')
+			if not statsFolder then
+				return nil, nil, nil
+			end
+			local statName
+			if statsFolder:FindFirstChild('Damage') then
+				statName = 'Damage'
+			elseif statsFolder:FindFirstChild('Defense') then
+				statName = 'Defense'
+			else
+				return nil, nil, nil
+			end
+			local match = folder:FindFirstChild('MatchBest')
+			if match and match:IsA('ValueBase') then
+				local pct = math.floor((tonumber(match.Value) or 0) * 100 + 0.5)
+				if pct > 0 then
+					return statName, pct .. '% of highest base ' .. statName, nil
+				end
+			end
+			local scale = folder:FindFirstChild('ScaleByLevel')
+			if scale and scale:IsA('ValueBase') then
+				local n = tonumber(scale.Value)
+				if n and n ~= 0 then
+					return statName, wikiCommaNumber(n) .. ' ' .. statName .. ' per level', n
+				end
+			end
+			return nil, nil, nil
+		end
+
 		local function dumpWikiMerchantItem(name, folder, kind, rarity, level, damage, crit, defense, buffs, merchant)
 			local critPct = wikiPctFromValue(crit)
-			local dmgText = damage and wikiCommaNumber(damage) or ''
-			local upgDmgText = damage and wikiCommaNumber(damage * 2) or ''
-			local defText = defense and wikiCommaNumber(defense) or ''
-			local upgDefText = defense and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
+			local scaleStat, scaleText, scalePer = wikiStatScale(folder)
+			local scaledDmg = scaleStat == 'Damage' and scaleText and (scalePer or not damage or damage <= 0) and scaleText or nil
+			local scaledDef = scaleStat == 'Defense' and scaleText and (scalePer or not defense or defense <= 0) and scaleText or nil
+			local dmgText = scaledDmg or (damage and damage > 0 and wikiCommaNumber(damage)) or ''
+			local upgDmgText = (not scaledDmg and damage and damage > 0) and wikiCommaNumber(damage * 2) or ''
+			local defText = scaledDef or (defense and defense > 0 and wikiCommaNumber(defense)) or ''
+			local upgDefText = (not scaledDef and defense and defense > 0) and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
 			local isArmorLike = kind == 'Armor' or kind == 'Shield'
 			local typeLabel = wikiMerchantInfoboxType(folder, kind)
 			local overviewKind = wikiMerchantOverviewKind(folder, kind)
@@ -26472,18 +26895,30 @@ local ok, err = pcall(function()
 				'|level=' .. (level and tostring(level) or ''),
 			}
 			if dmgText ~= '' then
-				lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
-				if upgDmgText ~= '' then
-					lines[#lines + 1] = 'Max: ' .. upgDmgText
+				if scalePer and scaledDmg then
+					lines[#lines + 1] = '|dmg=Damage based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
+				elseif scaledDmg then
+					lines[#lines + 1] = '|dmg=' .. dmgText
+				else
+					lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
+					if upgDmgText ~= '' then
+						lines[#lines + 1] = 'Max: ' .. upgDmgText
+					end
 				end
 			end
 			if critPct then
 				lines[#lines + 1] = '|crit=' .. tostring(critPct) .. '%'
 			end
 			if defText ~= '' then
-				lines[#lines + 1] = '|def=Clean: ' .. defText
-				if upgDefText ~= '' then
-					lines[#lines + 1] = 'Max: ' .. upgDefText
+				if scalePer and scaledDef then
+					lines[#lines + 1] = '|def=Defense based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
+				elseif scaledDef then
+					lines[#lines + 1] = '|def=' .. defText
+				else
+					lines[#lines + 1] = '|def=Clean: ' .. defText
+					if upgDefText ~= '' then
+						lines[#lines + 1] = 'Max: ' .. upgDefText
+					end
 				end
 			end
 			if #abilities == 0 then
@@ -26507,7 +26942,26 @@ local ok, err = pcall(function()
 				overview = overview .. (' %s,'):format(overviewKind)
 			end
 			overview = overview .. (' purchasable from the %s in [[Helmfirth]].'):format(shopLink)
-			if critPct then
+			if scaledDmg then
+				if scalePer then
+					if critPct then
+						overview = overview .. (' It has a %s%% critical chance and scales by %s Damage per level.'):format(
+							tostring(critPct),
+							wikiCommaNumber(scalePer)
+						)
+					else
+						overview = overview .. (' It scales by %s Damage per level.'):format(wikiCommaNumber(scalePer))
+					end
+					overview = overview .. (' When the player is at level {{CurrentMaxLevel}}, it deals {{DamageLvl|base=%s}} damage.'):format(tostring(scalePer))
+				elseif critPct then
+					overview = overview .. (' It has a %s%% critical chance and scales with %s.'):format(
+						tostring(critPct),
+						dmgText
+					)
+				else
+					overview = overview .. (' It scales with %s.'):format(dmgText)
+				end
+			elseif critPct then
 				overview = overview .. (' It has a %s%% critical chance'):format(tostring(critPct))
 				if dmgText ~= '' then
 					overview = overview .. (' and does %s damage.'):format(dmgText)
@@ -26517,7 +26971,16 @@ local ok, err = pcall(function()
 			elseif dmgText ~= '' then
 				overview = overview .. (' It does %s damage.'):format(dmgText)
 			end
-			if isArmorLike and defText ~= '' then
+			if scaledDef then
+				if scalePer then
+					overview = overview .. (' It scales by %s Defense per level. When the player is at level {{CurrentMaxLevel}}, it provides {{DamageLvl|base=%s}} defense.'):format(
+						wikiCommaNumber(scalePer),
+						tostring(scalePer)
+					)
+				else
+					overview = overview .. (' It scales with %s.'):format(defText)
+				end
+			elseif isArmorLike and defText ~= '' then
 				overview = overview .. (' At base, it provides the player with %s defenses'):format(defText)
 				if upgDefText ~= '' then
 					local maxUp = wikiMaxUpgradeLevel(rarity)
@@ -26607,6 +27070,7 @@ local ok, err = pcall(function()
 			local iconFile = name .. '.png'
 			local inGameFile = name .. ' in-game.png'
 			local lines = {
+				'{{ItemID}}',
 				'{{Item infobox',
 				'|name=' .. name,
 				'|image=<gallery>',
@@ -26652,6 +27116,7 @@ local ok, err = pcall(function()
 			local fileName = name .. '.png'
 			local levelText = level and tostring(level) or '_'
 			local lines = {
+				'{{ItemID}}',
 				'{{Item infobox',
 				'|name={{PAGENAME}}',
 				'|image=<gallery>',
@@ -26731,39 +27196,58 @@ local ok, err = pcall(function()
 			end
 
 			local critPct = wikiPctFromValue(crit)
-			local dmgText = damage and wikiCommaNumber(damage) or ''
-			local upgDmgText = damage and wikiCommaNumber(damage * 2) or ''
-			local defText = defense and wikiCommaNumber(defense) or ''
-			local upgDefText = defense and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
+			local scaleStat, scaleText, scalePer = wikiStatScale(folder)
+			local scaledDmg = scaleStat == 'Damage' and scaleText and (scalePer or not damage or damage <= 0) and scaleText or nil
+			local scaledDef = scaleStat == 'Defense' and scaleText and (scalePer or not defense or defense <= 0) and scaleText or nil
+			local dmgText = scaledDmg or (damage and damage > 0 and wikiCommaNumber(damage)) or ''
+			local upgDmgText = (not scaledDmg and damage and damage > 0) and wikiCommaNumber(damage * 2) or ''
+			local defText = scaledDef or (defense and defense > 0 and wikiCommaNumber(defense)) or ''
+			local upgDefText = (not scaledDef and defense and defense > 0) and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
 			local abilities, buffProse = wikiBuffAbilityLines(buffs)
 			local baseName = name
 			local iconFile = baseName .. '.png'
 			local inGameFile = baseName .. ' in-game.png'
 
 			local lines = {
+				'{{ItemID}}',
 				'{{Item infobox',
 				'|name=' .. baseName,
 				'|image=<gallery>',
 				iconFile .. ' | Icon',
 				inGameFile .. ' | In-game',
 				'</gallery>',
-				'|type=' .. typeLabel,
-				'|rarity=' .. rarity,
-				'|level=' .. (level and tostring(level) or ''),
 			}
+			if kind == 'Weapon' and (folder:FindFirstChild('Untradeable') or folder:FindFirstChild('Untradable')) then
+				lines[#lines + 1] = '|cost=Untradable'
+			end
+			lines[#lines + 1] = '|type=' .. typeLabel
+			lines[#lines + 1] = '|rarity=' .. rarity
+			lines[#lines + 1] = '|level=' .. (level and tostring(level) or '')
 			if dmgText ~= '' then
-				lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
-				if upgDmgText ~= '' then
-					lines[#lines + 1] = 'Max: ' .. upgDmgText
+				if scalePer and scaledDmg then
+					lines[#lines + 1] = '|dmg=Damage based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
+				elseif scaledDmg then
+					lines[#lines + 1] = '|dmg=' .. dmgText
+				else
+					lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
+					if upgDmgText ~= '' then
+						lines[#lines + 1] = 'Max: ' .. upgDmgText
+					end
 				end
 			end
 			if critPct then
 				lines[#lines + 1] = '|crit=' .. tostring(critPct) .. '%'
 			end
 			if defText ~= '' then
-				lines[#lines + 1] = '|def=Clean: ' .. defText
-				if upgDefText ~= '' then
-					lines[#lines + 1] = 'Max: ' .. upgDefText
+				if scalePer and scaledDef then
+					lines[#lines + 1] = '|def=Defense based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
+				elseif scaledDef then
+					lines[#lines + 1] = '|def=' .. defText
+				else
+					lines[#lines + 1] = '|def=Clean: ' .. defText
+					if upgDefText ~= '' then
+						lines[#lines + 1] = 'Max: ' .. upgDefText
+					end
 				end
 			end
 			lines[#lines + 1] = '|obtain=[[]]'
@@ -26786,7 +27270,16 @@ local ok, err = pcall(function()
 					overview = overview .. (' level %d'):format(level)
 				end
 				overview = overview .. (' %s, dropped by [[???]] in [[]].'):format(overviewWord)
-				if isArmorLike and defText ~= '' then
+				if scaledDef then
+					if scalePer then
+						overview = overview .. (' It scales by %s Defense per level. When the player is at level {{CurrentMaxLevel}}, it provides {{DamageLvl|base=%s}} defense.'):format(
+							wikiCommaNumber(scalePer),
+							tostring(scalePer)
+						)
+					else
+						overview = overview .. (' It scales with %s.'):format(defText)
+					end
+				elseif isArmorLike and defText ~= '' then
 					overview = overview .. (' At base, it provides the player with %s defenses'):format(defText)
 					if upgDefText ~= '' then
 						local maxUp = wikiMaxUpgradeLevel(rarity)
@@ -26797,6 +27290,25 @@ local ok, err = pcall(function()
 							)
 					else
 						overview = overview .. '.'
+					end
+				elseif scaledDmg then
+					if scalePer then
+						if critPct then
+							overview = overview .. (' It has a %s%% critical chance and scales by %s Damage per level.'):format(
+								tostring(critPct),
+								wikiCommaNumber(scalePer)
+							)
+						else
+							overview = overview .. (' It scales by %s Damage per level.'):format(wikiCommaNumber(scalePer))
+						end
+						overview = overview .. (' When the player is at level {{CurrentMaxLevel}}, it deals {{DamageLvl|base=%s}} damage.'):format(tostring(scalePer))
+					elseif critPct then
+						overview = overview .. (' It has a %s%% critical chance and scales with %s.'):format(
+							tostring(critPct),
+							dmgText
+						)
+					else
+						overview = overview .. (' It scales with %s.'):format(dmgText)
 					end
 				elseif critPct then
 					overview = overview .. (' It has a %s%% critical chance'):format(tostring(critPct))
@@ -28139,7 +28651,6 @@ local ok, err = pcall(function()
 			end
 		end)
 
-
 		-- Cosmetic tags wiki (loaded module — Luau 200-local limit)
 		local function loadTagWiki()
 			local paths = { 'PlayerTools/TagWiki.lua', 'TagWiki.lua' }
@@ -28810,10 +29321,8 @@ local ok, err = pcall(function()
 		Menu = Settings:AddLeftGroupbox('Script')
 		Settings.ScriptBox = Menu
 	end
-	if not Settings.ProfileBox and Library.Config and type(Library.Config.Build) == 'function' then
-		Settings.ProfileBox = Settings:AddRightGroupbox('Profiles')
-		pcall(Library.Config.Build, Settings.ProfileBox)
-	end
+	-- Profiles is built once by the library Settings tab. A second groupbox
+	-- overwrote the same option indexes and did not save.
 	if not Library.Toggles.ATA_Notifications and type(Library.AddNotifyToggle) == 'function' then
 		pcall(function()
 			Library:AddNotifyToggle(Menu)
@@ -28911,7 +29420,7 @@ local ok, err = pcall(function()
 
 	HomeBox:AddToggle('HideGameplayPaused', {
 		Text = 'Hide gameplay paused screen',
-		Default = getgenv().SB2HideGameplayPaused ~= false,
+		Default = getgenv().SB2HideGameplayPaused == true,
 		Tooltip = 'Hides Roblox streaming "Gameplay paused" overlay. Does not stop streaming itself — only the full-screen notice.',
 	}):OnChanged(function(value)
 		getgenv().SB2HideGameplayPaused = value == true
@@ -28928,7 +29437,7 @@ local ok, err = pcall(function()
 
 	HomeBox:AddToggle('FarmFps', {
 		Text = 'Farm FPS (potato graphics)',
-		Default = getgenv().SB2FarmFpsOn ~= false,
+		Default = getgenv().SB2FarmFpsOn == true,
 		Tooltip = 'Quality 1 + no global shadows + no bloom/blur. Skill clone janitor always runs separately. Turn off on the main if you want pretty graphics.',
 	}):OnChanged(function(value)
 		if value then
@@ -28974,12 +29483,12 @@ local ok, err = pcall(function()
 				local ok, exists = pcall(isfile, path)
 				if ok and exists then
 					local okRead, body = pcall(readfile, path)
-					if okRead and tostring(body) == 'false' then
-						return false
+					if okRead and tostring(body):lower():gsub('%s+', '') == 'true' then
+						return true
 					end
 				end
 			end
-			return true
+			return false
 		end
 		local function writeFile(on)
 			if type(makefolder) ~= 'function' or type(writefile) ~= 'function' then
@@ -29016,9 +29525,9 @@ local ok, err = pcall(function()
 		end
 	end)
 
-	local autoexecute = true
-	if isfile and isfile(AUTOEXEC_PATH) and readfile(AUTOEXEC_PATH) == 'false' then
-		autoexecute = false
+	local autoexecute = false
+	if isfile and isfile(AUTOEXEC_PATH) and tostring(readfile(AUTOEXEC_PATH)):lower():gsub('%s+', '') == 'true' then
+		autoexecute = true
 	end
 
 	Menu:AddToggle('Autoexecute', { Text = 'Autoexecute on teleport', Default = autoexecute, Tooltip = 'Must stay on so PlayerTools (and Anti-AFK) come back after an AFK kick to F1.' }):OnChanged(function(value)
@@ -29746,9 +30255,21 @@ local ok, err = pcall(function()
 			local okDecode, decoded = pcall(function()
 				return HttpServiceSM:JSONDecode(content)
 			end)
-			if not okDecode or type(decoded) ~= 'table' or type(decoded.objects) ~= 'table' then
+			if not okDecode or type(decoded) ~= 'table' then
 				return
 			end
+			if type(decoded.objects) ~= 'table' then
+				for idx, value in pairs(decoded) do
+					if type(idx) == 'string' and (value == true or value == false) and not PROFILE_SKIP[idx] then
+						lastProfileToggles[idx] = value == true
+						if idx == 'SoloCombatResume' then
+							lastSoloBlock.SoloCombatResume = value == true
+						elseif idx == 'AutoBlockJoin' then
+							lastSoloBlock.AutoBlockJoin = value == true
+						end
+					end
+				end
+			else
 			for _, obj in ipairs(decoded.objects) do
 				if type(obj) ~= 'table' then
 					continue
@@ -29776,29 +30297,21 @@ local ok, err = pcall(function()
 					end
 				end
 			end
-			-- Sidecars are written on every Resume / Auto block toggle — they win over
-			-- a stale autoload JSON until autosave catches up (and when Overwrite was skipped).
+			end
+			-- Sidecar fills a missing key only. An explicit profile false stays false.
 			local fileBlock = readAutoblockFileWanted()
-			if fileBlock ~= nil then
+			if lastProfileToggles.AutoBlockJoin == nil and fileBlock ~= nil then
 				lastSoloBlock.AutoBlockJoin = fileBlock
 				lastProfileToggles.AutoBlockJoin = fileBlock
 			elseif lastSoloBlock.AutoBlockJoin == nil and lastProfileToggles.AutoBlockJoin ~= nil then
 				lastSoloBlock.AutoBlockJoin = lastProfileToggles.AutoBlockJoin == true
 			end
 			local fileSolo = readSoloResumeFileWanted()
-			if fileSolo ~= nil then
+			if lastProfileToggles.SoloCombatResume == nil and fileSolo ~= nil then
 				lastSoloBlock.SoloCombatResume = fileSolo
 				lastProfileToggles.SoloCombatResume = fileSolo
 			elseif lastSoloBlock.SoloCombatResume == nil and lastProfileToggles.SoloCombatResume ~= nil then
 				lastSoloBlock.SoloCombatResume = lastProfileToggles.SoloCombatResume == true
-			elseif lastSoloBlock.SoloCombatResume == nil
-				and type(lastCombatOptions.SoloResumeWaypoint) == 'string'
-				and lastCombatOptions.SoloResumeWaypoint ~= ''
-				and lastCombatOptions.SoloResumeWaypoint ~= '(none)'
-			then
-				-- Saved waypoint with no sidecar yet — assume Resume should come back on.
-				lastSoloBlock.SoloCombatResume = true
-				writeSoloResumeFile(true)
 			end
 			if lastSoloBlock.SoloCombatResume == true then
 				writeSoloResumeFile(true)
@@ -29862,7 +30375,21 @@ local ok, err = pcall(function()
 				Library.Unloaded = false
 			end
 			getgenv().SB2ConfigLoading = true
+			local wdLobby = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+				and getgenv().SB2IsWaveDefenseHubLobby()
+			local wdLobbyOff = {
+				AutoAttack = true,
+				AutoSkill = true,
+				CombatAnchor = true,
+				DiveFarm = true,
+				SupportSkill = true,
+				AutoSwing = true,
+				BossWaypointRoute = true,
+			}
 			for idx, want in pairs(lastProfileToggles) do
+				if wdLobby and wdLobbyOff[idx] then
+					want = false
+				end
 				local toggle = Toggles[idx]
 				if type(toggle) ~= 'table' or type(toggle.SetValue) ~= 'function' then
 					continue
@@ -29884,26 +30411,29 @@ local ok, err = pcall(function()
 				pcall(ensureDropdownHasValue, Options[idx], value)
 			end
 			pcall(applyCombatPrefsFromSidecar)
+			if getgenv().SB2ResumeAfterConfig or lastSoloBlock.SoloCombatResume == true then
+				getgenv().SB2ResumeAfterConfig = nil
+				if wdLobby then
+					setCombatTrio(false)
+				elseif not otherPlayersPresent() then
+					setCombatTrio(true)
+				else
+					setCombatTrio(false)
+				end
+			end
+			if wdLobby and type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
+				pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'profile-ui')
+			end
 			task.delay(0.5, function()
 				getgenv().SB2ConfigLoading = false
 				pcall(applyCombatPrefsFromSidecar)
-				if getgenv().SB2ResumeAfterConfig or lastSoloBlock.SoloCombatResume == true then
-					getgenv().SB2ResumeAfterConfig = nil
+				if wdLobby and type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
+					pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'profile-ui-delay')
+				end
+				if lastSoloBlock.SoloCombatResume == true or isToggleOn('SoloCombatResume') then
 					if not otherPlayersPresent() then
 						setCombatTrio(true)
-					else
-						setCombatTrio(false)
 					end
-					-- Wait for Players list to populate — early empty list caused TP into crowded servers.
-					task.delay(1.25, function()
-						if lastSoloBlock.SoloCombatResume ~= true and not isToggleOn('SoloCombatResume') then
-							return
-						end
-						local resumeFn = getgenv().SB2ResumeSoloCombat
-						if type(resumeFn) == 'function' then
-							pcall(resumeFn, 'profile', true)
-						end
-					end)
 				end
 			end)
 			if reason then
@@ -29942,12 +30472,20 @@ local ok, err = pcall(function()
 				end
 			end)
 			pcall(function()
+				local applied = Library.Config and Library.Config.LastData
+				if type(applied) == 'table' and applied.SoloCombatResume ~= nil then
+					soloWanted = applied.SoloCombatResume == true
+					lastProfileToggles.SoloCombatResume = soloWanted
+					lastSoloBlock.SoloCombatResume = soloWanted
+				end
+				-- Saved profile false stays off. Sticky/sidecar only fill a missing key.
 				local wanted = soloWanted == true
-					or lastProfileToggles.SoloCombatResume == true
-					or lastSoloBlock.SoloCombatResume == true
-					or readSoloResumeFileWanted() == true
-					or getgenv().SB2StickyResumeWanted == true
-					or getgenv().SB2ForceResumeWanted == true
+				if lastProfileToggles.SoloCombatResume == false then
+					wanted = false
+					soloWanted = false
+					getgenv().SB2StickyResumeWanted = false
+					getgenv().SB2ForceResumeWanted = false
+				end
 				if wanted then
 					soloWanted = true
 					lastSoloBlock.SoloCombatResume = true
@@ -30022,11 +30560,10 @@ local ok, err = pcall(function()
 						local toggle = Toggles[name]
 						if want == true and type(toggle) == 'table' and type(toggle.SetValue) == 'function' then
 							pcall(function()
-								if toggle.Value == true then
-									toggle:SetValue(false)
-									task.wait()
-								end
-								toggle:SetValue(true)
+							if toggle.Value == true then
+								toggle:SetValue(false)
+							end
+							toggle:SetValue(true)
 							end)
 						end
 					end
@@ -30137,7 +30674,12 @@ local ok, err = pcall(function()
 							end)
 							getgenv().SB2ConfigLoading = false
 							writeSoloResumeFile(true)
-							if not otherPlayersPresent() then
+							if not otherPlayersPresent()
+								and not (
+									type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+									and getgenv().SB2IsWaveDefenseHubLobby()
+								)
+							then
 								setCombatTrio(true)
 							end
 						end
@@ -30256,10 +30798,17 @@ local ok, err = pcall(function()
 				end
 			end)
 			pcall(applySoloBlockFromProfile)
+			if type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
+				pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'refresh')
+			end
 			if lastSoloBlock.SoloCombatResume == true or getgenv().SB2StickyResumeWanted == true then
-				getgenv().SB2StickyResumeWanted = true
-				getgenv().SB2ForceResumeWanted = true
-				getgenv().SB2ResumeGuardUntil = os.clock() + 45
+				local wdLobby = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+					and getgenv().SB2IsWaveDefenseHubLobby()
+				if not wdLobby then
+					getgenv().SB2StickyResumeWanted = true
+					getgenv().SB2ForceResumeWanted = true
+					getgenv().SB2ResumeGuardUntil = os.clock() + 45
+				end
 				pcall(function()
 					local t = Toggles.SoloCombatResume
 					if type(t) == 'table' and type(t.SetValue) == 'function' then
@@ -30269,7 +30818,9 @@ local ok, err = pcall(function()
 						writeSoloResumeFile(true)
 					end
 				end)
-				if otherPlayersPresent() then
+				if wdLobby then
+					setCombatTrio(false)
+				elseif otherPlayersPresent() then
 					setCombatTrio(false)
 				else
 					setCombatTrio(true)
@@ -30746,11 +31297,15 @@ local ok, err = pcall(function()
 			getgenv().SB2ConfigLoading = true
 			rememberSoloBlockFromJSON(body)
 			scheduleSoloBlockApply()
+			local wdLobby = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+				and getgenv().SB2IsWaveDefenseHubLobby()
 			if lastSoloBlock.SoloCombatResume == true or lastProfileToggles.SoloCombatResume == true then
-				getgenv().SB2StickyResumeWanted = true
-				getgenv().SB2ForceResumeWanted = true
-				getgenv().SB2ResumeAssertUntil = os.clock() + 180
-				getgenv().SB2ResumeGuardUntil = getgenv().SB2ResumeAssertUntil
+				if not wdLobby then
+					getgenv().SB2StickyResumeWanted = true
+					getgenv().SB2ForceResumeWanted = true
+					getgenv().SB2ResumeAssertUntil = os.clock() + 180
+					getgenv().SB2ResumeGuardUntil = getgenv().SB2ResumeAssertUntil
+				end
 				pcall(function()
 					local t = Toggles.SoloCombatResume
 					if type(t) == 'table' and type(t.SetValue) == 'function' then
@@ -30760,20 +31315,27 @@ local ok, err = pcall(function()
 						writeSoloResumeFile(true)
 					end
 				end)
-				if type(getgenv().SB2AssertResumeOn) == 'function' then
+				if not wdLobby and type(getgenv().SB2AssertResumeOn) == 'function' then
 					pcall(getgenv().SB2AssertResumeOn, reason or 'autoload')
 				end
-				if otherPlayersPresent() then
+				if wdLobby then
+					setCombatTrio(false)
+				elseif otherPlayersPresent() then
 					setCombatTrio(false)
 				else
 					setCombatTrio(true)
 				end
-				task.delay(1.0, function()
-					local resumeFn = getgenv().SB2ResumeSoloCombat
-					if type(resumeFn) == 'function' then
-						pcall(resumeFn, reason or 'autoload', true)
-					end
-				end)
+				if not wdLobby then
+					task.delay(1.0, function()
+						local resumeFn = getgenv().SB2ResumeSoloCombat
+						if type(resumeFn) == 'function' then
+							pcall(resumeFn, reason or 'autoload', true)
+						end
+					end)
+				end
+			end
+			if wdLobby and type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
+				pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'autoload')
 			end
 			getgenv().SB2ConfigLoading = false
 			getgenv().SB2ConfigLoadingSince = 0
@@ -30995,8 +31557,29 @@ local ok, err = pcall(function()
 		end
 	end)
 	task.defer(function()
+		local profileHooked = false
+		local function applySavedProfile()
+			if not profileHooked and Library.Config and type(Library.Config.Hook) == 'function' then
+				profileHooked = true
+				pcall(Library.Config.Hook)
+			end
+			if Library.Config and type(Library.Config.LoadAutoload) == 'function' then
+				pcall(Library.Config.LoadAutoload)
+			end
+		end
+		applySavedProfile()
+		-- SaveManager's later pass can paint defaults over the profile. Apply again after it.
+		task.delay(3.5, applySavedProfile)
 		task.wait(2.5)
+		local freshToggle = Toggles and Toggles.FreshServerFinder
+		local freshOn = type(freshToggle) == 'table' and freshToggle.Value == true
 		local fsf = getgenv().SB2FreshServerFinder
+		if not freshOn then
+			if type(fsf) == 'table' and fsf.active == true and type(getgenv().SB2StopFreshServerFinder) == 'function' then
+				pcall(getgenv().SB2StopFreshServerFinder, 'Fresh finder stopped — profile is off')
+			end
+			return
+		end
 		if type(fsf) ~= 'table' or fsf.active ~= true then
 			return
 		end
@@ -31177,118 +31760,61 @@ end
 			return false
 		end
 		local ok, gear = pcall(require, modScript)
-		if not ok or type(gear) ~= 'table' or gear._SB2BlessPatch == true then
-			return ok == true
-		end
-		gear._SB2BlessPatch = true
-
-		local function ensureBlessContext()
-			-- Do NOT assign gear.ShrineModel here — BlessingGear.IsEnabled() is truthy when
-			-- ShrineModel is set, and Open() then returns before SetupModel / TrackRightItem.
-			local cam = workspace.CurrentCamera
-			if cam and (gear.Camera == nil or not gear.Camera.Parent) then
-				gear.Camera = cam
-			end
-		end
-
-		-- BlessingGear captures Profiles[player] once at require (u1). If profile loaded late,
-		-- TrackRightItem never wires reroll buttons (Connections stays 0).
-		local function rebindBlessingProfileUpvalue(fn)
-			if type(fn) ~= 'function' or type(debug.setupvalue) ~= 'function' then
-				return false
-			end
-			local LP = game:GetService('Players').LocalPlayer
-			local prof = RS:FindFirstChild('Profiles') and RS.Profiles:FindFirstChild(LP.Name)
-			if not prof then
-				return false
-			end
-			for i = 1, 16 do
-				local name = debug.getupvalue(fn, i)
-				if name == 'u1' then
-					debug.setupvalue(fn, i, prof)
-					return true
-				end
-			end
+		if not ok or type(gear) ~= 'table' then
 			return false
 		end
-
-		local function wrapBlessFn(name, rebindProfile)
-			local fn = gear[name]
-			if type(fn) ~= 'function' then
-				return
-			end
-			gear[name] = function(...)
-				if rebindProfile then
-					rebindBlessingProfileUpvalue(fn)
-				end
-				ensureBlessContext()
-				local okCall, result = pcall(fn, ...)
-				if not okCall then
-					local err = tostring(result)
-					if err:find('Vector3', 1, true) and err:find('nil', 1, true) then
-						notifyBlessErr(
-							'Blessing UI bug — select a weapon in inventory first, then open Bless Equipment again.'
-						)
-					else
-						notifyBlessErr('Blessing UI: ' .. err)
-					end
+		-- Older builds wrapped Open / AnimateOut in pcall. Those calls yield, so the
+		-- wrapper aborted the shrine menu and the button fell through to Upgrade UI.
+		if gear._SB2BlessPatch == true then
+			local function upvalueValue(fn, index)
+				if type(fn) ~= 'function' or type(debug.getupvalue) ~= 'function' then
 					return nil
 				end
-				return result
+				local a, b = debug.getupvalue(fn, index)
+				if a == nil and b == nil then
+					return nil
+				end
+				if type(a) == 'string' then
+					return b
+				end
+				return a
 			end
-		end
-
-		local function wrap(name)
-			wrapBlessFn(name, false)
-		end
-
-		wrapBlessFn('Open', true)
-		wrapBlessFn('TrackRightItem', true)
-		for _, name in ipairs({
-			'Float',
-			'UpdateModel',
-			'CacheOpenPositions',
-			'CreateSpinningModel',
-			'SetEffects',
-			'SetConfirmation',
-			'AnimateOut',
-			'UpdateLastRolled',
-		}) do
-			wrap(name)
-		end
-
-		local function fixBlessingEntryVisible(entry)
-			if not entry or not entry.Parent then
-				return
-			end
-			entry.Visible = true
-			local pad = entry:FindFirstChild('Padding')
-			if pad and pad:IsA('UIPadding') then
-				pad.PaddingTop = UDim.new(0, 0)
-			end
-		end
-
-		for _, pair in ipairs({ { 'UpdateCurrentBlessing', 'BlessingEntry' }, { 'UpdateRolledBlessing', 'RolledEntry' } }) do
-			local fname, entryKey = pair[1], pair[2]
-			local fn = gear[fname]
-			if type(fn) == 'function' then
-				gear[fname] = function(...)
-					rebindBlessingProfileUpvalue(fn)
-					ensureBlessContext()
-					local okCall, result = pcall(fn, ...)
-					fixBlessingEntryVisible(gear[entryKey])
-					if not okCall then
-						notifyBlessErr('Blessing UI: ' .. tostring(result))
-						return nil
+			local function recoverOriginal(fn)
+				local first = upvalueValue(fn, 1)
+				if first == true or first == false then
+					local orig = upvalueValue(fn, 3)
+					if type(orig) == 'function' then
+						return orig
 					end
-					task.defer(function()
-						fixBlessingEntryVisible(gear[entryKey])
-						fixBlessingGearUiVisible(gear)
-					end)
-					return result
+				end
+				local second = upvalueValue(fn, 2)
+				if type(first) == 'function' and type(second) == 'function' then
+					return second
+				end
+				return nil
+			end
+			for _, name in ipairs({
+				'Open',
+				'TrackRightItem',
+				'Float',
+				'UpdateModel',
+				'CacheOpenPositions',
+				'CreateSpinningModel',
+				'SetEffects',
+				'SetConfirmation',
+				'AnimateOut',
+				'UpdateLastRolled',
+				'UpdateCurrentBlessing',
+				'UpdateRolledBlessing',
+			}) do
+				local current = gear[name]
+				local orig = recoverOriginal(current)
+				if type(orig) == 'function' then
+					gear[name] = orig
 				end
 			end
 		end
+		gear._SB2BlessPatch = 'off'
 		return true
 	end
 
@@ -31605,8 +32131,12 @@ end
 		if rightId == nil or rightId == 0 or rightId == '' then
 			notifyBlessErr('Equip a weapon in your right slot first, then open Ancient Shrine again')
 		end
-		if type(gear.Close) == 'function' then
-			pcall(gear.Close)
+		if type(gear.Open) ~= 'function' then
+			return false, 'BlessingGear.Open missing'
+		end
+		-- Close and Open both yield. Do not pcall them, and do not swap in the upgrade UI.
+		if type(gear.Close) == 'function' and gear.ShrineModel ~= nil then
+			gear.Close()
 		end
 		gear.ShrineModel = nil
 		local pg = LP:FindFirstChild('PlayerGui')
@@ -31616,35 +32146,9 @@ end
 				blessGui.Enabled = true
 			end
 		end
-		if type(gear.Open) ~= 'function' then
-			return false, 'BlessingGear.Open missing'
-		end
-		local okOpen, errOpen = pcall(function()
-			gear.Open(shrine)
-		end)
-		if okOpen then
-			syncBlessingUiAfterOpen(gear)
-			task.defer(function()
-				local connN = type(gear.Connections) == 'table' and #gear.Connections or 0
-				if connN < 2 then
-					notifyBlessErr(
-						'Reroll not wired — close shrine, equip right-hand weapon, reopen Ancient Shrine'
-					)
-				elseif not gear.SpinningModel and not gear.BlessingEntry then
-					notifyBlessErr(
-						'Shrine opened but preview empty — equip right-hand weapon & stand in hub with character loaded'
-					)
-				end
-			end)
-			return true, 'blessings'
-		end
-		local okUp, howUp = tryUpgradeUi()
-		if okUp then
-			notifyBlessErr('Shrine UI failed — opened Upgrade UI. Pick weapon + crystals there.')
-			return true, howUp
-		end
-		notifyBlessErr(tostring(errOpen))
-		return false, tostring(errOpen)
+		gear.Open(shrine)
+		syncBlessingUiAfterOpen(gear)
+		return true, 'blessings'
 	end
 
 	getgenv().SB2OpenAncientShrine = openAncientShrineMenu
