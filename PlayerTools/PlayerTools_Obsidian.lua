@@ -607,6 +607,8 @@ local OWN_ALT_USERIDS = {
 	[11025682106] = true, -- SB2ButOnlyTrading
 	[285463210] = true, -- 62qx
 	[1099119770] = true, -- aormai
+	[292631317] = true, -- mesaryth
+	[23562654] = true, -- sweetpitchers
 }
 local function normalizeAltKey(raw)
 	-- Only for per-account profile filenames — whitelist itself is UserId-based.
@@ -11935,6 +11937,9 @@ local ok, err = pcall(function()
 				pcall(setAnchorPlayerNoclip, enabled == true)
 				return false
 			end
+			-- Stranger lock / combat-off loops call this with false every tick; zeroing velocity
+			-- when nothing was held froze jumps mid-air (fall stall + lost sideways speed).
+			local wasHeld = hrp.Anchored or typeof(getgenv().SB2AnchorLockCF) == 'CFrame'
 			pcall(function()
 				hrp.Anchored = false
 				if enabled == true then
@@ -11953,10 +11958,12 @@ local ok, err = pcall(function()
 			-- descendant scans were the Anchor lag (HelperMob does not reset on its own).
 			pcall(setAnchorPlayerNoclip, enabled == true)
 			if enabled ~= true then
-				pcall(function()
-					hrp.AssemblyLinearVelocity = Vector3.zero
-					hrp.AssemblyAngularVelocity = Vector3.zero
-				end)
+				if wasHeld then
+					pcall(function()
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						hrp.AssemblyAngularVelocity = Vector3.zero
+					end)
+				end
 				if getgenv().SB2TpPinActive == true then
 					getgenv().SB2TpPinGen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
 					getgenv().SB2TpPinActive = false
@@ -18685,6 +18692,9 @@ local ok, err = pcall(function()
 				pcall(function()
 					local toggle = Toggles[name]
 					if type(toggle) == 'table' and toggle.Value == true and type(toggle.SetValue) == 'function' then
+						if name == 'AutoFloorDodge' then
+							getgenv().SB2StrangerDodgeWasOn = true
+						end
 						toggle:SetValue(false)
 						anyToggle = true
 					end
@@ -19173,6 +19183,15 @@ local ok, err = pcall(function()
 							support:SetValue(true)
 						end
 					end)
+					if getgenv().SB2StrangerDodgeWasOn == true then
+						getgenv().SB2StrangerDodgeWasOn = nil
+						pcall(function()
+							local dodge = Toggles.AutoFloorDodge
+							if type(dodge) == 'table' and type(dodge.SetValue) == 'function' and dodge.Value ~= true then
+								dodge:SetValue(true)
+							end
+						end)
+					end
 				end
 				getgenv().SB2CombatAnchorOn = false
 				pcall(function()
@@ -19721,6 +19740,7 @@ local ok, err = pcall(function()
 					profile.SoloCombatResume = false
 				end
 				-- Resume owns the combat trio — turn them off with it.
+				getgenv().SB2StrangerDodgeWasOn = nil
 				setCombatTrio(false)
 				pcall(function()
 					local dodge = Toggles.AutoFloorDodge

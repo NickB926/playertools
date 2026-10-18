@@ -1,7 +1,7 @@
 --[[
 	Split from PlayerTools_Obsidian.lua (Luau 200-local register cap).
 ]]
-getgenv().SB2AutoFloorDodgeBuild = 'death-log-v2'
+getgenv().SB2AutoFloorDodgeBuild = 'boss-reach-v1'
 
 return function(env)
 	local CombatBox = env.CombatBox
@@ -251,9 +251,10 @@ return function(env)
 	local AEGANATOS_CLEARANCE = 3
 	local AEGANATOS_HEAD_ABOVE = 16
 	local WENDIGO_BEHIND = 150
-	-- Enough to clear floor smash; +400 blink+12s pin streamed the map out.
-	local BOB_LIFT_ABOVE = 232
-	local BOB_LIFT_STEP = 40
+	-- Fixed world Y. Relative +232 from revive height parked in the 20% tick band (~Y217).
+	-- +400 blink+12s pin streamed the map out; 300 stays under that.
+	local BOB_HOLD_Y = 300
+	local BOB_LIFT_STEP = 80
 	local BOB_HOLD_GRACE = 3
 	local VAELITH_MISSILE_SCAN_CAP = 1200
 	local VAELITH_MISSILE_CLEAR = 11
@@ -1811,12 +1812,89 @@ return function(env)
 
 	-- Air holds (lava, Bob, boss hover) park at arena center so killaura reaches the whole wave.
 	-- A sidestep pauses recentering briefly so the dodge is not undone the next tick.
+	-- If a named boss is outside melee reach (ledge / +120 hover), follow it instead.
 	local AIR_DODGE_HOLD = 1.5
 	local AIR_RECENTER_MIN = 4
+	local STRIKE_REACH = 78
+	local STRIKE_ABOVE = 8
 	local airDodgeUntil = 0
+	local strikeBossPos = nil
 
 	local function noteAirDodge(now)
 		airDodgeUntil = (now or os.clock()) + AIR_DODGE_HOLD
+	end
+
+	-- Normal jumps/falls must never be recentered (snapping mid-air = jitter + slow fall).
+	-- Only a body parked well above the floor, not falling, with no move input, counts.
+	local AIR_STUCK_MIN_HEIGHT = 12
+	local AIR_STUCK_MAX_VY = 3
+
+	local function airStuckHovering(hrp)
+		local hum = hrp.Parent and hrp.Parent:FindFirstChildOfClass('Humanoid')
+		if hum and hum.MoveDirection.Magnitude > 0.1 then
+			return false
+		end
+		if math.abs(hrp.AssemblyLinearVelocity.Y) > AIR_STUCK_MAX_VY then
+			return false
+		end
+		local gy = groundYAt(hrp)
+		if not gy then
+			return false
+		end
+		return hrp.Position.Y - gy - humanoidHip(hrp) - hrp.Size.Y * 0.5 >= AIR_STUCK_MIN_HEIGHT
+	end
+
+	local function mobStrikePos(mob)
+		if not mob or mobIsDead(mob) then
+			return nil
+		end
+		local part = mob:FindFirstChild('HumanoidRootPart')
+		if not (part and part:IsA('BasePart')) then
+			part = mob.PrimaryPart
+		end
+		if not (part and part:IsA('BasePart')) then
+			part = mob:FindFirstChildWhichIsA('BasePart')
+		end
+		if part and part:IsA('BasePart') then
+			return part.Position
+		end
+		return nil
+	end
+
+	local function refreshStrikeBossPos(hrp)
+		strikeBossPos = nil
+		getgenv().SB2StrikeBossPos = nil
+		if not hrp then
+			return nil
+		end
+		local tracked = getgenv().SB2WaveKillTargetTracked
+		if typeof(tracked) == 'Instance' then
+			local p = mobStrikePos(tracked)
+			if p then
+				strikeBossPos = p
+				getgenv().SB2StrikeBossPos = p
+				return p
+			end
+		end
+		local folder = workspace:FindFirstChild('Mobs')
+		if not folder then
+			return nil
+		end
+		local bestP, bestD = nil, nil
+		for _, mob in ipairs(folder:GetChildren()) do
+			if mobIsNamedWdBoss(mob) then
+				local p = mobStrikePos(mob)
+				if p then
+					local d = (p - hrp.Position).Magnitude
+					if not bestD or d < bestD then
+						bestP, bestD = p, d
+					end
+				end
+			end
+		end
+		strikeBossPos = bestP
+		getgenv().SB2StrikeBossPos = bestP
+		return bestP
 	end
 
 	local function airHoldXZ(hrp)
@@ -1828,6 +1906,14 @@ return function(env)
 			return here
 		end
 		if not inWdDodgeContext() then
+			return here
+		end
+		local strike = strikeBossPos
+		if typeof(strike) == 'Vector3' then
+			local flat = Vector3.new(strike.X, 0, strike.Z)
+			if (flat - here).Magnitude >= 6 then
+				return flat
+			end
 			return here
 		end
 		local center = waveDefenseRiftsCenterFlat()
@@ -1871,16 +1957,16 @@ return function(env)
 			writeHeldCF(hrp, Vector3.new(xz.X, holdY, xz.Z), nil, 0, true)
 			return
 		end
-		local step = fresh and (BOB_LIFT_STEP * 1.6) or BOB_LIFT_STEP
+		local step = fresh and (BOB_LIFT_STEP * 2) or BOB_LIFT_STEP
 		local targetY = math.min(holdY, hrp.Position.Y + step)
 		local dest = Vector3.new(xz.X, targetY, xz.Z)
 		local blinkFn = getgenv().SB2DiveBlinkTeleport
-		if fresh and dy > 72 and type(blinkFn) == 'function' then
-			local blinkY = math.min(holdY, hrp.Position.Y + 48)
+		-- First hop used to be +48, which landed in the Y216-221 20% ticks. Jump the band.
+		if fresh and dy > 48 and type(blinkFn) == 'function' then
 			pcall(function()
-				blinkFn(hrp, Vector3.new(dest.X, blinkY, dest.Z), Vector3.new(dest.X, blinkY, dest.Z))
+				blinkFn(hrp, Vector3.new(xz.X, holdY, xz.Z), Vector3.new(xz.X, holdY, xz.Z))
 			end)
-			dest = Vector3.new(xz.X, blinkY, xz.Z)
+			dest = Vector3.new(xz.X, holdY, xz.Z)
 		end
 		writeHeldCF(hrp, dest, nil, 0, true)
 		if type(getgenv().SB2BeginAnchorReplicate) == 'function' then
@@ -2143,6 +2229,7 @@ return function(env)
 			if not hrp or not hrp:IsA('BasePart') then
 				return
 			end
+			refreshStrikeBossPos(hrp)
 			local missileGoal = vaelithMissileDodgeGoal(hrp.Position)
 			local rubricatusNow = findRubricatusMob()
 			if rubricatusNow then
@@ -2219,7 +2306,7 @@ return function(env)
 				local freshBob = bobHoldY == nil
 				if freshBob then
 					bobAnchorY = hrp.Position.Y
-					bobHoldY = bobAnchorY + BOB_LIFT_ABOVE
+					bobHoldY = BOB_HOLD_Y
 					getgenv().SB2BobHoldY = bobHoldY
 				end
 				getgenv().SB2BobEscapeActive = true
@@ -2295,6 +2382,29 @@ return function(env)
 					return
 				end
 			end
+			if typeof(strikeBossPos) == 'Vector3' then
+				local destY = strikeBossPos.Y + STRIKE_ABOVE
+				if lavaNow then
+					local ly = lavaFightY or getgenv().SB2LavaFightY
+					if typeof(ly) == 'number' then
+						destY = ly
+					end
+				end
+				local dest = Vector3.new(strikeBossPos.X, destY, strikeBossPos.Z)
+				local dist = (hrp.Position - dest).Magnitude
+				if dist > STRIKE_REACH and nowPre - lastStep >= 0.12 then
+					lastStep = nowPre
+					local blinkFn = getgenv().SB2DiveBlinkTeleport
+					if dist > 48 and type(blinkFn) == 'function' then
+						pcall(function()
+							blinkFn(hrp, dest, dest)
+						end)
+					end
+					writeHeldCF(hrp, dest, strikeBossPos, 0, true, true)
+					getgenv().SB2DivePinPos = dest
+					return
+				end
+			end
 			if not lavaNow and not bossNow and not wendigoNow and getgenv().SB2DiveFarmOn == true and isToggleOn('DiveFarm') then
 				return
 			end
@@ -2313,6 +2423,9 @@ return function(env)
 					hoverGroundY = groundYAt(hrp) or (lavaStandY - 3)
 				end
 				local hoverY = hoverGroundY + clearance
+				if clearance == BOSS_CLEARANCE and typeof(strikeBossPos) == 'Vector3' then
+					hoverY = strikeBossPos.Y + STRIKE_ABOVE
+				end
 				if lavaNow and clearance == LAVA_CLEARANCE then
 					local freshLava = lavaFightY == nil
 					if lavaFightY == nil then
@@ -2380,7 +2493,7 @@ return function(env)
 			goal = resolveFloorDodgeGoal(hrp, circleY)
 			if not goal then
 				-- Left hovering after a lift ends: drift back over the room center so killaura reaches the ring.
-				if inWdDodgeContext() and humAirborne(hrp) and now - lastStep >= 0.25 then
+				if inWdDodgeContext() and humAirborne(hrp) and now - lastStep >= 0.25 and airStuckHovering(hrp) then
 					local xz = airHoldXZ(hrp)
 					local flatOff = Vector3.new(xz.X - hrp.Position.X, 0, xz.Z - hrp.Position.Z)
 					if flatOff.Magnitude >= AIR_RECENTER_MIN then
@@ -2409,7 +2522,7 @@ return function(env)
 	CombatBox:AddToggle('AutoFloorDodge', {
 		Text = 'Auto dodge floor circles',
 		Default = false,
-		Tooltip = 'WD rift hop, Bob lift (~+130 Y), Rubricatus pillars. Floor-is-lava: locks fight hover (Y173) every tick; circles only move XZ.',
+		Tooltip = 'WD rift hop, Bob lift (Y300), Rubricatus pillars. Chases a boss that walks onto a ledge out of melee range. Floor-is-lava: locks fight hover (Y173) every tick; circles only move XZ.',
 	}):OnChanged(function(value)
 		getgenv().SB2AutoFloorDodgeOn = value == true
 		local prev = getgenv().SB2AutoFloorDodgeConn

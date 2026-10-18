@@ -131,6 +131,8 @@ local OWN_ALT_USERIDS = {
 	[11025682106] = true, -- SB2ButOnlyTrading
 	[285463210] = true, -- 62qx
 	[1099119770] = true, -- aormai
+	[292631317] = true, -- mesaryth
+	[23562654] = true, -- sweetpitchers
 }
 local function isOwnAlt(plr)
 	if not plr then
