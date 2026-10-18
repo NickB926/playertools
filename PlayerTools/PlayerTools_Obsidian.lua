@@ -523,7 +523,7 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'autoskill-heal-v1'
+getgenv().SB2PlayerToolsLocalBuild = 'whitelist-self-v1'
 getgenv().SB2WaveKillTargetUILoaded = false
 getgenv().SB2BetweenPartyUILoaded = false
 pcall(function()
@@ -639,6 +639,10 @@ local function isOwnAlt(plr)
 	if not plr then
 		return false
 	end
+	local lp = game:GetService('Players').LocalPlayer
+	if lp and (plr == lp or tonumber(plr.UserId) == tonumber(lp.UserId)) then
+		return true
+	end
 	local uid = tonumber(plr.UserId)
 	if isOwnAltId(uid) then
 		return true
@@ -669,57 +673,168 @@ local function addOwnAltUserId(uid)
 end
 getgenv().SB2AddOwnAltUserId = addOwnAltUserId
 
+local PlayersService = game:GetService('Players')
+
 -- Local extras: PlayerTools/whitelist.txt (one username or UserId per line).
 -- Not shipped in updates, so friends can keep their own list.
+local pendingWhitelistNames = getgenv().SB2WhitelistPendingNames
+if type(pendingWhitelistNames) ~= 'table' then
+	pendingWhitelistNames = {}
+	getgenv().SB2WhitelistPendingNames = pendingWhitelistNames
+end
+
+local function matchPlayerByNameToken(token)
+	token = string.lower(tostring(token or ''))
+	if token == '' then
+		return nil
+	end
+	for _, plr in ipairs(PlayersService:GetPlayers()) do
+		if string.lower(tostring(plr.Name or '')) == token
+			or string.lower(tostring(plr.DisplayName or '')) == token
+		then
+			return plr
+		end
+	end
+	return nil
+end
+
+local function addWhitelistNameToken(token)
+	token = tostring(token or ''):gsub('^%s+', ''):gsub('%s+$', ''):gsub('^@', '')
+	if token == '' then
+		return false, 'empty'
+	end
+	local id = tonumber(token)
+	if id then
+		return addOwnAltUserId(id), 'id'
+	end
+	local inServer = matchPlayerByNameToken(token)
+	if inServer then
+		addOwnAltUserId(inServer.UserId)
+		return true, 'server'
+	end
+	local name = token:match('^([%w_]+)$')
+	if name and name ~= '' then
+		local ok, uid = pcall(function()
+			return PlayersService:GetUserIdFromNameAsync(name)
+		end)
+		if ok and tonumber(uid) then
+			addOwnAltUserId(uid)
+			return true, 'api'
+		end
+	end
+	pendingWhitelistNames[string.lower(token)] = true
+	return false, 'pending'
+end
+
 local function loadLocalWhitelistFile()
 	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+		warn('[PlayerTools] whitelist.txt skipped (no readfile)')
 		return
 	end
-	local src = nil
-	for _, path in ipairs({ 'PlayerTools/whitelist.txt', 'whitelist.txt' }) do
-		if isfile(path) then
+	local src, usedPath = nil, nil
+	local paths = { 'PlayerTools/whitelist.txt', 'whitelist.txt' }
+	if type(listfiles) == 'function' then
+		pcall(function()
+			for _, p in ipairs(listfiles('PlayerTools')) do
+				local n = tostring(p):gsub('\\', '/'):match('([^/]+)$')
+				if n and string.lower(n) == 'whitelist.txt' then
+					paths[#paths + 1] = p
+				end
+			end
+		end)
+	end
+	for _, path in ipairs(paths) do
+		local okExists, exists = pcall(isfile, path)
+		if okExists and exists then
 			local ok, body = pcall(readfile, path)
 			if ok and type(body) == 'string' and body ~= '' then
 				src = body
+				usedPath = path
 				break
 			end
 		end
 	end
 	if not src then
+		warn('[PlayerTools] no whitelist.txt (put it next to PlayerTools.lua as PlayerTools/whitelist.txt)')
 		return
 	end
-	local Players = game:GetService('Players')
+	if string.find(src, '\0', 1, true) then
+		src = src:gsub('\0', '')
+	end
+	if string.byte(src, 1) == 239 and string.byte(src, 2) == 187 and string.byte(src, 3) == 191 then
+		src = string.sub(src, 4)
+	end
+	local added, pending = 0, 0
 	for raw in string.gmatch(src, '[^\r\n]+') do
-		local line = (raw:gsub('^%s+', ''):gsub('%s+$', ''):gsub('#.*', ''))
+		local line = raw:gsub('^%s+', ''):gsub('%s+$', ''):gsub('#.*', '')
 		if line ~= '' then
-			local id = tonumber(line)
-			if not id then
-				local name = line:match('^@?([%w_]+)$')
-				if name and name ~= '' then
-					local ok, uid = pcall(function()
-						return Players:GetUserIdFromNameAsync(name)
-					end)
-					if ok then
-						id = tonumber(uid)
-					end
+			local function take(token)
+				local okAdd, how = addWhitelistNameToken(token)
+				if okAdd then
+					added += 1
+				elseif how == 'pending' then
+					pending += 1
 				end
 			end
-			addOwnAltUserId(id)
+			if line:find('[,;]') then
+				for token in string.gmatch(line, '[^,;]+') do
+					take(token)
+				end
+			elseif line:find('%s') then
+				take(line)
+				for token in string.gmatch(line, '%S+') do
+					take(token)
+				end
+			else
+				take(line)
+			end
 		end
 	end
+	warn(('[PlayerTools] whitelist %s added=%d pending=%d'):format(tostring(usedPath), added, pending))
 end
 pcall(loadLocalWhitelistFile)
+getgenv().SB2ReloadWhitelistFile = loadLocalWhitelistFile
 
-local PlayersService = game:GetService('Players')
-local function otherPlayersPresent()
+pcall(function()
+	if getgenv().SB2WhitelistPlayerAddedConn then
+		getgenv().SB2WhitelistPlayerAddedConn:Disconnect()
+	end
+	getgenv().SB2WhitelistPlayerAddedConn = PlayersService.PlayerAdded:Connect(function(plr)
+		local n = string.lower(tostring(plr.Name or ''))
+		local d = string.lower(tostring(plr.DisplayName or ''))
+		if pendingWhitelistNames[n] or pendingWhitelistNames[d] then
+			addOwnAltUserId(plr.UserId)
+			pendingWhitelistNames[n] = nil
+			pendingWhitelistNames[d] = nil
+		end
+	end)
 	for _, plr in ipairs(PlayersService:GetPlayers()) do
-		if plr ~= LocalPlayer and not isOwnAlt(plr) then
-			return true
+		local n = string.lower(tostring(plr.Name or ''))
+		local d = string.lower(tostring(plr.DisplayName or ''))
+		if pendingWhitelistNames[n] or pendingWhitelistNames[d] then
+			addOwnAltUserId(plr.UserId)
+			pendingWhitelistNames[n] = nil
+			pendingWhitelistNames[d] = nil
 		end
 	end
-	return false
+end)
+
+local function listStrangerPlayers()
+	local lp = PlayersService.LocalPlayer
+	local out = {}
+	for _, plr in ipairs(PlayersService:GetPlayers()) do
+		if plr ~= lp and not isOwnAlt(plr) then
+			out[#out + 1] = plr
+		end
+	end
+	return out
+end
+
+local function otherPlayersPresent()
+	return #listStrangerPlayers() > 0
 end
 getgenv().SB2OtherPlayersPresent = otherPlayersPresent
+getgenv().SB2ListStrangerPlayers = listStrangerPlayers
 -- Legacy name map kept empty for older plugins that still read SB2OwnAltNames.
 getgenv().SB2OwnAltNames = getgenv().SB2OwnAltNames or {}
 
@@ -19811,7 +19926,15 @@ local ok, err = pcall(function()
 			getgenv().SB2TpGate.block = false
 			if otherPlayersPresent() then
 				-- Don't arm combat while strangers are here — wait for empty.
-				Library:Notify('Resume on — combat stays off until only you/alts remain, then TP', 4)
+				local names = {}
+				local listFn = getgenv().SB2ListStrangerPlayers or listStrangerPlayers
+				pcall(function()
+					for _, plr in ipairs(listFn()) do
+						names[#names + 1] = plr.Name
+					end
+				end)
+				local who = #names > 0 and table.concat(names, ', ') or 'someone not on whitelist'
+				Library:Notify(('Resume on — waiting on: %s'):format(who), 8)
 				return
 			end
 			setCombatTrio(true)
@@ -19837,6 +19960,26 @@ local ok, err = pcall(function()
 				end
 			end
 		end
+
+		SoloBox:AddButton('Who is blocking Resume', function()
+			local names = {}
+			local listFn = getgenv().SB2ListStrangerPlayers
+			if type(listFn) == 'function' then
+				for _, plr in ipairs(listFn()) do
+					names[#names + 1] = ('%s (%d)'):format(plr.Name, plr.UserId)
+				end
+			end
+			if #names == 0 then
+				Library:Notify('Nobody blocking — only you/whitelist here', 5)
+			else
+				Library:Notify('Blocking Resume: ' .. table.concat(names, ', '), 8)
+			end
+		end)
+		SoloBox:AddButton('Reload whitelist.txt', function()
+			local fn = getgenv().SB2ReloadWhitelistFile or loadLocalWhitelistFile
+			pcall(fn)
+			Library:Notify('Reloaded PlayerTools/whitelist.txt — check F9 for added= / pending=', 6)
+		end)
 
 		local function assertResumeOn(reason)
 			-- Restore Resume when sticky/force says ON. Soft during load; also for a
@@ -25671,8 +25814,8 @@ local ok, err = pcall(function()
 					if type(readfile) == 'function' and type(isfile) == 'function' and isfile(p) then
 						local okRead, src = pcall(readfile, p)
 						if okRead and type(src) == 'string' and src ~= '' then
-							if not string.find(src, 'weapon-aura-preview-v6', 1, true) then
-								warn('[WeaponAuraPreview] stale WeaponAuraPreview.lua (expected v6) path=', p)
+							if not string.find(src, 'weapon-aura-preview-v7', 1, true) then
+								warn('[WeaponAuraPreview] stale WeaponAuraPreview.lua (expected v7) path=', p)
 							end
 							local fn, err = (loadstring or load)(src, p)
 							if fn then
