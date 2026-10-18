@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.34",
+    "version":  "1.0.35",
     "message":  "Wave Defense panel loads WD highlight module at UI build (wd-panel-fix-v1)",
     "files":  [
                   "PlayerTools/launch.lua",
