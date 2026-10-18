@@ -160,6 +160,56 @@ for id, v in pairs(OWN_ALT_USERIDS) do
 	getgenv().SB2OwnAltUserIds[id] = v
 end
 
+local function addOwnAltUserId(uid)
+	uid = tonumber(uid)
+	if not uid then
+		return false
+	end
+	OWN_ALT_USERIDS[uid] = true
+	getgenv().SB2OwnAltUserIds[uid] = true
+	return true
+end
+getgenv().SB2AddOwnAltUserId = addOwnAltUserId
+
+local function loadLocalWhitelistFile()
+	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+		return
+	end
+	local src = nil
+	for _, path in ipairs({ 'PlayerTools/whitelist.txt', 'whitelist.txt' }) do
+		if isfile(path) then
+			local ok, body = pcall(readfile, path)
+			if ok and type(body) == 'string' and body ~= '' then
+				src = body
+				break
+			end
+		end
+	end
+	if not src then
+		return
+	end
+	local Players = game:GetService('Players')
+	for raw in string.gmatch(src, '[^\r\n]+') do
+		local line = (raw:gsub('^%s+', ''):gsub('%s+$', ''):gsub('#.*', ''))
+		if line ~= '' then
+			local id = tonumber(line)
+			if not id then
+				local name = line:match('^@?([%w_]+)$')
+				if name and name ~= '' then
+					local ok, uid = pcall(function()
+						return Players:GetUserIdFromNameAsync(name)
+					end)
+					if ok then
+						id = tonumber(uid)
+					end
+				end
+			end
+			addOwnAltUserId(id)
+		end
+	end
+end
+pcall(loadLocalWhitelistFile)
+
 local notify = function(title, text)
 	pcall(function()
 		game:GetService('StarterGui'):SetCore('SendNotification', {
