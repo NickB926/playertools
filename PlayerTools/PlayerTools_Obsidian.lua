@@ -446,6 +446,7 @@ do
 		pcall(function()
 			RS:UnbindFromRenderStep('SB2CamLock')
 			RS:UnbindFromRenderStep('SB2CamLockLast')
+			RS:UnbindFromRenderStep('SB2DiveHold')
 		end)
 	end)
 	if live then
@@ -522,8 +523,9 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'rapid-inventory-use-v3-shadow-only'
+getgenv().SB2PlayerToolsLocalBuild = 'autoskill-heal-v1'
 getgenv().SB2WaveKillTargetUILoaded = false
+getgenv().SB2BetweenPartyUILoaded = false
 pcall(function()
 	warn(('[PlayerTools] local build %s | %s'):format(
 		tostring(getgenv().SB2PlayerToolsLocalBuild),
@@ -653,6 +655,17 @@ getgenv().SB2OwnAltUserIds = getgenv().SB2OwnAltUserIds or {}
 for id, v in pairs(OWN_ALT_USERIDS) do
 	getgenv().SB2OwnAltUserIds[id] = v
 end
+
+local PlayersService = game:GetService('Players')
+local function otherPlayersPresent()
+	for _, plr in ipairs(PlayersService:GetPlayers()) do
+		if plr ~= LocalPlayer and not isOwnAlt(plr) then
+			return true
+		end
+	end
+	return false
+end
+getgenv().SB2OtherPlayersPresent = otherPlayersPresent
 -- Legacy name map kept empty for older plugins that still read SB2OwnAltNames.
 getgenv().SB2OwnAltNames = getgenv().SB2OwnAltNames or {}
 
@@ -770,6 +783,9 @@ local unloadExisting = function()
 		if type(getgenv().SB2WeaponAuraPreviewClear) == 'function' then
 			pcall(getgenv().SB2WeaponAuraPreviewClear)
 		end
+		if type(getgenv().SB2SkillReachRingStop) == 'function' then
+			pcall(getgenv().SB2SkillReachRingStop)
+		end
 		local cam = workspace.CurrentCamera
 		if cam then
 			for _, name in ipairs({
@@ -843,6 +859,8 @@ local unloadExisting = function()
 			'SB2WsDeleteLogConn',
 			'SB2VoidProbeHbConn',
 			'SB2DiveFarmConn',
+			'SB2StoryIdleGuardConn',
+			'SB2StoryFloorStepConn',
 			'SB2WeaponModConn',
 			'SB2AnchorDescConn',
 		}) do
@@ -886,6 +904,7 @@ local unloadExisting = function()
 			local RS = game:GetService('RunService')
 			RS:UnbindFromRenderStep('SB2CamLock')
 			RS:UnbindFromRenderStep('SB2CamLockLast')
+			RS:UnbindFromRenderStep('SB2DiveHold')
 		end)
 		getgenv().SB2LogVoidProbe = nil
 		getgenv().SB2LastVoidProbe = nil
@@ -1095,6 +1114,30 @@ else
 	getgenv()[CONFIG.GenvKey] = true
 	pcall(unloadExisting)
 end
+-- GenvKey flips false→true in one frame on reload, so sleeping loops from the old
+-- instance never see false; they exit on this generation mismatch instead.
+getgenv().SB2PlayerToolsGen = (tonumber(getgenv().SB2PlayerToolsGen) or 0) + 1
+CONFIG.InstanceGen = getgenv().SB2PlayerToolsGen
+-- Keep-alive watchers re-set GenvKey to true within a frame, so loops from builds that
+-- predate InstanceGen never exit. Re-key their CONFIG so `getgenv()[CONFIG.GenvKey]` reads nil.
+if type(getgc) == 'function' then
+	pcall(function()
+		for _, v in ipairs(getgc(true)) do
+			if type(v) == 'table'
+				and v ~= CONFIG
+				and rawget(v, 'GenvKey') == 'SB2PlayerTools'
+				and rawget(v, 'InstanceGen') ~= CONFIG.InstanceGen
+			then
+				v.GenvKey = 'SB2PlayerTools_RetiredInstance'
+			end
+		end
+	end)
+end
+
+pcall(function()
+	game:GetService('RunService'):UnbindFromRenderStep('SB2DiveHold')
+end)
+getgenv().SB2DiveFarmOn = false
 
 local ok, err = pcall(function()
 	if not game:IsLoaded() then
@@ -1189,9 +1232,7 @@ local ok, err = pcall(function()
 		if idStr(game.PlaceId) == WD_HUB_PLACE then
 			return true
 		end
-		if idStr(game.GameId) == '8460001097' then
-			return true
-		end
+		-- WD combat instances share GameId 8460001097 — only the hub place is lobby.
 		return false
 	end
 	getgenv().SB2IsWaveDefenseHubLobby = isWaveDefenseHubLobby
@@ -1889,7 +1930,6 @@ local ok, err = pcall(function()
 			Soul = true,
 			Whirlpool = true,
 			Lava = true,
-			Indicator = true,
 			Lines = true,
 			['Trail/Slash'] = true,
 			Circle = true,
@@ -1904,7 +1944,33 @@ local ok, err = pcall(function()
 			Terrain = true,
 			Camera = true,
 			CurrentCamera = true,
+			HitEffects = true,
 		}
+
+		local function underHitEffects(inst)
+			local p = inst
+			while p and p ~= workspace do
+				if p.Name == 'HitEffects' then
+					return true
+				end
+				p = p.Parent
+			end
+			return false
+		end
+
+		local function looksLikeDamageNumber(inst)
+			if not inst then
+				return false
+			end
+			if inst:FindFirstChild('DamageText', true) then
+				return true
+			end
+			local bb = inst:FindFirstChildWhichIsA('BillboardGui')
+			if bb and bb:FindFirstChild('Label', true) then
+				return true
+			end
+			return false
+		end
 
 		local function dropConn(key)
 			local c = getgenv()[key]
@@ -1926,6 +1992,9 @@ local ok, err = pcall(function()
 			if not inst or inst.Parent ~= workspace then
 				return false
 			end
+			if underHitEffects(inst) or looksLikeDamageNumber(inst) then
+				return false
+			end
 			local name = inst.Name
 			if PROTECT_NAME[name] then
 				return false
@@ -1943,6 +2012,9 @@ local ok, err = pcall(function()
 				return true
 			end
 			if cls ~= 'Part' and cls ~= 'MeshPart' then
+				return false
+			end
+			if looksLikeDamageNumber(inst) then
 				return false
 			end
 			return hasBodyMover(inst)
@@ -2131,12 +2203,12 @@ local ok, err = pcall(function()
 				end
 				local now = os.clock()
 				local diving = getgenv().SB2DiveFarmOn == true
-				local flushGap = diving and 0.12 or 0.25
+				local flushGap = diving and 0.12 or 0.42
 				if now - (getgenv().SB2SkillFxFlushAt or 0) >= flushGap then
 					getgenv().SB2SkillFxFlushAt = now
 					flushBatch()
 				end
-				if not diving and now - lastSweep >= 8 then
+				if not diving and now - lastSweep >= 12 and #pending > 80 then
 					lastSweep = now
 					scanWorkspace()
 				end
@@ -2153,6 +2225,47 @@ local ok, err = pcall(function()
 			end
 			flushBatch()
 		end
+	end)()
+
+	-- Game reads Profiles.<you>.Settings.DamageIndicators; when false, no floating damage text.
+	;(function()
+		local Players = game:GetService('Players')
+		local RS = game:GetService('ReplicatedStorage')
+
+		local function getDamageIndicatorsSetting()
+			local lp = Players.LocalPlayer
+			if not lp then
+				return nil
+			end
+			local profiles = RS:FindFirstChild('Profiles')
+			local prof = profiles and profiles:FindFirstChild(lp.Name)
+			local settings = prof and prof:FindFirstChild('Settings')
+			return settings and settings:FindFirstChild('DamageIndicators')
+		end
+
+		local function ensureDamageIndicatorsOn(reason)
+			local flag = getDamageIndicatorsSetting()
+			if flag and flag:IsA('BoolValue') and flag.Value ~= true then
+				flag.Value = true
+				pcall(function()
+					warn(('[PlayerTools] DamageIndicators on (%s)'):format(tostring(reason or 'load')))
+				end)
+			end
+		end
+
+		task.spawn(function()
+			if not Players.LocalPlayer then
+				Players.PlayerAdded:Wait()
+			end
+			for _ = 1, 120 do
+				if getDamageIndicatorsSetting() then
+					break
+				end
+				task.wait(0.25)
+			end
+			ensureDamageIndicatorsOn('join')
+		end)
+		getgenv().SB2EnsureDamageIndicators = ensureDamageIndicatorsOn
 	end)()
 
 	-- Potato render: quality 1, no global shadows, mute lighting post-fx.
@@ -2455,10 +2568,16 @@ local ok, err = pcall(function()
 	end
 
 	local function lockReplicationFocus(char)
-		if getgenv().SB2DiveFarmOn then
+		if type(isToggleOn) == 'function' and (isToggleOn('ViewPlayer') or isToggleOn('ViewPlayerStream')) then
 			return
 		end
 		if type(isToggleOn) == 'function' and isToggleOn('DiveFarm') then
+			return
+		end
+		if getgenv().SB2DiveFarmOn == true and not (type(isToggleOn) == 'function' and isToggleOn('DiveFarm')) then
+			getgenv().SB2DiveFarmOn = false
+		end
+		if getgenv().SB2DiveFarmOn == true then
 			return
 		end
 		local model = char or getMyCharacterModel() or LocalPlayer.Character
@@ -2523,6 +2642,10 @@ local ok, err = pcall(function()
 	local function softLockRoot(model, hrp, opts)
 		opts = opts or {}
 		if not hrp or not hrp:IsA('BasePart') then
+			return
+		end
+		local hum = model and model:FindFirstChildOfClass('Humanoid')
+		if humJumpOrFall(hum) then
 			return
 		end
 		-- Lightweight: used by TP pin end / rare callers. No descendant scans.
@@ -2639,6 +2762,66 @@ local ok, err = pcall(function()
 	end
 	getgenv().SB2UprightWorldCFrame = uprightWorldCFrame
 
+	local function movementPinCombatActive()
+		return getgenv().SB2DiveFarmOn == true
+			or getgenv().SB2AutoFloorDodgeOn == true
+			or getgenv().SB2CombatAnchorOn == true
+	end
+
+	local function humJumpOrFall(hum)
+		if not hum then
+			return false
+		end
+		local st = hum:GetState()
+		return st == Enum.HumanoidStateType.Jumping or st == Enum.HumanoidStateType.Freefall
+	end
+	getgenv().SB2HumJumpOrFall = humJumpOrFall
+
+	local function cancelTpPinForAir()
+		getgenv().SB2TpPinGen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
+		getgenv().SB2TpPinActive = false
+		getgenv().SB2TpPinCFrame = nil
+		getgenv().SB2TpPinUntil = 0
+	end
+	getgenv().SB2CancelTpPinForAir = cancelTpPinForAir
+
+	local function breakSoftMovementPin()
+		getgenv().SB2TpPinGen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
+		getgenv().SB2TpPinActive = false
+		getgenv().SB2TpPinCFrame = nil
+		getgenv().SB2TpPinUntil = 0
+		getgenv().SB2AnchorLockCF = nil
+		getgenv().SB2AnchorHoldUntil = 0
+	end
+	getgenv().SB2BreakSoftMovementPin = breakSoftMovementPin
+
+	local function clearStaleSpawnVerticalPin(hrp)
+		if type(getgenv().SB2ClearWdDodgeHoverState) == 'function' then
+			pcall(getgenv().SB2ClearWdDodgeHoverState)
+		end
+		getgenv().SB2DivePinPos = nil
+		getgenv().SB2FloorDodgeGoal = nil
+		getgenv().SB2WdRiftHopGoal = nil
+		getgenv().SB2WdRiftHopActive = false
+		if not hrp or not hrp:IsA('BasePart') then
+			getgenv().SB2AnchorLockCF = nil
+			getgenv().SB2AnchorHoldUntil = 0
+			return
+		end
+		local lock = getgenv().SB2AnchorLockCF
+		if typeof(lock) == 'CFrame' then
+			local dy = math.abs(lock.Position.Y - hrp.Position.Y)
+			if dy > 35 or lock.Position.Y > hrp.Position.Y + 80 then
+				getgenv().SB2AnchorLockCF = nil
+				getgenv().SB2AnchorHoldUntil = 0
+				getgenv().SB2TpPinActive = false
+				getgenv().SB2TpPinCFrame = nil
+				getgenv().SB2TpPinUntil = 0
+			end
+		end
+	end
+	getgenv().SB2ClearStaleSpawnVerticalPin = clearStaleSpawnVerticalPin
+
 	-- Soft-pin HRP at cf: stay UNanchored so server learns the new CFrame, hold
 	-- with PivotTo + zero velocity (anti-gravity / anti-push) for a short settle.
 	local function pinTeleportCFrame(cf, seconds)
@@ -2705,14 +2888,27 @@ local ok, err = pcall(function()
 				RunService.Heartbeat:Wait()
 				local m = getMyCharacterModel() or LocalPlayer.Character
 				local root = m and (m:FindFirstChild('HumanoidRootPart') or m:FindFirstChild('UpperTorso'))
+				local hum = m and m:FindFirstChildOfClass('Humanoid')
 				if not root or not root:IsA('BasePart') then
 					continue
 				end
+				if humJumpOrFall(hum) then
+					cancelTpPinForAir()
+					if not movementPinCombatActive() then
+						breakSoftMovementPin()
+					end
+					break
+				end
 				pcall(function()
 					root.Anchored = false
+					local holdDelta = root.Position - cf.Position
+					local flatDelta = Vector3.new(holdDelta.X, 0, holdDelta.Z)
 					root.AssemblyLinearVelocity = Vector3.zero
 					root.AssemblyAngularVelocity = Vector3.zero
-					local holdDelta = root.Position - cf.Position
+					-- Ignore humanoid / physics micro-bob on Y when XZ is already pinned.
+					if flatDelta.Magnitude < 0.45 and math.abs(holdDelta.Y) < 1.15 then
+						return
+					end
 					if holdDelta.Magnitude > 0.4 then
 						if m.PivotTo then
 							m:PivotTo(cf)
@@ -2727,9 +2923,13 @@ local ok, err = pcall(function()
 			end
 			getgenv().SB2TpPinActive = false
 			getgenv().SB2TpPinCFrame = nil
-			-- Soft Combat Anchor: stay unanchored, lock CF for push snap-back.
-			setAnchorLockCF(cf)
-			beginAnchorReplicate(0.35)
+			if movementPinCombatActive() then
+				setAnchorLockCF(cf)
+				beginAnchorReplicate(0.35)
+			else
+				getgenv().SB2AnchorLockCF = nil
+				getgenv().SB2AnchorHoldUntil = 0
+			end
 			if getgenv().SB2CombatAnchorOn == true or isToggleOn('CombatAnchor') then
 				pcall(function()
 					local m = getMyCharacterModel() or LocalPlayer.Character
@@ -2758,8 +2958,36 @@ local ok, err = pcall(function()
 		if not hrp or not hrp:IsA('BasePart') then
 			return
 		end
-		-- Retarget snap-back BEFORE moving so Combat Anchor cannot yank to the old pad.
-		setAnchorLockCF(cf)
+		local hum = model:FindFirstChildOfClass('Humanoid')
+		if humJumpOrFall(hum) then
+			cancelTpPinForAir()
+			local pos = hrp.Position
+			local flat = Vector3.new(cf.Position.X - pos.X, 0, cf.Position.Z - pos.Z)
+			if flat.Magnitude < 1.2 then
+				return
+			end
+			local flatDest = Vector3.new(cf.Position.X, pos.Y, cf.Position.Z)
+			local lv = hrp.CFrame.LookVector
+			local keep = Vector3.new(lv.X, 0, lv.Z)
+			if keep.Magnitude >= 0.08 then
+				cf = CFrame.lookAt(flatDest, flatDest + keep.Unit)
+			else
+				cf = CFrame.new(flatDest)
+			end
+			cf = uprightWorldCFrame(cf)
+			pcall(function()
+				hrp.Anchored = false
+				if model.PivotTo then
+					model:PivotTo(cf)
+				else
+					hrp.CFrame = cf
+				end
+			end)
+			return
+		end
+		if movementPinCombatActive() then
+			setAnchorLockCF(cf)
+		end
 		local dist = (hrp.Position - cf.Position).Magnitude
 		if getgenv().SB2TpPinActive == true and typeof(getgenv().SB2TpPinCFrame) == 'CFrame' then
 			local pinDelta = getgenv().SB2TpPinCFrame.Position - cf.Position
@@ -2768,17 +2996,19 @@ local ok, err = pcall(function()
 			end
 		end
 		if dist < 6 then
-			pcall(function()
-				hrp.Anchored = false
-				hrp.AssemblyLinearVelocity = Vector3.zero
-				hrp.AssemblyAngularVelocity = Vector3.zero
-				if model.PivotTo then
-					model:PivotTo(cf)
-				else
-					hrp.CFrame = cf
-				end
-			end)
-			beginAnchorReplicate(0.35)
+			if movementPinCombatActive() then
+				pcall(function()
+					hrp.Anchored = false
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+					if model.PivotTo then
+						model:PivotTo(cf)
+					else
+						hrp.CFrame = cf
+					end
+				end)
+				beginAnchorReplicate(0.35)
+			end
 			return
 		end
 		pinTeleportCFrame(cf, tonumber(seconds) or 0.55)
@@ -2867,7 +3097,14 @@ local ok, err = pcall(function()
 			})
 		end
 		-- #endregion
-		holdCombatAnchor(4)
+		-- Do not open a multi-second anchor hold on boot — it pinned spawn Y and
+		-- fought gravity / walk animations (visible idle bob) without Anchor on.
+		pcall(function()
+			lockReplicationFocus(model)
+			if hrp and hrp:IsA('BasePart') then
+				LocalPlayer:RequestStreamAroundAsync(hrp.Position, 40)
+			end
+		end)
 	end)
 
 	local lastStreamRequestAt = 0
@@ -3117,7 +3354,39 @@ local ok, err = pcall(function()
 		return streamDensityPeak >= 60 and n < (streamDensityPeak * 0.22)
 	end
 
+	local function restoreLocalSpectateView()
+		getgenv().SB2SpectateTargetName = nil
+		getgenv().SB2SpectateGen = (tonumber(getgenv().SB2SpectateGen) or 0) + 1
+		getgenv().SB2ForceCamFix = true
+		local char = getMyCharacterModel() or LocalPlayer.Character
+		local hrp = char and char:FindFirstChild('HumanoidRootPart')
+		local hum = char and char:FindFirstChildOfClass('Humanoid')
+		pcall(function()
+			if hrp then
+				LocalPlayer.ReplicationFocus = hrp
+				LocalPlayer:RequestStreamAroundAsync(hrp.Position, 48)
+			end
+		end)
+		local cam = getLiveCamera()
+		if cam and hum then
+			pcall(function()
+				cam.CameraType = Enum.CameraType.Custom
+				cam.CameraSubject = hum
+			end)
+		end
+		pcall(function()
+			if type(getgenv().SB2RestoreStoryWalkCollision) == 'function' then
+				getgenv().SB2RestoreStoryWalkCollision()
+			end
+		end)
+		return fixCamera(char)
+	end
+	getgenv().SB2RestoreLocalSpectateView = restoreLocalSpectateView
+
 	local function fixCamera(preferredChar)
+		if scriptableMenuCameraActive() then
+			return false
+		end
 		local cam = getLiveCamera()
 		if not cam then
 			return false
@@ -3135,7 +3404,9 @@ local ok, err = pcall(function()
 		if not char or not char.Parent then
 			return false
 		end
-		lockReplicationFocus(char)
+		if type(isToggleOn) == 'function' and not isToggleOn('ViewPlayer') and not isToggleOn('ViewPlayerStream') then
+			lockReplicationFocus(char)
+		end
 		requestStreamAround(char, true)
 		local hum = char:FindFirstChildOfClass('Humanoid')
 		if not hum then
@@ -3146,16 +3417,18 @@ local ok, err = pcall(function()
 		if not subject then
 			return false
 		end
+		local forceFix = getgenv().SB2ForceCamFix == true
+		if forceFix then
+			getgenv().SB2ForceCamFix = nil
+		end
 		local ok = pcall(function()
 			cam.CameraType = Enum.CameraType.Custom
-			if cam.CameraSubject ~= subject then
-				cam.CameraSubject = subject
-			end
+			cam.CameraSubject = subject
 			if diveCameraQuiet() then
 				return
 			end
 			local now = os.clock()
-			if (now - (tonumber(getgenv().SB2LastCamFixAt) or 0)) < 0.85 then
+			if not forceFix and (now - (tonumber(getgenv().SB2LastCamFixAt) or 0)) < 0.85 then
 				return
 			end
 			getgenv().SB2LastCamFixAt = now
@@ -3193,12 +3466,32 @@ local ok, err = pcall(function()
 		return false
 	end
 
+	-- Ancient Shrine / other InOtherMenu UIs use Scriptable cameras — do not fight them.
+	local function scriptableMenuCameraActive()
+		if getgenv().SB2BlessingMenuOpen == true then
+			return true
+		end
+		if LocalPlayer:GetAttribute('InOtherMenu') == true then
+			return true
+		end
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local bless = pg and pg:FindFirstChild('Blessings')
+		if bless and bless:IsA('ScreenGui') and bless.Enabled then
+			return true
+		end
+		return false
+	end
+	getgenv().SB2ScriptableMenuCameraActive = scriptableMenuCameraActive
+
 	local function cameraLooksBroken(cam, char)
 		if not cam then
 			return true
 		end
 		-- Title / cinematic Scriptable cams must not be forced to Custom (black screen).
 		if not inGameplayWorld() then
+			return false
+		end
+		if scriptableMenuCameraActive() then
 			return false
 		end
 		local cp = cam.CFrame.Position
@@ -4810,6 +5103,13 @@ local ok, err = pcall(function()
 				getgenv().SB2MenuWantOpen = true
 				getgenv().SB2UiOrphanFails = 0
 				task.defer(function()
+					local char = LocalPlayer.Character
+					local hrp = char and char:FindFirstChild('HumanoidRootPart')
+					if type(getgenv().SB2ClearStaleSpawnVerticalPin) == 'function' then
+						pcall(getgenv().SB2ClearStaleSpawnVerticalPin, hrp)
+					end
+				end)
+				task.defer(function()
 					if type(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet) == 'function' then
 						pcall(getgenv().SB2ApplyWaveDefenseHubLobbyQuiet, 'place-hop')
 					end
@@ -6176,6 +6476,13 @@ local ok, err = pcall(function()
 			return true
 		end
 		-- Profile names sometimes omit commas / titles; match long substrings only.
+		if #key >= 5 then
+			for bossKey in pairs(BOSS_KILL_KEYS) do
+				if #bossKey > #key and string.sub(bossKey, 1, #key) == key then
+					return true
+				end
+			end
+		end
 		for bossKey in pairs(BOSS_KILL_KEYS) do
 			if #bossKey >= 8 and string.find(key, bossKey, 1, true) then
 				return true
@@ -7013,8 +7320,7 @@ local ok, err = pcall(function()
 	PlayersBox:AddToggle('ViewPlayer', { Text = 'Spectate' }):OnChanged(function(value)
 		if not value then
 			spectateTargetName = nil
-			getgenv().SB2SpectateTargetName = nil
-			fixCamera(LocalPlayer.Character or Character)
+			pcall(restoreLocalSpectateView)
 			return
 		end
 
@@ -7034,9 +7340,11 @@ local ok, err = pcall(function()
 		end
 		Library:Notify('Spectating ' .. name)
 
+		getgenv().SB2SpectateGen = (tonumber(getgenv().SB2SpectateGen) or 0) + 1
+		local spectateGen = getgenv().SB2SpectateGen
 		-- Never block the toggle OnChanged thread (SetValue / UI deadlocks).
 		task.spawn(function()
-			while isToggleOn('ViewPlayer') do
+			while isToggleOn('ViewPlayer') and getgenv().SB2SpectateGen == spectateGen do
 				name = spectateTargetName or getSelectedProfileName()
 				if not name then
 					fixCamera(LocalPlayer.Character or Character)
@@ -7059,8 +7367,8 @@ local ok, err = pcall(function()
 				end
 				task.wait(0.1)
 			end
-			if not isToggleOn('ViewPlayerStream') then
-				fixCamera(LocalPlayer.Character or Character)
+			if getgenv().SB2SpectateGen == spectateGen and not isToggleOn('ViewPlayerStream') then
+				pcall(restoreLocalSpectateView)
 			end
 		end)
 	end)
@@ -7076,10 +7384,8 @@ local ok, err = pcall(function()
 		if not value then
 			if not isToggleOn('ViewPlayer') then
 				spectateTargetName = nil
-				getgenv().SB2SpectateTargetName = nil
 			end
-			lockReplicationFocus(LocalPlayer.Character or Character)
-			fixCamera(LocalPlayer.Character or Character)
+			pcall(restoreLocalSpectateView)
 			return
 		end
 
@@ -7141,7 +7447,9 @@ local ok, err = pcall(function()
 			end
 			Library:Notify('Stream spectate on — viewing ' .. tostring(name))
 
-			while isToggleOn('ViewPlayerStream') do
+			getgenv().SB2SpectateGen = (tonumber(getgenv().SB2SpectateGen) or 0) + 1
+			local streamGen = getgenv().SB2SpectateGen
+			while isToggleOn('ViewPlayerStream') and getgenv().SB2SpectateGen == streamGen do
 				name = spectateTargetName or getSelectedProfileName()
 				if not name then
 					fixCamera(LocalPlayer.Character or Character)
@@ -7182,9 +7490,8 @@ local ok, err = pcall(function()
 				task.wait(0.1)
 			end
 
-			if not isToggleOn('ViewPlayer') then
-				lockReplicationFocus(LocalPlayer.Character or Character)
-				fixCamera(LocalPlayer.Character or Character)
+			if getgenv().SB2SpectateGen == streamGen and not isToggleOn('ViewPlayer') then
+				pcall(restoreLocalSpectateView)
 			end
 		end)
 	end)
@@ -7732,6 +8039,12 @@ local ok, err = pcall(function()
 
 		-- Must match SERVER_HOP_UI_VER in ServerHop.iy (server list on floor click).
 		local SERVER_HOP_PT_VER = 7
+		local SERVER_HOP_PATHS = {
+			'PlayerTools/ServerHop.iy',
+			'ServerHop.iy',
+			'scripts/PlayerTools/ServerHop.iy',
+			'PlayerTools/scripts/ServerHop.iy',
+		}
 
 		local function teardownServerHopUi()
 			pcall(function()
@@ -7751,21 +8064,29 @@ local ok, err = pcall(function()
 		end
 
 		local function ensureServerHopPlugin()
+			local expected = tonumber(getgenv().SB2ServerHopUiVerExpected) or SERVER_HOP_PT_VER
 			local ver = tonumber(getgenv().SB2ServerHopUiVer) or 0
 			local hasBrowse = type(getgenv().SB2ServerHopBrowseFloor) == 'function'
-			if ver >= SERVER_HOP_PT_VER and hasBrowse and type(getgenv().SB2ServerHopOpenGui) == 'function' then
+			local hasOpen = type(getgenv().SB2ServerHopOpenGui) == 'function'
+			if ver >= expected and hasBrowse and hasOpen then
 				return true
 			end
 			-- Old IY-only hop UI often registers ToggleGui without server browse — reload from disk.
 			teardownServerHopUi()
-			for _, path in ipairs({ 'PlayerTools/ServerHop.iy', 'ServerHop.iy' }) do
+			for _, path in ipairs(SERVER_HOP_PATHS) do
 				if type(isfile) == 'function' and isfile(path) and type(readfile) == 'function' then
 					local okRead, src = pcall(readfile, path)
 					if okRead and type(src) == 'string' and #src > 200 then
+						if not string.find(src, 'SERVER_HOP_UI_VER = 7', 1, true) then
+							warn('[PlayerTools] ServerHop.iy outdated (need UI v7): ', path)
+						end
 						local fn, err = (loadstring or load)(src, path)
 						if fn then
 							local okRun, res = pcall(fn)
+							ver = tonumber(getgenv().SB2ServerHopUiVer) or 0
+							expected = tonumber(getgenv().SB2ServerHopUiVerExpected) or SERVER_HOP_PT_VER
 							if okRun
+								and ver >= expected
 								and type(getgenv().SB2ServerHopOpenGui) == 'function'
 								and type(getgenv().SB2ServerHopBrowseFloor) == 'function'
 							then
@@ -7773,6 +8094,14 @@ local ok, err = pcall(function()
 							end
 							if not okRun then
 								warn('[PlayerTools] ServerHop load: ' .. tostring(res))
+							else
+								warn(
+									'[PlayerTools] ServerHop loaded but browse API missing (ver=',
+									ver,
+									' expected=',
+									expected,
+									')'
+								)
 							end
 						else
 							warn('[PlayerTools] ServerHop compile: ' .. tostring(err))
@@ -7782,6 +8111,11 @@ local ok, err = pcall(function()
 			end
 			return false
 		end
+
+		getgenv().SB2EnsureServerHopPlugin = ensureServerHopPlugin
+		task.defer(function()
+			pcall(ensureServerHopPlugin)
+		end)
 
 		JoinBox:AddButton('Browse floor servers', function()
 			if not ensureServerHopPlugin() then
@@ -8383,6 +8717,7 @@ local ok, err = pcall(function()
 			end
 			local hrp = newCharacter:WaitForChild('HumanoidRootPart', 10)
 			if hrp then
+				clearStaleSpawnVerticalPin(hrp)
 				-- Wait until past title / PLAY screen before touching camera or streaming.
 				for _ = 1, 40 do
 					if inGameplayWorld() then
@@ -8393,9 +8728,18 @@ local ok, err = pcall(function()
 				if not inGameplayWorld() then
 					return
 				end
+				clearStaleSpawnVerticalPin(hrp)
 				lockReplicationFocus(newCharacter)
 				requestStreamAround(newCharacter, true)
-				holdCombatAnchor(4)
+				-- Unconditional holdCombatAnchor(4) pinned spawn Y and fought walk/idle anim (micro bob).
+				if isToggleOn('CombatAnchor') or getgenv().SB2CombatAnchorOn == true then
+					if hrp.Position.Y < 120 then
+						holdCombatAnchor(4)
+					else
+						getgenv().SB2AnchorLockCF = nil
+						getgenv().SB2AnchorHoldUntil = 0
+					end
+				end
 			end
 			for _ = 1, 30 do
 				if isToggleOn('ViewPlayer') or isToggleOn('ViewPlayerStream') then
@@ -8482,6 +8826,9 @@ local ok, err = pcall(function()
 			if getgenv().SB2CheaterScannerSpectating == true then
 				return
 			end
+			if scriptableMenuCameraActive() then
+				return
+			end
 			-- Leave title / PLAY-menu cinematic cams alone (forcing Custom = black screen).
 			if not inGameplayWorld() then
 				return
@@ -8566,7 +8913,7 @@ local ok, err = pcall(function()
 				return
 			end
 			local function onCamProp()
-				if diveCameraQuiet() then
+				if diveCameraQuiet() or scriptableMenuCameraActive() then
 					return
 				end
 				if cameraLooksBroken(cam, getMyCharacterModel() or LocalPlayer.Character) then
@@ -8630,27 +8977,15 @@ local ok, err = pcall(function()
 		-- Server rejects aura damage past ~melee/skill reach on elites/bosses even when
 		-- the instance is streamed. Prefer real/attack CF within these XZ radii.
 		-- Killaura load profiles. Aggressive = old defaults (48×~12 Hz) — melts FPS + server.
-		if getgenv().SB2CombatLiteLoad == nil then
-			getgenv().SB2CombatLiteLoad = false
-		end
-		local function syncCombatLiteLoadFromToggle()
-			local t = Toggles and Toggles.CombatLiteLoad
-			if type(t) == 'table' then
-				getgenv().SB2CombatLiteLoad = t.Value == true
-			end
-		end
-		getgenv().SB2SyncCombatLiteLoad = syncCombatLiteLoadFromToggle
+		getgenv().SB2CombatLiteLoad = false
+		getgenv().SB2SyncCombatLiteLoad = nil
 		local function combatLiteLoadEnabled()
-			local t = Toggles and Toggles.CombatLiteLoad
-			if type(t) == 'table' then
-				return t.Value == true
-			end
-			return getgenv().SB2CombatLiteLoad == true
+			return false
 		end
 		getgenv().SB2CombatLiteLoadEnabled = combatLiteLoadEnabled
 		local WD_HUB_PLACE = '121252145396212'
 		local function isWdHubKillauraCap()
-			return idStr(game.PlaceId) == WD_HUB_PLACE or idStr(game.GameId) == '8460001097'
+			return idStr(game.PlaceId) == WD_HUB_PLACE
 		end
 		getgenv().SB2IsWdHubKillauraCap = isWdHubKillauraCap
 		local KILLAURA_WD = {
@@ -9392,6 +9727,21 @@ local ok, err = pcall(function()
 			local maxR = 0
 			for radius in string.gmatch(source, 'DamageArea%([^)]-%s(%d+%.?%d*)%s*[,)]') do
 				maxR = math.max(maxR, tonumber(radius) or 0)
+			end
+			for radius in string.gmatch(source, 'DamageArea%s*%(%s*[^,]+,%s*(%d+%.?%d*)') do
+				maxR = math.max(maxR, tonumber(radius) or 0)
+			end
+			for radius in string.gmatch(source, '[Rr]adius%s*=%s*(%d+%.?%d*)') do
+				local n = tonumber(radius)
+				if n and n >= 4 and n <= 120 then
+					maxR = math.max(maxR, n)
+				end
+			end
+			for radius in string.gmatch(source, '[Tt]rue[Rr]ange%s*=%s*(%d+%.?%d*)') do
+				local n = tonumber(radius)
+				if n and n >= 4 and n <= 120 then
+					maxR = math.max(maxR, n)
+				end
 			end
 			return maxR > 0 and maxR or nil
 		end
@@ -10471,7 +10821,15 @@ local ok, err = pcall(function()
 			if BOSS_KEYS[key] then
 				return true
 			end
-			-- Only: full wiki boss name appears inside the mob name (not the reverse —
+			-- WD / profile: short mob name is prefix of full wiki title (Magnor, Egnor, …).
+			if #key >= 5 then
+				for bossKey in pairs(BOSS_KEYS) do
+					if #bossKey > #key and string.sub(bossKey, 1, #key) == key then
+						return true
+					end
+				end
+			end
+			-- Full wiki boss name appears inside the mob name (not the reverse —
 			-- reverse matched random mobs like "Giant"/"King" inside boss titles).
 			for bossKey in pairs(BOSS_KEYS) do
 				if #bossKey >= 8 and string.find(key, bossKey, 1, true) then
@@ -10534,6 +10892,7 @@ local ok, err = pcall(function()
 
 		-- One-shot / arena-nuke bosses: charge telegraphs + head-top autofarm height.
 		local NUKE_BOSS_NEEDLES = {
+			'rubricatus',
 			'aeganatos',
 			'aegatanos',
 			'deityoftheflame',
@@ -10555,6 +10914,13 @@ local ok, err = pcall(function()
 			'wendigo',
 			'countdracula',
 			'dracula',
+			'kraken',
+			'headlesshorseman',
+			'alphawerewolf',
+			'cucurbita',
+			'bulswick',
+			'egnor',
+			'magnor',
 		}
 		local function isNukeBossMob(mob)
 			if not mob or not mob.Parent then
@@ -10813,6 +11179,16 @@ local ok, err = pcall(function()
 					or string.find(n, 'aeganatos', 1, true)
 					or string.find(n, 'aegatanos', 1, true)
 					or string.find(n, 'sunken sovereign', 1, true)
+					or string.find(n, 'kraken', 1, true)
+					or string.find(n, 'dracula', 1, true)
+					or string.find(n, 'enraged wendigo', 1, true)
+					or string.find(n, 'terror incarn', 1, true)
+					or string.find(n, 'headless horseman', 1, true)
+					or string.find(n, 'alpha werewolf', 1, true)
+					or string.find(n, 'cucurbita', 1, true)
+					or string.find(n, 'bulswick', 1, true)
+					or string.find(n, 'egnor', 1, true)
+					or string.find(n, 'magnor', 1, true)
 					or string.find(n, 'saurus', 1, true)
 				then
 					return true
@@ -11045,9 +11421,9 @@ local ok, err = pcall(function()
 			if (tonumber(getgenv().SB2CombatBootGraceUntil) or 0) > os.clock() then
 				return nil
 			end
+			-- Keep the window when Mobs briefly empties: the skill is still active server-side and
+			-- on cooldown, so wiping it left the next spawn with untagged hits until the CD ended.
 			if not workspaceHasMobs() then
-				getgenv().SB2SkillActiveUntil = 0
-				getgenv().SB2SkillActiveName = nil
 				return nil
 			end
 
@@ -11146,6 +11522,7 @@ local ok, err = pcall(function()
 			end
 
 			getgenv().SB2SkillCastLock = true
+			getgenv().SB2SkillCastLockAt = os.clock()
 			local now = time()
 			-- Keep the skill name even if UseSkill is on CD / fails — AutoAttack
 			-- still needs it for DealDamage/Attack tags between casts.
@@ -11155,6 +11532,7 @@ local ok, err = pcall(function()
 			task.defer(function()
 				task.wait(0.15)
 				getgenv().SB2SkillCastLock = false
+				getgenv().SB2SkillCastLockAt = 0
 			end)
 			-- Keep the tag window open even when UseSkill fails (CD / range).
 			-- Bare DealDamage(nil) barely ticks; skill-tagged hits still work.
@@ -11416,6 +11794,55 @@ local ok, err = pcall(function()
 			warn('[WaveKillTarget] UI not loaded — see Farm → Wave Defense label')
 		end
 
+		local function tryLoadBetweenPartyModule()
+			if getgenv().SB2BetweenPartyUILoaded == true then
+				return true
+			end
+			local compile = loadstring or load
+			if type(compile) ~= 'function' or type(readfile) ~= 'function' or type(isfile) ~= 'function' then
+				return false, 'filesystem/compile unavailable'
+			end
+			for _, modPath in ipairs({ 'PlayerTools/BetweenParty.lua', 'BetweenParty.lua' }) do
+				if isfile(modPath) then
+					local src = readfile(modPath)
+					if type(src) == 'string' and src ~= '' then
+						local fn, err = compile(src, modPath)
+						if fn then
+							local ok, result = pcall(fn)
+							if ok and type(result) == 'function' then
+								ok, result = pcall(result, {
+									WdBox = WdBox,
+									Library = Library,
+									LocalPlayer = LocalPlayer,
+									Players = Players,
+									ReplicatedStorage = ReplicatedStorage,
+									Options = Options,
+									Toggles = Toggles,
+								})
+							end
+							if ok then
+								getgenv().SB2BetweenPartyUILoaded = true
+								return true
+							end
+							warn('[BetweenParty] init failed: ', result)
+						else
+							warn('[BetweenParty] compile failed: ', err)
+						end
+					end
+				end
+			end
+			return false, 'BetweenParty.lua not found or failed to load'
+		end
+		if not tryLoadBetweenPartyModule() then
+			pcall(function()
+				WdBox:AddLabel(
+					'Between party start unavailable — keep PlayerTools/BetweenParty.lua in workspace, then reload.',
+					true
+				)
+			end)
+			warn('[BetweenParty] UI not loaded — see Farm → Wave Defense label')
+		end
+
 		CombatBox:AddToggle('AutoSkill', {
 			Text = 'Auto skill damage',
 			Default = false,
@@ -11588,24 +12015,6 @@ local ok, err = pcall(function()
 			return true
 		end
 
-		CombatBox:AddToggle('CombatLiteLoad', {
-			Text = 'Lite killaura (less lag)',
-			Default = false,
-			Tooltip = 'ON: throttled killaura (fewer hits + Attack remotes). OFF: full reach/rates (Cursed Threefold Slash, etc.).',
-		}):OnChanged(function(value)
-			getgenv().SB2CombatLiteLoad = value == true
-		end)
-		task.defer(function()
-			if type(getgenv().SB2SyncCombatLiteLoad) == 'function' then
-				pcall(getgenv().SB2SyncCombatLiteLoad)
-			end
-		end)
-		task.delay(0.6, function()
-			if type(getgenv().SB2SyncCombatLiteLoad) == 'function' then
-				pcall(getgenv().SB2SyncCombatLiteLoad)
-			end
-		end)
-
 		pcall(function()
 			local prevSwing = getgenv().SB2AutoSwingConn
 			if prevSwing then
@@ -11666,22 +12075,50 @@ local ok, err = pcall(function()
 			end)
 		end)
 
-		CombatBox:AddToggle('AutoAttack', {
-			Text = 'Killaura',
-			Tooltip = 'DealDamage/Attack nearby (and streamed) mobs. Pair with Auto skill for UseSkill + skill-tagged hits.',
-		}):OnChanged(function(value)
-			getgenv().SB2AutoAttackOn = value == true
+		local function killauraConnLive()
+			local conn = getgenv().SB2AutoAttackConn
+			if not conn then
+				return false
+			end
+			local ok, connected = pcall(function()
+				return conn.Connected == true
+			end)
+			if not ok or not connected then
+				getgenv().SB2AutoAttackConn = nil
+				return false
+			end
+			return true
+		end
+
+		local function stopKillauraLoop()
 			local prev = getgenv().SB2AutoAttackConn
 			if prev then
 				pcall(function()
 					prev:Disconnect()
 				end)
-				getgenv().SB2AutoAttackConn = nil
 			end
+			getgenv().SB2AutoAttackConn = nil
+		end
 
-			if not value then
-				return
+		local function startKillauraLoop()
+			if not isToggleOn('AutoAttack') then
+				stopKillauraLoop()
+				getgenv().SB2AutoAttackOn = false
+				return false
 			end
+			if getgenv().SB2StrangerCombatLock == true
+				or (type(getgenv().SB2OtherPlayersPresent) == 'function' and getgenv().SB2OtherPlayersPresent())
+			then
+				return false
+			end
+			if type(getgenv().SB2IsWaveDefenseHubLobby) == 'function' and getgenv().SB2IsWaveDefenseHubLobby() then
+				return false
+			end
+			stopKillauraLoop()
+			getgenv().SB2AutoAttackOn = true
+			task.spawn(function()
+				pcall(refreshRpcKey)
+			end)
 			if isWdHubKillauraCap() and getgenv()._SB2WdAuraTold ~= true then
 				getgenv()._SB2WdAuraTold = true
 				Library:Notify('Wave Defense hub: killaura capped (6 nearby / slower) so the server does not choke', 7)
@@ -11689,28 +12126,18 @@ local ok, err = pcall(function()
 				getgenv()._SB2AggressiveAuraTold = true
 				Library:Notify('Full killaura — enable Lite killaura if combat lags', 7)
 			end
-
-			-- Hive follow/stack already warps. Pinning in place here froze alts
-			-- at a half-moved pad and Combat Anchor snapped them backward.
 			pcall(function()
 				if isPoorAuraTagSkill(getgenv().SB2SkillActiveName) then
 					getgenv().SB2SkillActiveName = nil
 					getgenv().SB2SkillActiveUntil = 0
 				end
 			end)
-
-			-- One safe RPCKey fetch if we don't have it yet — never RefillKeys / gc brute.
-			task.spawn(function()
-				pcall(refreshRpcKey)
-			end)
-			-- Clear stuck skill lock/CD from old laggy sessions.
 			getgenv().SB2SkillCastLock = false
+			getgenv().SB2SkillCastLockAt = 0
 			getgenv().SB2SkillCdUntil = {}
-			-- Keep last skill tag name — wiping it made the first seconds of killaura do nothing.
 			if type(getgenv().SB2SkillActiveUntil) ~= 'number' or getgenv().SB2SkillActiveUntil < time() then
 				getgenv().SB2SkillActiveUntil = 0
 			end
-			-- Combat Skill often left on (none) while FarmSkill is set — fill it so tags work.
 			pcall(function()
 				local combat = flattenOptionValue(Options.SkillName and Options.SkillName.Value)
 				local farm = flattenOptionValue(Options.FarmSkillName and Options.FarmSkillName.Value)
@@ -11724,7 +12151,6 @@ local ok, err = pcall(function()
 					Options.SkillName:SetValue(farm)
 				end
 			end)
-			-- Kill live namecall UseSkill hooks (they blocked skills / added hitch).
 			pcall(function()
 				if getgenv()._SB2SupportBossOld and getrawmetatable then
 					local mt = getrawmetatable(game)
@@ -11735,26 +12161,33 @@ local ok, err = pcall(function()
 					getgenv().SB2SupportBossOnlyLive = false
 				end
 			end)
-
 			local onCooldown = {}
 			local lastTick = 0
 			getgenv().SB2AutoAttackConn = RunService.Heartbeat:Connect(function()
-				local gui = getgenv().SB2PlayerToolsGui
-				if getgenv().SB2AutoAttackOn ~= true
-					or not isToggleOn('AutoAttack')
-					or not (gui and gui.Parent)
-				then
-					local conn = getgenv().SB2AutoAttackConn
-					if conn then
-						conn:Disconnect()
-						getgenv().SB2AutoAttackConn = nil
-					end
+				local toggleOn = isToggleOn('AutoAttack')
+				if not toggleOn then
+					stopKillauraLoop()
 					getgenv().SB2AutoAttackOn = false
+					return
+				end
+				if getgenv().SB2AutoAttackOn ~= true then
+					getgenv().SB2AutoAttackOn = true
+				end
+				if getgenv().SB2StrangerCombatLock == true
+					or (type(getgenv().SB2OtherPlayersPresent) == 'function' and getgenv().SB2OtherPlayersPresent())
+				then
 					return
 				end
 
 				local prof = getKillauraProfile()
 				local now = os.clock()
+				if getgenv().SB2SkillCastLock == true then
+					local lockAt = tonumber(getgenv().SB2SkillCastLockAt) or 0
+					if lockAt > 0 and now - lockAt > 0.4 then
+						getgenv().SB2SkillCastLock = false
+						getgenv().SB2SkillCastLockAt = 0
+					end
+				end
 				local hitLivesRush = wantHitLivesRush()
 				local tickGap = hitLivesRush and prof.hitLivesInterval or prof.interval
 				if usingEventFarmSkills() then
@@ -11772,7 +12205,6 @@ local ok, err = pcall(function()
 				if (tonumber(getgenv().SB2CombatBootGraceUntil) or 0) > os.clock() then
 					return
 				end
-				-- Soft re-fetch RPC key if it never landed (boot race / hop).
 				if not combatState.rpcReady and (now - (combatState.lastRpcTry or 0)) > 2.5 then
 					combatState.lastRpcTry = now
 					task.spawn(function()
@@ -11798,7 +12230,6 @@ local ok, err = pcall(function()
 				local origin = myPart.Position
 				local selectedSkill = getActiveWeaponSkillName()
 				local pistolMode = not hitLivesRush and FORCE_ATTACK_SKILLS[selectedSkill] == true
-				-- After pistol UseSkill, tag like CTF (wide reach). Before that, stay on killaura.
 				local skillWindowOpen = not hitLivesRush
 					and isToggleOn('AutoSkill')
 					and type(getgenv().SB2SkillActiveUntil) == 'number'
@@ -11815,10 +12246,8 @@ local ok, err = pcall(function()
 					rangeSq = range * range
 				end
 
-				-- Always refresh real-CF cache so stacked packs + far bosses range-check right.
 				cacheMobRealPositions(origin)
 
-				-- Hit-lives mobs die by hit count — CE buff + basic swings, no weapon UseSkill.
 				local attackName = nil
 				local function skillTagFallback()
 					if pistolMode then
@@ -11850,19 +12279,13 @@ local ok, err = pcall(function()
 					end
 				elseif isToggleOn('AutoSkill') then
 					attackName = ensureSkillWindow()
-					-- Between UseSkill casts, bare DealDamage(nil) does almost nothing past
-					-- melee. Keep tagging the selected/last skill so ranged ticks still hurt.
 					if not attackName then
 						attackName = skillTagFallback()
 					end
 				else
-					-- Killaura alone: basic hits only. Tagging a skill name here looked
-					-- like Auto Skill was still on.
 					attackName = nil
 				end
 
-				-- Pistol: UseSkill shot only. Tagging DealDamage with "Summon Pistol" does not
-				-- multi-hit like Downward Smash / CTF — that was the "one damage instance" bug.
 				if isToggleOn('AutoSkill') and pistolMode and not attackName then
 					if pistolInCastRange(origin) then
 						local info = getSkillInfo(selectedSkill)
@@ -11907,7 +12330,6 @@ local ok, err = pcall(function()
 					local dx = atkCF.Position.X - origin.X
 					local dz = atkCF.Position.Z - origin.Z
 					local distSq = dx * dx + dz * dz
-					-- Live root fallback (sometimes more accurate than stale cache).
 					local lx = root.Position.X - origin.X
 					local lz = root.Position.Z - origin.Z
 					local liveSq = lx * lx + lz * lz
@@ -11989,7 +12411,6 @@ local ok, err = pcall(function()
 								end)
 								break
 							else
-								-- Bosses: brief per-strike spacing only.
 								onCooldown[mob] = true
 								task.delay(prof.bossDelay or 0.06, function()
 									onCooldown[mob] = nil
@@ -12001,79 +12422,156 @@ local ok, err = pcall(function()
 					end
 				end
 			end)
+			return true
+		end
+		getgenv().SB2KillauraConnLive = killauraConnLive
+		getgenv().SB2KillauraNeedsStart = function()
+			local fn = getgenv().SB2KillauraConnLive
+			if type(fn) == 'function' then
+				return not fn()
+			end
+			return getgenv().SB2AutoAttackConn == nil
+		end
+		getgenv().SB2StartKillauraLoop = startKillauraLoop
+		getgenv().SB2StopKillauraLoop = stopKillauraLoop
+
+		CombatBox:AddToggle('AutoAttack', {
+			Text = 'Killaura',
+			Tooltip = 'DealDamage/Attack nearby (and streamed) mobs. Pair with Auto skill for UseSkill + skill-tagged hits.',
+		}):OnChanged(function(value)
+			if value == true then
+				if getgenv().SB2StrangerCombatLock == true
+					or (type(getgenv().SB2OtherPlayersPresent) == 'function' and getgenv().SB2OtherPlayersPresent())
+				then
+					task.defer(function()
+						local t = Toggles.AutoAttack
+						if type(t) == 'table' and t.Value == true and type(t.SetValue) == 'function' then
+							t:SetValue(false)
+						end
+					end)
+					pcall(function()
+						Library:Notify('Killaura blocked — non-whitelist player in server', 5)
+					end)
+					return
+				end
+				if type(getgenv().SB2IsWaveDefenseHubLobby) == 'function' and getgenv().SB2IsWaveDefenseHubLobby() then
+					task.defer(function()
+						local t = Toggles.AutoAttack
+						if type(t) == 'table' and t.Value == true and type(t.SetValue) == 'function' then
+							t:SetValue(false)
+						end
+					end)
+					pcall(function()
+						Library:Notify('Killaura off in Wave Defense hub — enter a run first', 5)
+					end)
+					return
+				end
+			end
+			getgenv().SB2AutoAttackOn = value == true
+			stopKillauraLoop()
+			if not value then
+				return
+			end
+			task.defer(function()
+				if isToggleOn('AutoAttack') then
+					startKillauraLoop()
+				end
+			end)
+		end)
+		task.defer(function()
+			local t = Toggles.AutoAttack
+			if type(t) == 'table' and t.Value == true and not killauraConnLive() then
+				pcall(startKillauraLoop)
+			end
 		end)
 
-		CombatBox:AddToggle('CombatAnchor', {
-			Text = 'Anchor',
+		local KILLAURA_OFF_WAVE = 75
+		CombatBox:AddToggle('KillauraOffWave75', {
+			Text = 'Killaura off at wave 75',
 			Default = false,
-			Tooltip = 'One-shot HelperMob ghost (mobs/players walk through) + rare push snap (~1s). No per-frame work. TPs stay unanchored so they replicate. Auto-off during Event dive.',
-		}):OnChanged(function(value)
-			-- Resume/profile setCombatTrio must not pin HRP during Event dive.
-			if value and (isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true) then
-				getgenv().SB2CombatAnchorOn = false
-				local prev = getgenv().SB2CombatAnchorConn
-				if prev then
-					pcall(function()
-						prev:Disconnect()
-					end)
-					getgenv().SB2CombatAnchorConn = nil
-				end
-				applyCombatAnchor(false)
-				task.defer(function()
-					local t = Toggles.CombatAnchor
-					if type(t) == 'table' and type(t.SetValue) == 'function' and t.Value == true then
-						t:SetValue(false)
+			Tooltip = 'Wave Defense: turns Killaura off for wave 75 only and back on when wave 76 starts.',
+		})
+		task.spawn(function()
+			-- Once per run, so a manual change during wave 75 sticks.
+			local firedThisRun = false
+			local turnedOffByUs = false
+			while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
+				local wave = workspace:GetAttribute('Wave')
+				local t = Toggles.AutoAttack
+				local canSet = type(t) == 'table' and type(t.SetValue) == 'function'
+				if typeof(wave) ~= 'number' or wave < KILLAURA_OFF_WAVE then
+					firedThisRun = false
+					turnedOffByUs = false
+				elseif wave == KILLAURA_OFF_WAVE then
+					if not firedThisRun and isToggleOn('KillauraOffWave75') then
+						firedThisRun = true
+						if canSet and t.Value == true then
+							t:SetValue(false)
+							turnedOffByUs = true
+							pcall(function()
+								Library:Notify(('Killaura off — wave %d'):format(wave), 5)
+							end)
+						end
 					end
-				end)
-				return
-			end
-			getgenv().SB2CombatAnchorOn = value == true
-			local prev = getgenv().SB2CombatAnchorConn
-			if prev then
-				pcall(function()
-					prev:Disconnect()
-				end)
-				getgenv().SB2CombatAnchorConn = nil
-			end
-			if not value then
-				getgenv().SB2AnchorHoldUntil = 0
-				-- Cancel any active TP pin loop — it re-sets Anchored=true every Heartbeat
-				-- and leaves you floating after turning Anchor off.
-				getgenv().SB2TpPinGen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
-				getgenv().SB2TpPinActive = false
-				getgenv().SB2TpPinCFrame = nil
-				getgenv().SB2TpPinUntil = 0
-				applyCombatAnchor(false)
-				pcall(function()
-					local model = getMyCharacterModel() or LocalPlayer.Character
-					local root = model
-						and (model:FindFirstChild('HumanoidRootPart') or model:FindFirstChild('UpperTorso'))
-					local hum = model and model:FindFirstChildOfClass('Humanoid')
-					if root and root:IsA('BasePart') then
-						root.Anchored = false
-						root.AssemblyLinearVelocity = Vector3.zero
-						root.AssemblyAngularVelocity = Vector3.zero
-					end
-					if hum then
-						hum.PlatformStand = false
+				elseif turnedOffByUs then
+					turnedOffByUs = false
+					if canSet and t.Value ~= true then
+						t:SetValue(true)
 						pcall(function()
-							hum:ChangeState(Enum.HumanoidStateType.Freefall)
+							Library:Notify(('Killaura back on — wave %d'):format(wave), 5)
 						end)
 					end
-				end)
-				return
+				end
+				task.wait(1)
 			end
-			-- Boss-route / TP pin: do NOT open an unanchor window — that drops you into the floor.
-			if getgenv().SB2TpPinActive == true or getgenv().SB2BossRouteWanted == true then
-				getgenv().SB2AnchorHoldUntil = 0
-			else
-				holdCombatAnchor(0.5)
-			end
-			applyCombatAnchor(true)
-			-- NO Heartbeat soft-lock. Probe: Anchor heartbeat/scans were ~16fps.
-			-- HelperMob is one-shot; DescendantAdded covers new parts; push snap is optional via TP pin only.
-			getgenv().SB2CombatAnchorConn = nil
 		end)
+
+		CombatBox:AddToggle('AutoReviveHearts', {
+			Text = 'Auto revive (hearts)',
+			Default = true,
+			Tooltip = 'Wave Defense: presses the red Revive button when you die, spending 1 heart. Never presses it at 0 hearts (that is the paid revive).',
+		})
+		task.spawn(function()
+			local lastTry = 0
+			while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
+				task.wait(0.5)
+				if not isToggleOn('AutoReviveHearts') or os.clock() - lastTry < 2 then
+					continue
+				end
+				local lives = LocalPlayer:GetAttribute('Lives')
+				if typeof(lives) ~= 'number' or lives <= 0 then
+					continue
+				end
+				local frame = nil
+				pcall(function()
+					frame = LocalPlayer.PlayerGui.CardinalUI.PlayerUI.Popups.WaveDefense.ReviveFrame
+				end)
+				local btn = frame and frame:FindFirstChild('Options') and frame.Options:FindFirstChild('Revive')
+				if not (frame and frame.Visible and btn and btn.Text == 'Revive') then
+					continue
+				end
+				lastTry = os.clock()
+				task.spawn(function()
+					local ok, res = pcall(function()
+						return game:GetService('ReplicatedStorage').Function:InvokeServer('UniqueFloorTypes', { 'WaveDefense', 'Revive' })
+					end)
+					if ok and res then
+						pcall(function()
+							frame.Visible = false
+						end)
+						pcall(function()
+							Library:Notify(('Auto revived — %d heart(s) left'):format(math.max(0, lives - 1)), 4)
+						end)
+					else
+						warn('[PlayerTools] auto revive failed: ', ok and tostring(res) or res)
+					end
+				end)
+			end
+		end)
+
+		-- Combat Anchor toggle removed — TP pin / dive still use holdCombatAnchor internally.
+		getgenv().SB2CombatAnchorOn = false
+		pcall(applyCombatAnchor, false)
 
 		do
 			local compile = loadstring or load
@@ -12096,6 +12594,14 @@ local ok, err = pcall(function()
 								})
 							end
 							if ok then
+								task.defer(function()
+									task.wait(0.35)
+									pcall(function()
+										if type(getgenv().SB2EnforceUiOffStopsRuntime) == 'function' then
+											getgenv().SB2EnforceUiOffStopsRuntime()
+										end
+									end)
+								end)
 								break
 							end
 							warn('[AutoFloorDodge] init failed: ', result)
@@ -12106,6 +12612,18 @@ local ok, err = pcall(function()
 				end
 			end
 		end
+
+		task.defer(function()
+			if type(getgenv().SB2SkillReachRingStop) == 'function' then
+				pcall(getgenv().SB2SkillReachRingStop)
+			end
+			local ringFolder = workspace:FindFirstChild('SB2SkillReachRing')
+			if ringFolder then
+				pcall(function()
+					ringFolder:Destroy()
+				end)
+			end
+		end)
 
 		-- Soft reload: restore pose + combat toggles that teardown cleared.
 		task.defer(function()
@@ -12133,11 +12651,6 @@ local ok, err = pcall(function()
 					if type(pinTeleportCFrame) == 'function' then
 						pcall(pinTeleportCFrame, pin, 0.75)
 					end
-					if Toggles.CombatAnchor and type(Toggles.CombatAnchor.SetValue) == 'function' then
-						pcall(function()
-							Toggles.CombatAnchor:SetValue(true)
-						end)
-					end
 				else
 					-- Landing / walk: release HRP after a short settle.
 					task.delay(0.35, function()
@@ -12157,8 +12670,15 @@ local ok, err = pcall(function()
 			-- Teardown clears AA/skill; put them back if they were on.
 			task.defer(function()
 				if wantAA and Toggles.AutoAttack and type(Toggles.AutoAttack.SetValue) == 'function' then
-					pcall(function()
-						Toggles.AutoAttack:SetValue(true)
+					task.spawn(function()
+						local atk = Toggles.AutoAttack
+						if not atk.Value then
+							pcall(function()
+								atk:SetValue(true)
+							end)
+						elseif not killauraConnLive() then
+							pcall(startKillauraLoop)
+						end
 					end)
 				end
 				if wantSkill and Toggles.AutoSkill and type(Toggles.AutoSkill.SetValue) == 'function' then
@@ -12345,7 +12865,10 @@ local ok, err = pcall(function()
 
 		-- Only snap XZ to DarknerOrb on the event pad (see getgenv helper — no extra locals).
 		getgenv().SB2DiveUseDarknerOrbLock = function()
-			-- F5 only — new dungeons (The Between) must not XZ-snap to a distant orb.
+			-- Wave Defense / F5 darkness: orb present → always lock XZ to center.
+			if workspace:FindFirstChild('DarknerOrb') then
+				return true
+			end
 			local zfn = getgenv().SB2DiveFarmZone
 			local zone = type(zfn) == 'function' and zfn() or nil
 			return zone ~= nil and zone.bossSpawnName == 'ASpawnBoss'
@@ -12654,12 +13177,20 @@ local ok, err = pcall(function()
 					hum:SetStateEnabled(Enum.HumanoidStateType.Physics, true)
 					hum.PlatformStand = false
 					hum.AutoRotate = true
-					pcall(function()
-						hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-					end)
+					local st = hum:GetState()
+					if st == Enum.HumanoidStateType.Flying then
+						pcall(function()
+							if hum.FloorMaterial ~= Enum.Material.Air then
+								hum:ChangeState(Enum.HumanoidStateType.Running)
+							else
+								hum:ChangeState(Enum.HumanoidStateType.Freefall)
+							end
+						end)
+					end
 				end
 			end)
 		end
+		getgenv().SB2DiveSetFlyHumanoid = diveSetFlyHumanoid
 		local diveDashed = setmetatable({}, { __mode = 'k' })
 		local diveSeenAt = setmetatable({}, { __mode = 'k' })
 		local divePartSample = setmetatable({}, { __mode = 'k' })
@@ -13202,7 +13733,6 @@ local ok, err = pcall(function()
 							return
 						end
 						diveApplyNoclipParts()
-						diveReassertHold()
 						local hrp = getMyBringPart()
 						if hrp then
 							local clampVel = getgenv().SB2DiveClampVelocity
@@ -13284,6 +13814,10 @@ local ok, err = pcall(function()
 				diveSetFlyHumanoid(false)
 				getgenv().SB2DiveNoclipStepped = nil
 				getgenv().SB2DiveNoclipHeartbeat = nil
+				local clearHold = getgenv().SB2DiveClearHoldConns
+				if type(clearHold) == 'function' then
+					pcall(clearHold)
+				end
 			end
 			getgenv().SB2DiveSetNoclip = setDiveNoclip
 		end
@@ -13316,11 +13850,24 @@ local ok, err = pcall(function()
 			if typeof(lavaHoverY) == 'number' then
 				dest = Vector3.new(dest.X, math.max(dest.Y, lavaHoverY), dest.Z)
 			end
+			local bobHoldY = getgenv().SB2BobHoldY
+			if typeof(bobHoldY) == 'number' then
+				dest = Vector3.new(dest.X, math.max(dest.Y, bobHoldY), dest.Z)
+			end
 			if typeof(getgenv().SB2DarknerOrbXZ) == 'Vector3' then
 				dest = Vector3.new(getgenv().SB2DarknerOrbXZ.X, dest.Y, getgenv().SB2DarknerOrbXZ.Z)
 			end
 			if typeof(getgenv().SB2WendigoHold) == 'Vector3' then
 				dest = getgenv().SB2WendigoHold
+			end
+			local wdRiftHop = getgenv().SB2WdRiftHopGoal
+			if typeof(wdRiftHop) == 'Vector3' then
+				dest = Vector3.new(wdRiftHop.X, dest.Y, wdRiftHop.Z)
+			end
+			local rubCover = getgenv().SB2RubricatusCoverPos
+			local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
+			if typeof(rubCover) == 'Vector3' and os.clock() < rubUntil then
+				dest = rubCover
 			end
 			-- Reject absurd blinks (boss respawn / void) that explode physics.
 			local fromPos = hrp.Position
@@ -13354,6 +13901,16 @@ local ok, err = pcall(function()
 				if (dest - lastDiveWritePos).Magnitude < DIVE_WRITE_DEBOUNCE then
 					return true
 				end
+			end
+			if getgenv().SB2BobEscapeActive == true and typeof(getgenv().SB2BobHoldY) == 'number' then
+				writeOpts.noClamp = true
+				writeOpts.force = true
+			end
+			if getgenv().SB2LavaEscapeActive == true and typeof(getgenv().SB2LavaFightY) == 'number'
+				and not (typeof(rubCover) == 'Vector3' and os.clock() < rubUntil) then
+				dest = Vector3.new(dest.X, math.max(dest.Y, getgenv().SB2LavaFightY), dest.Z)
+				writeOpts.noClamp = true
+				writeOpts.force = true
 			end
 			local anchor = diveLastCluster
 			if not writeOpts.noClamp and anchor then
@@ -13533,8 +14090,36 @@ local ok, err = pcall(function()
 			return hrp and hrp.Parent ~= nil
 		end
 
+		local function diveFloorDodgeManagesY()
+			if typeof(getgenv().SB2LavaFightY) == 'number' or typeof(getgenv().SB2AeganatosFightY) == 'number' then
+				return true
+			end
+			if typeof(getgenv().SB2BobHoldY) == 'number' or typeof(getgenv().SB2LavaHoverY) == 'number' then
+				return true
+			end
+			if typeof(getgenv().SB2WdRiftHopGoal) == 'Vector3' then
+				return true
+			end
+			if typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3' then
+				local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
+				if os.clock() < rubUntil then
+					return true
+				end
+			end
+			return false
+		end
+
 		local function diveReassertHold()
-			if not getgenv().SB2DiveFarmOn and not isToggleOn('DiveFarm') then
+			-- Stale SB2DiveFarmOn without the UI toggle left hold loops pinning Y on story floors.
+			if not isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn ~= true then
+				if getgenv().SB2DiveFarmOn == true then
+					getgenv().SB2DiveFarmOn = false
+				end
+				pcall(diveClearHoldConns)
+				return
+			end
+			if sb2StoryFloorNoDiveHover() then
+				pcall(diveClearHoldConns)
 				return
 			end
 			local hrp = getMyBringPart()
@@ -13557,6 +14142,44 @@ local ok, err = pcall(function()
 			if typeof(pin) ~= 'Vector3' then
 				pin = getgenv().SB2DivePinPos
 			end
+			if not workspace:FindFirstChild('WaveDefenseStuff') then
+				getgenv().SB2WdRiftHopGoal = nil
+				getgenv().SB2WdRiftHopActive = false
+			end
+			local wdRiftHop = getgenv().SB2WdRiftHopGoal
+			if typeof(wdRiftHop) == 'Vector3' then
+				local py = pin and pin.Y or wdRiftHop.Y
+				pin = Vector3.new(wdRiftHop.X, py, wdRiftHop.Z)
+				diveHoldPos = pin
+				getgenv().SB2DivePinPos = pin
+			end
+			local rubCover = getgenv().SB2RubricatusCoverPos
+			local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
+			local rubCoverActive = typeof(rubCover) == 'Vector3' and os.clock() < rubUntil
+			if rubCoverActive then
+				pin = rubCover
+				diveHoldPos = pin
+				getgenv().SB2DivePinPos = pin
+			end
+			local bobY = getgenv().SB2BobHoldY
+			if getgenv().SB2BobEscapeActive == true and typeof(bobY) == 'number' then
+				local px = pin and pin.X or hrp.Position.X
+				local pz = pin and pin.Z or hrp.Position.Z
+				pin = Vector3.new(px, math.max(pin and pin.Y or bobY, bobY), pz)
+				diveHoldPos = pin
+				getgenv().SB2DivePinPos = pin
+			end
+			local lavaFightY = typeof(getgenv().SB2LavaFightY) == 'number' and getgenv().SB2LavaFightY
+				or typeof(getgenv().SB2LavaHoverY) == 'number' and getgenv().SB2LavaHoverY
+			local lavaLock = getgenv().SB2LavaEscapeActive == true and typeof(lavaFightY) == 'number'
+				and not rubCoverActive
+			if lavaLock then
+				local px = pin and pin.X or hrp.Position.X
+				local pz = pin and pin.Z or hrp.Position.Z
+				pin = Vector3.new(px, lavaFightY, pz)
+				diveHoldPos = pin
+				getgenv().SB2DivePinPos = pin
+			end
 			-- Toggle-on / roam gap: no write yet but fly hooks are live — pin here or gravity wins.
 			if typeof(pin) ~= 'Vector3' then
 				pin = hrp.Position
@@ -13565,16 +14188,18 @@ local ok, err = pcall(function()
 			end
 			local underMap = getgenv().SB2DiveUnderMap == true
 			local pos = hrp.Position
-			if not underMap then
+			if not underMap and not lavaLock then
 				pin = diveClampAboveArena(pin, pos.Y)
 				local groundY = divePreviewGroundY(pos)
 				if typeof(groundY) == 'number' then
 					local floorMin = groundY + 2
-					if pin.Y < floorMin then
-						pin = Vector3.new(pin.X, floorMin, pin.Z)
+					local targetY = math.max(pin.Y, floorMin)
+					if math.abs(targetY - pin.Y) > 0.45 then
+						pin = Vector3.new(pin.X, targetY, pin.Z)
 					end
-					if pos.Y < floorMin - 0.75 then
-						pin = Vector3.new(pos.X, math.max(pin.Y, floorMin + 4), pos.Z)
+					if pos.Y < floorMin - 0.35 then
+						-- Smooth lift — +4 stud jumps fought gravity and bobbed every frame.
+						pin = Vector3.new(pin.X, math.max(pin.Y, pos.Y + 1.25, floorMin), pin.Z)
 					end
 				end
 				diveHoldPos = pin
@@ -13599,13 +14224,26 @@ local ok, err = pcall(function()
 				end)
 				return
 			end
-			local needsSnap = fallingThrough or drift.Magnitude > 2.5 or math.abs(drift.Y) > 0.4
-			if needsSnap then
+			local floorDodgeY = diveFloorDodgeManagesY()
+			local yDriftGate = floorDodgeY and 1.35 or 0.55
+			local flatDrift = Vector3.new(drift.X, 0, drift.Z)
+			local needsSnapXZ = fallingThrough or flatDrift.Magnitude > 2.5
+			local needsSnapY = fallingThrough
+				or (floorDodgeY and math.abs(drift.Y) > yDriftGate)
+				or (not floorDodgeY and math.abs(drift.Y) > 2.25)
+			if needsSnapXZ or needsSnapY then
+				local snapDest = pin
+				if not needsSnapY then
+					snapDest = Vector3.new(pin.X, pos.Y, pin.Z)
+				elseif not needsSnapXZ then
+					snapDest = Vector3.new(pos.X, pin.Y, pos.Z)
+				end
 				local blinkFn = getgenv().SB2DiveBlinkTeleport
-				if drift.Magnitude > 18 and type(blinkFn) == 'function' then
-					blinkFn(hrp, pin, pin)
-				else
-					diveWriteCFrame(hrp, pin, nil, { force = true, noClamp = true, hoverHold = true })
+				local snapDrift = snapDest - pos
+				if snapDrift.Magnitude > 18 and type(blinkFn) == 'function' then
+					blinkFn(hrp, snapDest, snapDest)
+				elseif snapDrift.Magnitude > 0.08 then
+					diveWriteCFrame(hrp, snapDest, nil, { force = true, noClamp = true, hoverHold = true })
 				end
 			end
 			if shouldAnchor and not fallingThrough then
@@ -13617,6 +14255,10 @@ local ok, err = pcall(function()
 		end
 
 		local function diveEnsureHoldConns()
+			if not getgenv().SB2DiveFarmOn and not isToggleOn('DiveFarm') then
+				diveClearHoldConns()
+				return
+			end
 			if not diveHoldConn then
 				pcall(function()
 					RunService:UnbindFromRenderStep('SB2DiveHold')
@@ -13625,9 +14267,6 @@ local ok, err = pcall(function()
 					RunService:BindToRenderStep('SB2DiveHold', Enum.RenderPriority.Last.Value, diveReassertHold)
 				end)
 				diveHoldConn = true
-			end
-			if not diveStepConn then
-				diveStepConn = RunService.Stepped:Connect(diveReassertHold)
 			end
 		end
 		getgenv().SB2DiveEnsureHoldConns = diveEnsureHoldConns
@@ -13648,6 +14287,346 @@ local ok, err = pcall(function()
 				end)
 				diveStepConn = nil
 			end
+		end
+		getgenv().SB2DiveClearHoldConns = diveClearHoldConns
+
+		local SB2_CORE_PART = {
+			HumanoidRootPart = true,
+			UpperTorso = true,
+			LowerTorso = true,
+			Torso = true,
+			Head = true,
+		}
+
+		local function isWdInstanceWorld()
+			if workspace:FindFirstChild('WaveDefenseStuff') then
+				return true
+			end
+			if getgenv().SB2WaveDefensePlace == true then
+				return true
+			end
+			local pid = tonumber(game.PlaceId)
+			return pid == 540240728 or pid == 78945654064532 or pid == 580239979
+		end
+		getgenv().SB2IsWdInstanceWorld = isWdInstanceWorld
+
+		local function sb2StoryFloorNoDiveHover()
+			if isWdInstanceWorld() then
+				return false
+			end
+			return not isToggleOn('DiveFarm')
+		end
+
+		local function sb2StoryWalkActive()
+			if not sb2StoryFloorNoDiveHover() then
+				return false
+			end
+			if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
+				return false
+			end
+			-- Story floors: keep walk/physics cleanup even with Auto floor dodge.
+			-- Between / WD instances use hover pins — do not run story sanitizer there.
+			if isToggleOn('AutoFloorDodge') and getgenv().SB2AutoFloorDodgeOn == true and isWdInstanceWorld() then
+				return false
+			end
+			if getgenv().SB2TpPinActive == true then
+				return false
+			end
+			if typeof(getgenv().SB2DiveChaseGoal) == 'Vector3' then
+				return false
+			end
+			return true
+		end
+
+		local function sb2RestoreStoryWalkCollision()
+			if getgenv().SB2CombatAnchorOn == true or isToggleOn('CombatAnchor') then
+				return
+			end
+			if not isToggleOn('DiveFarm') and type(getgenv().SB2DiveSetNoclip) == 'function' then
+				pcall(getgenv().SB2DiveSetNoclip, false)
+			end
+			if type(getgenv().SB2DiveSetFlyHumanoid) == 'function' then
+				pcall(getgenv().SB2DiveSetFlyHumanoid, false)
+			end
+			pcall(getgenv().SB2SetAnchorPlayerNoclip, false)
+			pcall(getgenv().SB2DiveForceClip)
+			for _, key in ipairs({ 'SB2DiveNoclipStepped', 'SB2DiveNoclipHeartbeat' }) do
+				local c = getgenv()[key]
+				if c then
+					pcall(function()
+						c:Disconnect()
+					end)
+					getgenv()[key] = nil
+				end
+			end
+			getgenv().SB2DiveNoclipOn = false
+			getgenv().SB2DiveFlyOn = false
+			local model = getMyCharacterModel() or LocalPlayer.Character
+			if not model then
+				return
+			end
+			for _, p in ipairs(model:GetDescendants()) do
+				if p:IsA('BasePart') then
+					if p.CollisionGroup == 'SB2DiveNoclip' then
+						pcall(function()
+							p.CollisionGroup = 'Players'
+						end)
+					end
+					if SB2_CORE_PART[p.Name] then
+						p.CanCollide = true
+						p.CanTouch = true
+					end
+				end
+			end
+		end
+
+		local storyFloorYCache = { y = nil, at = 0, x = 0, z = 0 }
+
+		local function sb2StoryGroundY(hrp)
+			if not hrp then
+				return nil
+			end
+			local now = os.clock()
+			local pos = hrp.Position
+			if typeof(storyFloorYCache.y) == 'number' and (now - storyFloorYCache.at) < 0.4 then
+				local dx = pos.X - storyFloorYCache.x
+				local dz = pos.Z - storyFloorYCache.z
+				if (dx * dx + dz * dz) < 36 then
+					return storyFloorYCache.y
+				end
+			end
+			local fn = getgenv().SB2DivePreviewGroundY
+			local gy = type(fn) == 'function' and fn(pos) or nil
+			if typeof(gy) == 'number' then
+				storyFloorYCache.y = gy
+				storyFloorYCache.at = now
+				storyFloorYCache.x = pos.X
+				storyFloorYCache.z = pos.Z
+			end
+			return gy
+		end
+
+		local function diveEnsureIdlePhysics()
+			if sb2StoryFloorNoDiveHover() then
+				getgenv().SB2DiveFarmOn = false
+				getgenv().SB2DiveUnderMap = false
+				getgenv().SB2DivePinPos = nil
+				getgenv().SB2DiveChaseGoal = nil
+				getgenv().SB2BobHoldY = nil
+			end
+			local diving = isToggleOn('DiveFarm') and getgenv().SB2DiveFarmOn == true
+			local dodgeOn = isToggleOn('AutoFloorDodge') and getgenv().SB2AutoFloorDodgeOn == true
+			if diving then
+				return
+			end
+			if dodgeOn and isWdInstanceWorld() then
+				return
+			end
+			local staleFly = getgenv().SB2DiveNoclipOn == true
+				or getgenv().SB2DiveFlyOn == true
+				or getgenv().SB2DiveNoclipStepped ~= nil
+				or getgenv().SB2DiveNoclipHeartbeat ~= nil
+				or diveHoldConn
+				or diveStepConn
+			if staleFly then
+				local stop = getgenv().SB2StopDiveFarm
+				if type(stop) == 'function' then
+					pcall(function()
+						stop(false)
+					end)
+				elseif type(getgenv().SB2DiveSetNoclip) == 'function' then
+					pcall(getgenv().SB2DiveSetNoclip, false)
+				end
+				pcall(diveClearHoldConns)
+			end
+			if getgenv().SB2TpPinActive == true
+				and getgenv().SB2CombatAnchorOn ~= true
+				and not isToggleOn('CombatAnchor')
+			then
+				getgenv().SB2TpPinGen = (tonumber(getgenv().SB2TpPinGen) or 0) + 1
+				getgenv().SB2TpPinActive = false
+				getgenv().SB2TpPinCFrame = nil
+				getgenv().SB2TpPinUntil = 0
+			end
+			if getgenv().SB2CombatAnchorOn ~= true and not isToggleOn('CombatAnchor') then
+				getgenv().SB2AnchorLockCF = nil
+				getgenv().SB2AnchorHoldUntil = 0
+				getgenv().SB2DivePinPos = nil
+				getgenv().SB2BobHoldY = nil
+			end
+			if staleFly then
+				pcall(diveClearHoldConns)
+			end
+			pcall(function()
+				local hrp = getMyBringPart()
+				local model = getMyCharacterModel() or LocalPlayer.Character
+				local hum = model and model:FindFirstChildOfClass('Humanoid')
+				local align = getgenv().SB2DiveAlign
+				local hadFly = false
+				if hrp then
+					if diveLinVel and diveLinVel.Parent == hrp then
+						hadFly = true
+						diveLinVel.Parent = nil
+						diveLinVel.Attachment0 = nil
+						diveLinVel.VectorVelocity = Vector3.zero
+					end
+					if align and align.Parent == hrp then
+						hadFly = true
+						align.Parent = nil
+						align.Attachment0 = nil
+					end
+					if hrp.Anchored then
+						hadFly = true
+						hrp.Anchored = false
+					end
+				end
+				if hum and (hum.PlatformStand or hum:GetState() == Enum.HumanoidStateType.Flying) then
+					hadFly = true
+					if type(getgenv().SB2DiveSetFlyHumanoid) == 'function' then
+						pcall(getgenv().SB2DiveSetFlyHumanoid, false)
+					else
+						hum.PlatformStand = false
+						hum.AutoRotate = true
+						pcall(function()
+							hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+							hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+							hum:SetStateEnabled(Enum.HumanoidStateType.Physics, true)
+						end)
+					end
+				end
+				-- Only hard-zero when removing dive fly — not every idle tick (fought walk anim = Y bob).
+				if hadFly and hrp then
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+				end
+			end)
+			if sb2StoryWalkActive() then
+				pcall(sb2RestoreStoryWalkCollision)
+			end
+		end
+		getgenv().SB2DiveEnsureIdlePhysics = diveEnsureIdlePhysics
+		getgenv().SB2StoryFloorNoDiveHover = sb2StoryFloorNoDiveHover
+		getgenv().SB2RestoreStoryWalkCollision = sb2RestoreStoryWalkCollision
+
+		local function sb2StoryIdleSanitize()
+			if not getgenv()[CONFIG.GenvKey] then
+				return
+			end
+			if workspace:FindFirstChild('WaveDefenseStuff') then
+				return
+			end
+			if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
+				return
+			end
+			if isToggleOn('AutoFloorDodge') and getgenv().SB2AutoFloorDodgeOn == true and isWdInstanceWorld() then
+				return
+			end
+			if getgenv().SB2CombatAnchorOn == true or isToggleOn('CombatAnchor') then
+				return
+			end
+			pcall(function()
+				RunService:UnbindFromRenderStep('SB2DiveHold')
+			end)
+			pcall(diveClearHoldConns)
+			local model = getMyCharacterModel() or LocalPlayer.Character
+			local hrp = model and model:FindFirstChild('HumanoidRootPart')
+			local hum = model and model:FindFirstChildOfClass('Humanoid')
+			if hrp then
+				pcall(function()
+					if diveLinVel and diveLinVel.Parent == hrp then
+						diveLinVel.Parent = nil
+						diveLinVel.Attachment0 = nil
+						diveLinVel.VectorVelocity = Vector3.zero
+					end
+					local diveAlign = getgenv().SB2DiveAlign
+					if diveAlign and diveAlign.Parent == hrp then
+						diveAlign.Parent = nil
+						diveAlign.Attachment0 = nil
+					end
+				end)
+				if hrp.Anchored then
+					hrp.Anchored = false
+				end
+			end
+			if hum and (hum.PlatformStand or hum:GetState() == Enum.HumanoidStateType.Flying) then
+				if type(getgenv().SB2DiveSetFlyHumanoid) == 'function' then
+					pcall(getgenv().SB2DiveSetFlyHumanoid, false)
+				else
+					hum.PlatformStand = false
+					hum.AutoRotate = true
+				end
+			end
+			if sb2StoryWalkActive() then
+				pcall(sb2RestoreStoryWalkCollision)
+			end
+		end
+		getgenv().SB2StoryIdleSanitize = sb2StoryIdleSanitize
+
+		task.defer(function()
+			pcall(diveEnsureIdlePhysics)
+			if sb2StoryWalkActive() then
+				pcall(sb2RestoreStoryWalkCollision)
+			end
+			pcall(sb2StoryIdleSanitize)
+		end)
+		do
+			local prevGuard = getgenv().SB2StoryIdleGuardConn
+			if prevGuard then
+				pcall(function()
+					prevGuard:Disconnect()
+				end)
+				getgenv().SB2StoryIdleGuardConn = nil
+			end
+			local prevStep = getgenv().SB2StoryFloorStepConn
+			if prevStep then
+				pcall(function()
+					prevStep:Disconnect()
+				end)
+				getgenv().SB2StoryFloorStepConn = nil
+			end
+			local guardAcc = 0
+			getgenv().SB2StoryIdleGuardConn = RunService.Heartbeat:Connect(function(dt)
+				if not sb2StoryWalkActive() then
+					guardAcc = 0
+					return
+				end
+				guardAcc += dt
+				if guardAcc < 1.25 then
+					return
+				end
+				guardAcc = 0
+				pcall(sb2StoryIdleSanitize)
+			end)
+			local function hookStoryJumpPinBreak(char)
+				local hum = char and char:FindFirstChildOfClass('Humanoid')
+				if not hum then
+					return
+				end
+				hum.StateChanged:Connect(function(_, new)
+					if new ~= Enum.HumanoidStateType.Jumping and new ~= Enum.HumanoidStateType.Freefall then
+						return
+					end
+					cancelTpPinForAir()
+					local hrp = char:FindFirstChild('HumanoidRootPart')
+					local lock = getgenv().SB2AnchorLockCF
+					if hrp and typeof(lock) == 'CFrame' then
+						if math.abs(lock.Position.Y - hrp.Position.Y) > 3.5 then
+							getgenv().SB2AnchorLockCF = nil
+							getgenv().SB2AnchorHoldUntil = 0
+						end
+					end
+					if movementPinCombatActive() then
+						return
+					end
+					breakSoftMovementPin()
+				end)
+			end
+			pcall(function()
+				if LocalPlayer.Character then
+					hookStoryJumpPinBreak(LocalPlayer.Character)
+				end
+				LocalPlayer.CharacterAdded:Connect(hookStoryJumpPinBreak)
+			end)
 		end
 
 		local function diveApplyCFrame(hrp, dest)
@@ -14895,6 +15874,11 @@ local ok, err = pcall(function()
 			if not DIVE_CIRCLE_DODGE or typeof(hrpPos) ~= 'Vector3' then
 				return nil
 			end
+			local lavaPinY = typeof(getgenv().SB2LavaFightY) == 'number' and getgenv().SB2LavaFightY
+				or typeof(getgenv().SB2LavaHoverY) == 'number' and getgenv().SB2LavaHoverY
+			if lavaPinY then
+				fightY = lavaPinY
+			end
 			local now = os.clock()
 			local diveFarmActive = getgenv().SB2DiveFarmOn == true
 				and type(isToggleOn) == 'function'
@@ -15046,7 +16030,20 @@ local ok, err = pcall(function()
 				end
 				return false
 			end
-			if not covered(me.X, me.Z, 2.5) then
+			local FLOOR_DODGE_INSIDE_PAD = 2.5
+			local FLOOR_DODGE_LEAD_PAD = 16
+			local function circleThreatPad(pad)
+				for i = 1, #circles do
+					local c = circles[i]
+					local fx, fz = me.X - c.x, me.Z - c.z
+					local need = c.r + pad
+					if fx * fx + fz * fz < need * need then
+						return true
+					end
+				end
+				return false
+			end
+			if not circleThreatPad(FLOOR_DODGE_LEAD_PAD) then
 				if diveFarmActive then
 					diveAoeGoal = nil
 				else
@@ -15088,7 +16085,7 @@ local ok, err = pcall(function()
 				best = clampNearCluster(best, cluster, DIVE_DODGE_RING)
 			end
 			local stickyGoal = diveFarmActive and diveAoeGoal or getgenv().SB2FloorDodgeGoal
-			if typeof(stickyGoal) == 'Vector3' and not covered(stickyGoal.X, stickyGoal.Z, 2.5) then
+			if typeof(stickyGoal) == 'Vector3' and not covered(stickyGoal.X, stickyGoal.Z, FLOOR_DODGE_INSIDE_PAD) then
 				local dx = stickyGoal.X - best.X
 				local dz = stickyGoal.Z - best.Z
 				if (dx * dx + dz * dz) < 36 then
@@ -15218,6 +16215,7 @@ local ok, err = pcall(function()
 			end
 			return pos, needDash, dashDir, chargeThreat
 		end
+		getgenv().SB2TelegraphEscape = telegraphEscape
 
 		local function diveTryDash(hrp, dir)
 			return
@@ -15225,6 +16223,14 @@ local ok, err = pcall(function()
 
 		local function stopDiveFarm(restore)
 			local wasOn = getgenv().SB2DiveFarmOn == true
+			local noclipActive = getgenv().SB2DiveNoclipOn == true
+			local hasThread = getgenv().SB2DiveFarmThread ~= nil
+			local hasConn = getgenv().SB2DiveFarmConn ~= nil
+			if not wasOn and not noclipActive and not hasThread and not hasConn and not diveHoldConn then
+				getgenv().SB2DiveFarmOn = false
+				pcall(diveClearHoldConns)
+				return
+			end
 			getgenv().SB2DiveFarmOn = false
 			getgenv().SB2DiveUnderMap = false
 			getgenv().SB2DivePinPos = nil
@@ -15237,6 +16243,9 @@ local ok, err = pcall(function()
 			diveNukeCooldownUntil = 0
 			diveNukeAnchor = nil
 			diveClearHoldConns()
+			if type(getgenv().SB2DiveEnsureIdlePhysics) == 'function' then
+				pcall(getgenv().SB2DiveEnsureIdlePhysics)
+			end
 			pcall(function()
 				local hrp = getMyBringPart()
 				if hrp then
@@ -15370,18 +16379,12 @@ local ok, err = pcall(function()
 				if not t or type(t.SetValue) ~= 'function' then
 					return
 				end
-				-- Toggle can stay true while Heartbeat conn died — vacuum then never hits.
-				if t.Value == true and getgenv().SB2AutoAttackConn == nil then
-					t:SetValue(false)
-				end
 				if not t.Value then
 					t:SetValue(true)
+				elseif type(getgenv().SB2KillauraNeedsStart) == 'function' and getgenv().SB2KillauraNeedsStart() then
+					pcall(startKillauraLoop)
 				else
 					getgenv().SB2AutoAttackOn = true
-					if getgenv().SB2AutoAttackConn == nil then
-						t:SetValue(false)
-						t:SetValue(true)
-					end
 				end
 			end)
 			applyCombatAnchor(false)
@@ -16439,7 +17442,12 @@ local ok, err = pcall(function()
 				local useOrb = getgenv().SB2DiveUseDarknerOrbLock
 				local darknerOrb = diveDarknerOrbPos()
 				if darknerOrb and type(useOrb) == 'function' and useOrb() then
-					lockedPos = Vector3.new(darknerOrb.X, lockedPos.Y, darknerOrb.Z)
+					local orbStand = typeof(getgenv().SB2DarknerOrbStandY) == 'number' and getgenv().SB2DarknerOrbStandY
+					if orbStand then
+						stickyFightY = orbStand
+						approachY = orbStand
+					end
+					lockedPos = Vector3.new(darknerOrb.X, stickyFightY, darknerOrb.Z)
 					approach = Vector3.new(darknerOrb.X, approachY, darknerOrb.Z)
 					diveLastCluster = lockedPos
 				end
@@ -16608,6 +17616,9 @@ local ok, err = pcall(function()
 							diveNukeAnchor = nil
 						end
 						diveNukeUntil = os.clock() + DIVE_NUKE_HOLD
+						if mob and string.find(normBossKey(mob.Name), 'rubricatus', 1, true) then
+							getgenv().SB2RubricatusNukeUntil = os.clock() + 9
+						end
 						diveDebug('nuke-charge', tostring(nukeWhy))
 					end
 					local nukeFlee = os.clock() < diveNukeUntil
@@ -16625,20 +17636,57 @@ local ok, err = pcall(function()
 						and os.clock() < diveMendingUntil
 						and typeof(diveMendingPos) == 'Vector3'
 
+					-- Rubricatus nuke: blink behind spawned pillar (not 16-stud beam shuffle).
+					do
+						local rkey = mob and normBossKey(mob.Name) or ''
+						if string.find(rkey, 'rubricatus', 1, true) then
+							local pillarsNear = type(getgenv().SB2RubricatusNukeTelegraph) == 'function'
+								and getgenv().SB2RubricatusNukeTelegraph(myPart.Position)
+							local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
+							if pillarsNear or os.clock() < rubUntil or nukeFlee then
+								local coverFn = getgenv().SB2RubricatusPillarCoverGoal
+								local snapFn = getgenv().SB2RubricatusSnapToCover
+								if type(coverFn) == 'function' then
+									local coverDest = coverFn(myPart.Position, stickyFightY, mob)
+									if typeof(coverDest) == 'Vector3' then
+										local bossFlat = getMobRoot(mob)
+										local look = bossFlat and bossFlat.Position or lockedPos
+										if type(snapFn) == 'function' then
+											pcall(snapFn, myPart, coverDest, look)
+										else
+											diveWriteCFrame(myPart, coverDest, look, {
+												force = true,
+												noClamp = true,
+											})
+										end
+										diveHoldPos = coverDest
+										getgenv().SB2DivePinPos = coverDest
+										task.wait(0.1)
+										continue
+									end
+								end
+							end
+						end
+					end
+
 					-- Floor circle telegraphs (DungeonLootr-style) + beam/charge dodge.
 					local dodgePos, needDash, dashDir, chargeThreat = nil, false, nil, false
 					if not fleeing and not underNow then
 						local circleGoal = diveAvoidFloorCircles(myPart.Position, stickyFightY, lockedPos)
 						if circleGoal and (os.clock() - lastDodgeAt) >= 0.28 then
+							local sideY = typeof(getgenv().SB2LavaFightY) == 'number' and getgenv().SB2LavaFightY
+								or typeof(getgenv().SB2LavaHoverY) == 'number' and getgenv().SB2LavaHoverY
+								or stickyFightY
+							local sideGoal = Vector3.new(circleGoal.X, sideY, circleGoal.Z)
 							local flatMove = Vector3.new(
-								circleGoal.X - myPart.Position.X,
+								sideGoal.X - myPart.Position.X,
 								0,
-								circleGoal.Z - myPart.Position.Z
+								sideGoal.Z - myPart.Position.Z
 							)
 							if flatMove.Magnitude >= 4 then
 								lastDodgeAt = os.clock()
 								diveDebug('circle-dodge', string.format('d=%.0f', flatMove.Magnitude))
-								diveStepToward(myPart, circleGoal, DIVE_TWEEN_SPEED * 1.2, lockedPos, fightClamp)
+								diveStepToward(myPart, sideGoal, DIVE_TWEEN_SPEED * 1.2, lockedPos, fightClamp)
 								task.wait(0.05)
 								continue
 							end
@@ -16653,6 +17701,15 @@ local ok, err = pcall(function()
 						nukeFlee = true
 						fleeing = true
 						wasNukeFlee = true
+					end
+					if dodgePos and not nukeFlee and not panic and (os.clock() - lastDodgeAt) >= 0.45 then
+						local rubShuffleBlock = mob
+							and string.find(normBossKey(mob.Name), 'rubricatus', 1, true)
+							and type(getgenv().SB2RubricatusNukeTelegraph) == 'function'
+							and getgenv().SB2RubricatusNukeTelegraph(myPart.Position)
+						if rubShuffleBlock then
+							dodgePos = nil
+						end
 					end
 					if dodgePos and not nukeFlee and not panic and (os.clock() - lastDodgeAt) >= 0.45 then
 						local flatMove = Vector3.new(dodgePos.X - myPart.Position.X, 0, dodgePos.Z - myPart.Position.Z)
@@ -16672,6 +17729,33 @@ local ok, err = pcall(function()
 
 					-- Low HP (<=25%) / charge nuke: hold under-map, spam heals until ~max HP.
 					if fleeing then
+						if nukeFlee and mob then
+							local rkey = normBossKey(mob.Name)
+							if string.find(rkey, 'rubricatus', 1, true) then
+								local coverFn = getgenv().SB2RubricatusPillarCoverGoal
+								local snapFn = getgenv().SB2RubricatusSnapToCover
+								if type(coverFn) == 'function' then
+									local coverDest = coverFn(myPart.Position, stickyFightY, mob)
+									if typeof(coverDest) == 'Vector3' then
+										diveDebug('rubricatus-cover', string.format('y=%.0f', coverDest.Y))
+										local bossFlat = getMobRoot(mob)
+										local look = bossFlat and bossFlat.Position or lockedPos
+										if type(snapFn) == 'function' then
+											pcall(snapFn, myPart, coverDest, look)
+										else
+											diveWriteCFrame(myPart, coverDest, look, {
+												force = true,
+												noClamp = true,
+											})
+										end
+										diveHoldPos = coverDest
+										getgenv().SB2DivePinPos = coverDest
+										task.wait(0.12)
+										continue
+									end
+								end
+							end
+						end
 						diveFocusStream(lockedPos)
 						tryCastEventHeal('under', hpFrac)
 						if not diveNukeAnchor or math.abs((diveNukeAnchor.Y or 0) - underHoldY) > 4 then
@@ -16869,8 +17953,20 @@ local ok, err = pcall(function()
 					stickPos = Vector3.new(stickPos.X, stickyFightY, stickPos.Z)
 					local orbNow = diveDarknerOrbPos()
 					if orbNow then
-						stickPos = Vector3.new(orbNow.X, stickyFightY, orbNow.Z)
-						lockedPos = Vector3.new(orbNow.X, lockedPos.Y, orbNow.Z)
+						local orbStand = typeof(getgenv().SB2DarknerOrbStandY) == 'number' and getgenv().SB2DarknerOrbStandY
+						local orbY = orbStand or stickyFightY
+						stickPos = Vector3.new(orbNow.X, orbY, orbNow.Z)
+						lockedPos = Vector3.new(orbNow.X, orbY, orbNow.Z)
+						stickyFightY = orbY
+					end
+					local wdRiftHop = getgenv().SB2WdRiftHopGoal
+					if typeof(wdRiftHop) == 'Vector3' then
+						stickPos = Vector3.new(wdRiftHop.X, stickyFightY, wdRiftHop.Z)
+					end
+					local rubCover = getgenv().SB2RubricatusCoverPos
+					local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
+					if typeof(rubCover) == 'Vector3' and os.clock() < rubUntil then
+						stickPos = rubCover
 					end
 					if typeof(stickPos) == 'Vector3' then
 						diveHoldPos = stickPos
@@ -17060,7 +18156,13 @@ local ok, err = pcall(function()
 			-- Toggle watchdog only (farm work is the AutoFarm-style thread).
 			getgenv().SB2DiveFarmConn = RunService.Heartbeat:Connect(function()
 				if not isToggleOn('DiveFarm') then
-					stopDiveFarm(true)
+					if getgenv().SB2DiveFarmOn == true
+						or getgenv().SB2DiveNoclipOn == true
+						or getgenv().SB2DiveNoclipStepped ~= nil
+						or diveHoldConn
+					then
+						stopDiveFarm(true)
+					end
 					return
 				end
 				for _, plr in ipairs(Players:GetPlayers()) do
@@ -17212,7 +18314,7 @@ local ok, err = pcall(function()
 			end
 			diveFarmWatchdogStarted = true
 			task.spawn(function()
-				while getgenv()[CONFIG.GenvKey] do
+				while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
 					task.wait(1.1)
 					if isToggleOn('DiveFarm') then
 						if getgenv().SB2DiveFarmThread == nil or getgenv().SB2DiveFarmConn == nil then
@@ -17549,22 +18651,50 @@ local ok, err = pcall(function()
 		end
 		getgenv().SB2StopCombatRuntime = stopCombatRuntime
 
-		local disableCombatForPlayerJoin = function(joiner)
-			if not joiner or joiner == LocalPlayer or isOwnAlt(joiner) then
-				return
+		-- Force off while anyone not on OWN_ALT_USERIDS is in the server (Resume toggle may stay on).
+		local STRANGER_COMBAT_OFF = {
+			AutoAttack = true,
+			AutoSkill = true,
+			AutoSwing = true,
+			SupportSkill = true,
+			SupportBossOnly = true,
+			DiveFarm = true,
+			DiveAutoHeight = true,
+			AutoFloorDodge = true,
+			BossWaypointRoute = true,
+			BossComboEnable = true,
+		}
+
+		local function forceAllCombatOffForStrangers(reason, notifyJoiner)
+			local strangers = type(getgenv().SB2OtherPlayersPresent) == 'function'
+					and getgenv().SB2OtherPlayersPresent()
+				or otherPlayersPresent()
+			if not strangers then
+				getgenv().SB2StrangerCombatLock = false
+				return false
 			end
-			-- Always kill Event dive — blatant while strangers are here.
-			local diveWasOn = false
-			pcall(function()
-				local dive = Toggles.DiveFarm
-				if type(dive) == 'table' and dive.Value == true then
-					diveWasOn = true
-					if type(dive.SetValue) == 'function' then
-						dive:SetValue(false)
+			getgenv().SB2StrangerCombatLock = true
+			getgenv().SB2AutoAttackOn = false
+			getgenv().SB2AutoSkillOn = false
+			getgenv().SB2CombatAnchorOn = false
+			getgenv().SB2AutoFloorDodgeOn = false
+			getgenv().SB2WaveKillTargetOn = false
+			getgenv().SB2BossRouteWanted = false
+			local anyToggle = false
+			for name in pairs(STRANGER_COMBAT_OFF) do
+				pcall(function()
+					local toggle = Toggles[name]
+					if type(toggle) == 'table' and toggle.Value == true and type(toggle.SetValue) == 'function' then
+						toggle:SetValue(false)
+						anyToggle = true
 					end
-				end
-			end)
-			if getgenv().SB2DiveFarmOn or diveWasOn then
+				end)
+			end
+			if getgenv().SB2DiveFarmOn == true
+				or getgenv().SB2DiveNoclipOn == true
+				or getgenv().SB2DiveFarmThread
+				or getgenv().SB2DiveFarmConn
+			then
 				pcall(function()
 					local stopDive = getgenv().SB2StopDiveFarm
 					if type(stopDive) == 'function' then
@@ -17578,31 +18708,33 @@ local ok, err = pcall(function()
 						getgenv().SB2DiveFarmThread = nil
 					end
 				end)
-				pcall(function()
-					Library:Notify(('Event vacuum off — %s joined'):format(joiner.DisplayName or joiner.Name), 4)
-				end)
+				anyToggle = true
 			end
-			-- Always turn off the combat trio when a stranger joins.
-			-- Resume stays ON so we re-arm + TP once the server is empty again.
-			local changed = false
-			for _, name in ipairs({ 'AutoAttack', 'AutoSkill', 'CombatAnchor' }) do
-				local toggle = Toggles[name]
-				if type(toggle) == 'table' and toggle.Value == true and type(toggle.SetValue) == 'function' then
-					pcall(function()
-						toggle:SetValue(false)
-					end)
-					changed = true
+			pcall(function()
+				if type(getgenv().SB2SetBossWaypointRoute) == 'function' then
+					getgenv().SB2SetBossWaypointRoute(false)
 				end
-			end
-			getgenv().SB2AutoAttackOn = false
-			getgenv().SB2AutoSkillOn = false
-			getgenv().SB2CombatAnchorOn = false
+			end)
 			stopCombatRuntime(true)
-			if changed then
+			if notifyJoiner and anyToggle then
 				pcall(function()
-					Library:Notify(('Combat off — %s joined'):format(joiner.DisplayName or joiner.Name), 4)
+					Library:Notify(
+						('All combat off — %s joined (whitelist only)'):format(
+							notifyJoiner.DisplayName or notifyJoiner.Name
+						),
+						5
+					)
 				end)
 			end
+			return true
+		end
+		getgenv().SB2ForceCombatOffForStrangers = forceAllCombatOffForStrangers
+
+		local disableCombatForPlayerJoin = function(joiner)
+			if not joiner or joiner == LocalPlayer or isOwnAlt(joiner) then
+				return
+			end
+			forceAllCombatOffForStrangers('join', joiner)
 		end
 		do
 			local prev = getgenv().SB2CombatJoinDisableConn
@@ -17623,35 +18755,170 @@ local ok, err = pcall(function()
 			end)
 		end
 
+		local function healAutoAttackConnection(_reason)
+			if not isToggleOn('AutoAttack') then
+				return
+			end
+			local last = tonumber(getgenv().SB2AutoAttackHealAt) or 0
+			if os.clock() - last < 4 then
+				return
+			end
+			getgenv().SB2AutoAttackHealAt = os.clock()
+			if killauraConnLive() then
+				return
+			end
+			pcall(startKillauraLoop)
+		end
+		getgenv().SB2HealAutoAttackConnection = healAutoAttackConnection
+
+		local function healAutoSkillConnection()
+			if not isToggleOn('AutoSkill') then
+				return
+			end
+			local conn = getgenv().SB2AutoSkillOnlyConn
+			local live = false
+			if conn then
+				pcall(function()
+					live = conn.Connected == true
+				end)
+			end
+			if not live then
+				getgenv().SB2AutoSkillOnlyConn = nil
+				pcall(startAutoSkillLoop)
+			end
+		end
+
+		local function enforceUiOffStopsRuntime()
+			local function stopIfUiOff(toggleName, genvFlag, connKey, afterOff)
+				local toggle = Toggles[toggleName]
+				if type(toggle) ~= 'table' or toggle.Value == true then
+					return
+				end
+				if genvFlag then
+					getgenv()[genvFlag] = false
+				end
+				if connKey then
+					local conn = getgenv()[connKey]
+					if conn then
+						pcall(function()
+							conn:Disconnect()
+						end)
+						getgenv()[connKey] = nil
+					end
+				end
+				if type(afterOff) == 'function' then
+					pcall(afterOff)
+				end
+			end
+			stopIfUiOff('AutoFloorDodge', 'SB2AutoFloorDodgeOn', 'SB2AutoFloorDodgeConn')
+			stopIfUiOff('AutoAttack', 'SB2AutoAttackOn', 'SB2AutoAttackConn')
+			stopIfUiOff('AutoSkill', 'SB2AutoSkillOn', 'SB2AutoSkillOnlyConn')
+			stopIfUiOff('AutoSwing', nil, 'SB2AutoSwingConn')
+			if getgenv().SB2CombatAnchorOn == true or getgenv().SB2CombatAnchorConn then
+				getgenv().SB2CombatAnchorOn = false
+				local anc = getgenv().SB2CombatAnchorConn
+				if anc then
+					pcall(function()
+						anc:Disconnect()
+					end)
+					getgenv().SB2CombatAnchorConn = nil
+				end
+				pcall(applyCombatAnchor, false)
+			end
+		end
+		getgenv().SB2EnforceUiOffStopsRuntime = enforceUiOffStopsRuntime
+
 		-- Keep toggle UI in sync with live combat. SaveManager/display glitches can
 		-- show Default=false while AutoAttack/Anchor connections are still running.
 		task.spawn(function()
-			while getgenv()[CONFIG.GenvKey] do
-				task.wait(2)
+			while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
+				task.wait(2.5)
 				if getgenv().SB2ConfigLoading then
 					continue
 				end
 				pcall(function()
+					if getgenv().SB2StrangerCombatLock == true
+						or (type(getgenv().SB2OtherPlayersPresent) == 'function' and getgenv().SB2OtherPlayersPresent())
+					then
+						forceAllCombatOffForStrangers('sync-guard')
+						return
+					end
+					enforceUiOffStopsRuntime()
 					local diving = isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true
 					if diving then
 						getgenv().SB2CombatAnchorOn = false
 					end
-					local pairsOn = {
-						AutoAttack = getgenv().SB2AutoAttackOn == true,
-						AutoSkill = getgenv().SB2AutoSkillOn == true,
-						CombatAnchor = (not diving) and getgenv().SB2CombatAnchorOn == true,
-					}
-					for name, want in pairs(pairsOn) do
-						local toggle = Toggles[name]
-						if type(toggle) ~= 'table' then
-							continue
-						end
-						if want and toggle.Value ~= true and type(toggle.SetValue) == 'function' then
-							toggle:SetValue(true)
-						elseif want and toggle.Value == true and type(toggle.Display) == 'function' then
-							toggle:Display()
+					if not diving and not isToggleOn('DiveFarm') then
+						local needIdle = getgenv().SB2DiveNoclipOn == true
+							or getgenv().SB2DiveFlyOn == true
+							or getgenv().SB2DiveNoclipStepped ~= nil
+							or getgenv().SB2DiveNoclipHeartbeat ~= nil
+							or typeof(getgenv().SB2DivePinPos) == 'Vector3'
+							or typeof(getgenv().SB2BobHoldY) == 'number'
+						if needIdle then
+							if type(getgenv().SB2DiveEnsureIdlePhysics) == 'function' then
+								pcall(getgenv().SB2DiveEnsureIdlePhysics)
+							end
+						elseif type(getgenv().SB2StoryIdleSanitize) == 'function' then
+							pcall(getgenv().SB2StoryIdleSanitize)
 						end
 					end
+					-- UI toggles are source of truth — stale genv flags used to re-flip Killaura/Anchor
+					-- and spam SetValue(false) every 2s (profile paint vs sync guard = jitter).
+					local function uiOn(name)
+						local toggle = Toggles[name]
+						return type(toggle) == 'table' and toggle.Value == true
+					end
+					getgenv().SB2AutoAttackOn = uiOn('AutoAttack')
+					getgenv().SB2AutoSkillOn = uiOn('AutoSkill')
+					getgenv().SB2CombatAnchorOn = false
+					if uiOn('AutoAttack') then
+						healAutoAttackConnection('sync-guard')
+					end
+					if uiOn('AutoSkill') then
+						healAutoSkillConnection()
+					end
+					if not uiOn('AutoAttack') then
+						local aa = getgenv().SB2AutoAttackConn
+						if aa then
+							pcall(function()
+								aa:Disconnect()
+							end)
+							getgenv().SB2AutoAttackConn = nil
+						end
+					end
+					if not uiOn('AutoSkill') then
+						local sk = getgenv().SB2AutoSkillOnlyConn
+						if sk then
+							pcall(function()
+								sk:Disconnect()
+							end)
+							getgenv().SB2AutoSkillOnlyConn = nil
+						end
+					end
+					if not getgenv().SB2CombatAnchorOn then
+						getgenv().SB2AnchorHoldUntil = 0
+					end
+					pcall(function()
+						local dodgeT = Toggles.AutoFloorDodge
+						if type(dodgeT) == 'table' and dodgeT.Value ~= true then
+							getgenv().SB2AutoFloorDodgeOn = false
+							local stop = getgenv().SB2StopAutoFloorDodgeLoop
+							if type(stop) == 'function' then
+								stop()
+							else
+								local dc = getgenv().SB2AutoFloorDodgeConn
+								if dc then
+									pcall(function()
+										dc:Disconnect()
+									end)
+									getgenv().SB2AutoFloorDodgeConn = nil
+								end
+							end
+						elseif type(dodgeT) == 'table' and dodgeT.Value == true then
+							getgenv().SB2AutoFloorDodgeOn = true
+						end
+					end)
 					local looksWiped = getgenv().SB2ProfileUiLooksWiped
 					local reapply = getgenv().SB2ReapplyProfileUi
 					if type(looksWiped) == 'function' and looksWiped() and type(reapply) == 'function' then
@@ -17795,10 +19062,10 @@ local ok, err = pcall(function()
 			end)
 		end
 
-		local COMBAT_TRIO = { 'AutoAttack', 'AutoSkill', 'CombatAnchor' }
+		local COMBAT_TRIO = { 'AutoAttack', 'AutoSkill' }
 		local WP_NONE = '(none)'
 
-		local function otherPlayersPresent()
+		local otherPlayersPresent = getgenv().SB2OtherPlayersPresent or function()
 			local isAlt = getgenv().SB2IsOwnAlt or isOwnAlt
 			for _, plr in ipairs(Players:GetPlayers()) do
 				if plr ~= LocalPlayer and not isAlt(plr) then
@@ -17822,7 +19089,6 @@ local ok, err = pcall(function()
 		local WD_HUB_LOBBY_OFF = {
 			AutoAttack = true,
 			AutoSkill = true,
-			CombatAnchor = true,
 			DiveFarm = true,
 			SupportSkill = true,
 			AutoSwing = true,
@@ -17853,7 +19119,10 @@ local ok, err = pcall(function()
 			end
 			setCombatTrio(false)
 			pcall(function()
-				if type(getgenv().SB2SyncDiveFarmFromToggle) == 'function' then
+				local stopDive = getgenv().SB2StopDiveFarm
+				if type(stopDive) == 'function' then
+					stopDive(true)
+				elseif type(getgenv().SB2SyncDiveFarmFromToggle) == 'function' then
 					getgenv().SB2SyncDiveFarmFromToggle()
 				end
 			end)
@@ -17868,6 +19137,9 @@ local ok, err = pcall(function()
 
 		local function setCombatTrio(enabled)
 			enabled = enabled == true
+			if enabled and otherPlayersPresent() then
+				enabled = false
+			end
 			if enabled
 				and type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
 				and getgenv().SB2IsWaveDefenseHubLobby()
@@ -17877,34 +19149,18 @@ local ok, err = pcall(function()
 			local diving = isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true
 			task.spawn(function()
 				for _, name in ipairs(COMBAT_TRIO) do
-					-- Event dive owns movement — never force Anchor on while diving.
-					if name == 'CombatAnchor' and (diving or (enabled and (isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true))) then
-						pcall(function()
-							local toggle = Toggles.CombatAnchor
-							if type(toggle) == 'table' and type(toggle.SetValue) == 'function' then
-								if toggle.Value == true then
-									toggle:SetValue(false)
-								end
-							end
-						end)
-						getgenv().SB2CombatAnchorOn = false
-						pcall(function()
-							if type(applyCombatAnchor) == 'function' then
-								applyCombatAnchor(false)
-							end
-						end)
-						continue
-					end
 					local toggle = Toggles[name]
 					if type(toggle) == 'table' and type(toggle.SetValue) == 'function' then
 						pcall(function()
-							-- Linoria skips OnChanged if the value is unchanged, so
-							-- combat loops never start after autoload paints the toggle.
-							-- Yield between flips so a deferred false cannot win the race.
-							if toggle.Value == enabled then
-								toggle:SetValue(not enabled)
+							if toggle.Value ~= enabled then
+								toggle:SetValue(enabled)
+							elseif enabled and name == 'AutoAttack' and type(getgenv().SB2KillauraNeedsStart) == 'function'
+								and getgenv().SB2KillauraNeedsStart()
+							then
+								pcall(startKillauraLoop)
+							elseif enabled and name == 'AutoSkill' and getgenv().SB2AutoSkillOnlyConn == nil then
+								pcall(startAutoSkillLoop)
 							end
-							toggle:SetValue(enabled)
 						end)
 					end
 				end
@@ -17918,34 +19174,21 @@ local ok, err = pcall(function()
 						end
 					end)
 				end
-				if diving or isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
-					getgenv().SB2CombatAnchorOn = false
-					pcall(function()
-						if type(applyCombatAnchor) == 'function' then
-							applyCombatAnchor(false)
-						end
-					end)
-				else
-					getgenv().SB2CombatAnchorOn = enabled
-				end
-				if not enabled then
-					pcall(function()
-						if type(applyCombatAnchor) == 'function' then
-							applyCombatAnchor(false)
-						end
-					end)
-				end
+				getgenv().SB2CombatAnchorOn = false
+				pcall(function()
+					if type(applyCombatAnchor) == 'function' then
+						applyCombatAnchor(false)
+					end
+				end)
 				if enabled then
 					task.defer(function()
-						local atk = Toggles.AutoAttack
-						if type(atk) == 'table' and atk.Value == true and getgenv().SB2AutoAttackConn == nil then
-							pcall(function()
-								atk:SetValue(false)
-							end)
-							task.wait(0.05)
-							pcall(function()
-								atk:SetValue(true)
-							end)
+						if isToggleOn('AutoAttack') and type(getgenv().SB2KillauraNeedsStart) == 'function'
+							and getgenv().SB2KillauraNeedsStart()
+						then
+							pcall(startKillauraLoop)
+						end
+						if isToggleOn('AutoSkill') and getgenv().SB2AutoSkillOnlyConn == nil then
+							pcall(startAutoSkillLoop)
 						end
 						if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
 							if type(getgenv().SB2SyncDiveFarmFromToggle) == 'function' then
@@ -17976,7 +19219,7 @@ local ok, err = pcall(function()
 					applyWaveDefenseHubLobbyQuiet('boot')
 				end)
 			end
-			while getgenv()[CONFIG.GenvKey] do
+			while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
 				task.wait(0.45)
 				local now = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
 					and getgenv().SB2IsWaveDefenseHubLobby()
@@ -17984,6 +19227,21 @@ local ok, err = pcall(function()
 					applyWaveDefenseHubLobbyQuiet('enter-lobby')
 				end
 				lastLobby = now
+			end
+		end)
+
+		-- Keep combat/farm automation off while strangers remain (profile/resume cannot turn it back on).
+		task.spawn(function()
+			while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
+				task.wait(0.55)
+				if getgenv().SB2ConfigLoading then
+					continue
+				end
+				if otherPlayersPresent() then
+					forceAllCombatOffForStrangers('poll')
+				else
+					getgenv().SB2StrangerCombatLock = false
+				end
 			end
 		end)
 		workspace:GetAttributeChangedSignal('NextPlaceId'):Connect(function()
@@ -18464,7 +19722,13 @@ local ok, err = pcall(function()
 				end
 				-- Resume owns the combat trio — turn them off with it.
 				setCombatTrio(false)
-				Library:Notify('Resume off — Auto skill / Auto attack / Combat Anchor off', 3)
+				pcall(function()
+					local dodge = Toggles.AutoFloorDodge
+					if type(dodge) == 'table' and type(dodge.SetValue) == 'function' and dodge.Value == true then
+						dodge:SetValue(false)
+					end
+				end)
+				Library:Notify('Resume off — Auto skill / Auto attack / Combat Anchor / Auto dodge off', 3)
 				return
 			end
 			getgenv().SB2StickyResumeWanted = true
@@ -25573,56 +26837,10 @@ local ok, err = pcall(function()
 			refreshDismantleNameList('', true)
 		end)
 
-		do
-			getgenv().SB2RapidInventoryUseBuild = nil
-			getgenv().SB2RapidInventoryUseStop = nil
-			getgenv().SB2RapidInventoryUseStart = nil
-			getgenv().SB2RapidInventoryUseItem = nil
-			local function loadRapidInventoryUseModule()
-				local paths = {
-					'PlayerTools/RapidInventoryUse.lua',
-					'RapidInventoryUse.lua',
-				}
-				for _, p in ipairs(paths) do
-					if type(readfile) == 'function' and type(isfile) == 'function' and isfile(p) then
-						local okRead, src = pcall(readfile, p)
-						if okRead and type(src) == 'string' and src ~= '' then
-							if not string.find(src, 'rapid-inventory-use-v2-shadow-only', 1, true) then
-								warn('[RapidInventoryUse] stale RapidInventoryUse.lua (expected v2 shadow-only) path=', p)
-							end
-							local fn, err = (loadstring or load)(src, p)
-							if fn then
-								local okRun, result = pcall(fn)
-								if okRun and type(result) == 'function' then
-									return result
-								end
-							else
-								warn('[RapidInventoryUse] compile failed: ', err)
-							end
-						end
-					end
-				end
-				return nil
-			end
-			local rapidInit = loadRapidInventoryUseModule()
-			if rapidInit then
-				local okRapid, rapidErr = pcall(rapidInit, {
-					Library = Library,
-					Options = Options,
-					InvTab = InvTab,
-					getInventoryFolder = getInventoryFolder,
-				})
-				if not okRapid then
-					warn('[RapidInventoryUse] init failed: ', rapidErr)
-					Library:Notify('Rapid stackable use failed to load — see console', 6)
-				end
-			else
-				warn('[RapidInventoryUse] RapidInventoryUse.lua not found in executor workspace')
-				InvTab:AddRightGroupbox('Shadow Shard rapid use'):AddLabel(
-					'Missing PlayerTools/RapidInventoryUse.lua — copy from repo, then reload Ataraxia.'
-				)
-			end
-		end
+		getgenv().SB2RapidInventoryUseBuild = nil
+		getgenv().SB2RapidInventoryUseStop = nil
+		getgenv().SB2RapidInventoryUseStart = nil
+		getgenv().SB2RapidInventoryUseItem = nil
 	end)()
 
 	-- ── Items: snapshot Database.Items so a patch only shows NEW names ──
@@ -26889,11 +28107,14 @@ local ok, err = pcall(function()
 				'|image=<gallery>',
 				iconFile .. ' | Icon',
 				inGameFile .. ' | In-game',
-				'</gallery>',
-				'|type=' .. typeLabel,
-				'|rarity=' .. rarity,
-				'|level=' .. (level and tostring(level) or ''),
 			}
+			if kind == 'Weapon' then
+				lines[#lines + 1] = wikiFileSlug(name) .. ' gif.gif | In-game effect'
+			end
+			lines[#lines + 1] = '</gallery>'
+			lines[#lines + 1] = '|type=' .. typeLabel
+			lines[#lines + 1] = '|rarity=' .. rarity
+			lines[#lines + 1] = '|level=' .. (level and tostring(level) or '')
 			if dmgText ~= '' then
 				if scalePer and scaledDmg then
 					lines[#lines + 1] = '|dmg=Damage based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
@@ -27215,8 +28436,11 @@ local ok, err = pcall(function()
 				'|image=<gallery>',
 				iconFile .. ' | Icon',
 				inGameFile .. ' | In-game',
-				'</gallery>',
 			}
+			if kind == 'Weapon' then
+				lines[#lines + 1] = baseName .. ' gif.gif | In-game effect'
+			end
+			lines[#lines + 1] = '</gallery>'
 			if kind == 'Weapon' and (folder:FindFirstChild('Untradeable') or folder:FindFirstChild('Untradable')) then
 				lines[#lines + 1] = '|cost=Untradable'
 			end
@@ -29256,7 +30480,7 @@ local ok, err = pcall(function()
 			end)
 
 			task.spawn(function()
-				while getgenv()[CONFIG.GenvKey] do
+				while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
 					task.wait(1.25)
 					local toggle = Toggles and Toggles.HiveEnabled
 					-- If the toggle object is gone (script reload), do not treat that as
@@ -29395,7 +30619,7 @@ local ok, err = pcall(function()
 		end)
 	end
 	task.spawn(function()
-		while getgenv()[CONFIG.GenvKey] do
+		while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
 			pcall(getgenv().SB2AntiAfkPaint)
 			task.wait(5)
 		end
@@ -30380,7 +31604,6 @@ local ok, err = pcall(function()
 			local wdLobbyOff = {
 				AutoAttack = true,
 				AutoSkill = true,
-				CombatAnchor = true,
 				DiveFarm = true,
 				SupportSkill = true,
 				AutoSwing = true,
@@ -30544,15 +31767,14 @@ local ok, err = pcall(function()
 			if type(getgenv().SB2AutoBlockAfterConfig) == 'function' then
 				pcall(getgenv().SB2AutoBlockAfterConfig)
 			end
-			-- Resume toggle is not enough — also restore Auto skill / attack / Anchor
-			-- when the server is solo. Never force combat on while strangers are here.
+			-- Resume toggle is not enough — also restore Auto skill / attack when solo.
 			if soloWanted == true then
 				task.spawn(function()
 					if otherPlayersPresent() then
 						setCombatTrio(false)
 						return
 					end
-					for _, name in ipairs({ 'AutoAttack', 'AutoSkill', 'CombatAnchor' }) do
+					for _, name in ipairs(COMBAT_TRIO) do
 						local want = lastProfileToggles[name]
 						if want == nil then
 							want = true
@@ -30560,10 +31782,15 @@ local ok, err = pcall(function()
 						local toggle = Toggles[name]
 						if want == true and type(toggle) == 'table' and type(toggle.SetValue) == 'function' then
 							pcall(function()
-							if toggle.Value == true then
-								toggle:SetValue(false)
-							end
-							toggle:SetValue(true)
+								if toggle.Value ~= true then
+									toggle:SetValue(true)
+								elseif name == 'AutoAttack' and type(getgenv().SB2KillauraNeedsStart) == 'function'
+									and getgenv().SB2KillauraNeedsStart()
+								then
+									pcall(startKillauraLoop)
+								elseif name == 'AutoSkill' and getgenv().SB2AutoSkillOnlyConn == nil then
+									pcall(startAutoSkillLoop)
+								end
 							end)
 						end
 					end
@@ -31740,6 +32967,10 @@ end
 -- Ancient Shrine / Blessings UI: game client can throw Vector3+nil when camera
 -- cache or tracked item is missing (common with 0 Catalyst Runes or no item selected).
 ;(function()
+	local RunService = game:GetService('RunService')
+	local Players = game:GetService('Players')
+	local LocalPlayerBless = Players.LocalPlayer
+
 	local function notifyBlessErr(msg)
 		warn('[PlayerTools] ' .. tostring(msg))
 		pcall(function()
@@ -31748,6 +32979,56 @@ end
 				lib:Notify(tostring(msg):sub(1, 140), 7)
 			end
 		end)
+	end
+
+	local function installStableBlessingCameraConn(gear)
+		if type(gear) ~= 'table' or type(gear.Connections) ~= 'table' then
+			return
+		end
+		local old = gear.Connections.CameraConnection
+		if old then
+			pcall(function()
+				old:Disconnect()
+			end)
+			gear.Connections.CameraConnection = nil
+		end
+		gear.TimeTracker = 0
+		gear.Connections.CameraConnection = RunService.RenderStepped:Connect(function(dt)
+			local shrineCam = gear.Camera
+			if not shrineCam then
+				return
+			end
+			local cam = workspace.CurrentCamera
+			if not cam then
+				return
+			end
+			cam.CameraType = Enum.CameraType.Scriptable
+			local step = tonumber(dt) or 0
+			local alpha = 1 - math.exp(-2 * step)
+			cam.CFrame = cam.CFrame:Lerp(shrineCam.CFrame, alpha)
+		end)
+	end
+
+	local function hookBlessingGearLifecycle(gear)
+		if type(gear) ~= 'table' or gear._SB2LifecycleHook == true then
+			return
+		end
+		local origOpen = gear.Open
+		if type(origOpen) == 'function' then
+			gear.Open = function(...)
+				getgenv().SB2BlessingMenuOpen = true
+				origOpen(...)
+				installStableBlessingCameraConn(gear)
+			end
+		end
+		local origClose = gear.Close
+		if type(origClose) == 'function' then
+			gear.Close = function(...)
+				getgenv().SB2BlessingMenuOpen = false
+				return origClose(...)
+			end
+		end
+		gear._SB2LifecycleHook = true
 	end
 
 	local function patchBlessingGear()
@@ -31763,6 +33044,7 @@ end
 		if not ok or type(gear) ~= 'table' then
 			return false
 		end
+		hookBlessingGearLifecycle(gear)
 		-- Older builds wrapped Open / AnimateOut in pcall. Those calls yield, so the
 		-- wrapper aborted the shrine menu and the button fell through to Upgrade UI.
 		if gear._SB2BlessPatch == true then
@@ -32039,9 +33321,42 @@ end
 	task.delay(1.5, runPatch)
 	task.delay(5, runPatch)
 	pcall(function()
-		game:GetService('Players').LocalPlayer.PlayerGui.ChildAdded:Connect(function(ch)
+		local pg = LocalPlayerBless:WaitForChild('PlayerGui', 8)
+		if not pg then
+			return
+		end
+		local function watchBlessGui(gui)
+			if not gui or not gui:IsA('ScreenGui') or gui.Name ~= 'Blessings' then
+				return
+			end
+			gui:GetPropertyChangedSignal('Enabled'):Connect(function()
+				getgenv().SB2BlessingMenuOpen = gui.Enabled == true
+				if gui.Enabled then
+					task.defer(function()
+						pcall(patchBlessingGear)
+						local RS = game:GetService('ReplicatedStorage')
+						local mod = RS:FindFirstChild('CardinalClient')
+						mod = mod and mod:FindFirstChild('MainModule')
+						mod = mod and mod:FindFirstChild('Services')
+						mod = mod and mod:FindFirstChild('BlessingGear')
+						if mod then
+							local ok, gear = pcall(require, mod)
+							if ok and type(gear) == 'table' then
+								installStableBlessingCameraConn(gear)
+							end
+						end
+					end)
+				end
+			end)
+		end
+		local existing = pg:FindFirstChild('Blessings')
+		if existing then
+			watchBlessGui(existing)
+		end
+		pg.ChildAdded:Connect(function(ch)
 			if ch and (ch.Name == 'Blessings' or ch.Name == 'NPCDialogue') then
 				task.defer(runPatch)
+				watchBlessGui(ch)
 			end
 		end)
 	end)
@@ -32146,7 +33461,9 @@ end
 				blessGui.Enabled = true
 			end
 		end
+		hookBlessingGearLifecycle(gear)
 		gear.Open(shrine)
+		installStableBlessingCameraConn(gear)
 		syncBlessingUiAfterOpen(gear)
 		return true, 'blessings'
 	end

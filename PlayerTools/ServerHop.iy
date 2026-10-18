@@ -35,7 +35,7 @@ pcall(function()
 end)
 
 -- Bump when Join panel click behavior changes (forces new floor rows / handlers).
-local SERVER_HOP_UI_VER = 6
+local SERVER_HOP_UI_VER = 7
 getgenv().SB2ServerHopUiVerExpected = SERVER_HOP_UI_VER
 if getgenv().SB2ServerHopUiVer ~= SERVER_HOP_UI_VER then
 	pcall(function()
@@ -937,9 +937,6 @@ local function fillServerList(list, rec, nextCursor, accumulated)
 end
 
 local function openServerBrowser(list, rec)
-	if type(getgenv().SB2ServerHopBrowseFloor) == 'function' then
-		return getgenv().SB2ServerHopBrowseFloor(list, rec)
-	end
 	if not list or not rec then
 		return false
 	end

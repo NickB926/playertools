@@ -7,6 +7,7 @@
 local Players = game:GetService('Players')
 local UserInputService = game:GetService('UserInputService')
 local RunService = game:GetService('RunService')
+local Lighting = game:GetService('Lighting')
 local TweenService = game:GetService('TweenService')
 local TextService = game:GetService('TextService')
 local GuiService = game:GetService('GuiService')
@@ -985,6 +986,162 @@ function Library:GetMaxZoomTarget()
 end
 
 ---------------------------------------------------------------------------
+-- Fullbright (Infinite Yield loopfb). Re-applies each frame while on.
+-- Opt out: CreateWindow{ Fullbright = false }. Persists in Ataraxia/fullbright.
+-- IY: add PlayerTools/Ataraxia.iy or use fullbright | loopfb | unloopfb commands.
+---------------------------------------------------------------------------
+local Fullbright = (function()
+	local api = {}
+	local FILE = 'Ataraxia/fullbright'
+
+	local function disconnectLoop()
+		local conn = getgenv().AtaraxiaFullbrightConn
+		if conn then
+			pcall(function()
+				conn:Disconnect()
+			end)
+		end
+		getgenv().AtaraxiaFullbrightConn = nil
+	end
+
+	local function captureSaved()
+		if type(getgenv().AtaraxiaSavedLighting) == 'table' then
+			return
+		end
+		getgenv().AtaraxiaSavedLighting = {
+			Brightness = Lighting.Brightness,
+			ClockTime = Lighting.ClockTime,
+			FogEnd = Lighting.FogEnd,
+			FogStart = Lighting.FogStart,
+			Ambient = Lighting.Ambient,
+			OutdoorAmbient = Lighting.OutdoorAmbient,
+			GlobalShadows = Lighting.GlobalShadows,
+		}
+	end
+
+	local function applyBright()
+		Lighting.Brightness = 2
+		Lighting.ClockTime = 14
+		Lighting.FogEnd = 100000
+		Lighting.FogStart = 0
+		Lighting.GlobalShadows = false
+		Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+	end
+
+	local function restoreSaved()
+		local s = getgenv().AtaraxiaSavedLighting
+		if type(s) ~= 'table' then
+			return
+		end
+		pcall(function()
+			Lighting.Brightness = s.Brightness
+			Lighting.ClockTime = s.ClockTime
+			Lighting.FogEnd = s.FogEnd
+			Lighting.FogStart = s.FogStart
+			Lighting.Ambient = s.Ambient
+			Lighting.OutdoorAmbient = s.OutdoorAmbient
+			Lighting.GlobalShadows = s.GlobalShadows
+		end)
+	end
+
+	local function readFileOn()
+		if type(isfile) == 'function' and type(readfile) == 'function' then
+			local ok, exists = pcall(isfile, FILE)
+			if ok and exists then
+				local rok, body = pcall(readfile, FILE)
+				if rok and tostring(body):lower():find('true', 1, true) then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local function writeFile(on)
+		if type(writefile) ~= 'function' then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+				makefolder('Ataraxia')
+			end
+		end)
+		pcall(writefile, FILE, on and 'true' or 'false')
+	end
+
+	local function bindLoop()
+		disconnectLoop()
+		if getgenv().AtaraxiaFullbrightOn ~= true then
+			return
+		end
+		applyBright()
+		getgenv().AtaraxiaFullbrightConn = RunService.RenderStepped:Connect(applyBright)
+	end
+
+	function api.set(on)
+		local want = on == true
+		local was = getgenv().AtaraxiaFullbrightOn == true
+		if want then
+			captureSaved()
+			getgenv().AtaraxiaFullbrightOn = true
+			bindLoop()
+		else
+			getgenv().AtaraxiaFullbrightOn = false
+			disconnectLoop()
+			restoreSaved()
+		end
+		if was ~= want then
+			writeFile(want)
+		end
+	end
+
+	function api.toggle()
+		api.set(not api.isOn())
+		return api.isOn()
+	end
+
+	function api.isOn()
+		return getgenv().AtaraxiaFullbrightOn == true
+	end
+
+	function api.tick()
+		if getgenv().AtaraxiaFullbrightOn == true then
+			applyBright()
+		end
+	end
+
+	function api.ensure()
+		if readFileOn() then
+			getgenv().AtaraxiaFullbrightOn = true
+			captureSaved()
+			bindLoop()
+		else
+			getgenv().AtaraxiaFullbrightOn = false
+		end
+	end
+
+	return api
+end)()
+
+function Library:SetFullbright(on)
+	if on == false or on == 'off' then
+		Fullbright.set(false)
+	else
+		Fullbright.set(true)
+	end
+	return Fullbright.isOn()
+end
+
+function Library:ToggleFullbright()
+	Fullbright.toggle()
+	return Fullbright.isOn()
+end
+
+function Library:IsFullbright()
+	return Fullbright.isOn()
+end
+
+---------------------------------------------------------------------------
 -- Hide Roblox "Gameplay Paused". The engine stall is not switchable from Lua;
 -- this only keeps the CoreGui banner off. Opt out: CreateWindow{ HideGameplayPaused = false }.
 -- Persists in Ataraxia/nopause. Stays armed across Unload like Anti-AFK.
@@ -1277,6 +1434,91 @@ function Library:AddNotifyToggle(box)
 	end)
 end
 
+function Library:AddFullbrightToggle(box)
+	if not box or type(box.AddToggle) ~= 'function' then
+		return
+	end
+	return box:AddToggle('ATA_Fullbright', {
+		Text = 'Fullbright',
+		Default = Fullbright.isOn(),
+		Tooltip = 'IY loopfb-style lighting pin. Saved in Ataraxia/fullbright. Chat: fullbright, loopfb, unloopfb.',
+	}):OnChanged(function(v)
+		Library:SetFullbright(v == true)
+	end)
+end
+
+function Library:SayIy(msg)
+	msg = tostring(msg or '')
+	if msg == '' then
+		return
+	end
+	pcall(function()
+		print('[Ataraxia] ' .. msg)
+	end)
+	pcall(function()
+		if type(notify) == 'function' then
+			notify(msg)
+		end
+	end)
+	pcall(function()
+		self:Notify(msg)
+	end)
+end
+
+function Library:BuildIyPlugin()
+	local lib = self
+	local function fbSay(on)
+		lib:SayIy('Fullbright ' .. (on and 'on' or 'off'))
+	end
+	local function setOn()
+		lib:SetFullbright(true)
+		fbSay(true)
+	end
+	local function setOff()
+		lib:SetFullbright(false)
+		fbSay(false)
+	end
+	return {
+		['PluginName'] = 'Ataraxia',
+		['PluginDescription'] = 'Shared Ataraxia chrome helpers (fullbright / loopfb). Uses PlayerTools when loaded.',
+		['Commands'] = {
+			['fullbright'] = {
+				['ListName'] = 'fullbright',
+				['Description'] = 'Enable loop fullbright (same as IY loopfb)',
+				['Aliases'] = { 'fb', 'bright' },
+				['Function'] = setOn,
+			},
+			['loopfb'] = {
+				['ListName'] = 'loopfb',
+				['Description'] = 'Enable loop fullbright (Ataraxia pin)',
+				['Aliases'] = { 'loopfullbright' },
+				['Function'] = setOn,
+			},
+			['fullbrightoff'] = {
+				['ListName'] = 'fullbrightoff',
+				['Description'] = 'Disable fullbright and restore saved lighting',
+				['Aliases'] = { 'fboff', 'unfullbright' },
+				['Function'] = setOff,
+			},
+			['unloopfb'] = {
+				['ListName'] = 'unloopfb',
+				['Description'] = 'Disable loop fullbright',
+				['Aliases'] = { 'noloopfb' },
+				['Function'] = setOff,
+			},
+			['fullbrighttoggle'] = {
+				['ListName'] = 'fullbrighttoggle',
+				['Description'] = 'Toggle fullbright on/off',
+				['Aliases'] = { 'fbtoggle', 'togglefb', 'loopfbtoggle' },
+				['Function'] = function()
+					local on = lib:ToggleFullbright()
+					fbSay(on)
+				end,
+			},
+		},
+	}
+end
+
 function Library:ListThemes()
 	local out = {}
 	for i, name in ipairs(THEME_ORDER) do
@@ -1396,6 +1638,7 @@ function Library:BuildSettingsTab(Window, info)
 	end
 
 	self:AddNotifyToggle(scriptBox)
+	self:AddFullbrightToggle(scriptBox)
 
 	scriptBox:AddDropdown('ATA_Theme', {
 		Text = 'Theme',
@@ -3413,6 +3656,9 @@ function Library:CreateWindow(info)
 	if info.HideGameplayPaused ~= false then
 		pcall(NoPause.ensure)
 	end
+	if info.Fullbright ~= false then
+		pcall(Fullbright.ensure)
+	end
 	-- Default Settings tab (Script + Profiles + theme). Opt out: SettingsTab = false.
 	if info.SettingsTab ~= false then
 		pcall(function()
@@ -3425,8 +3671,11 @@ function Library:CreateWindow(info)
 		end
 		pcall(Occlusion.tick)
 		pcall(MaxZoom.tick)
+		pcall(Fullbright.tick)
 	end))
 	return Window
 end
+
+getgenv().AtaraxiaLibraryApi = Library
 
 return Library
