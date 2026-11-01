@@ -5,7 +5,7 @@
 	Custom titles: local UIGradient / UIStroke / Icon / optional loops (client-only).
 ]]
 
-getgenv().SB2TitlingBuild = 'titling-alias-anim-v1'
+getgenv().SB2TitlingBuild = 'titling-switcher-v1'
 
 return function(env)
 	local WikiTab = env.WikiTab or env.ItemsTab
@@ -622,6 +622,171 @@ return function(env)
 		return names
 	end
 
+	local function listOwnedTitles()
+		local names = {}
+		local seen = {}
+		local function add(n)
+			if type(n) ~= 'string' or n == '' or n == NONE or seen[n] then
+				return
+			end
+			if VARIANT_BASE_HIDDEN[n] then
+				return
+			end
+			seen[n] = true
+			names[#names + 1] = n
+		end
+		local prof = getProfilesFolder() and getProfilesFolder():FindFirstChild(LocalPlayer.Name)
+		local tags = prof and prof:FindFirstChild('CosmeticTags')
+		if tags then
+			for _, child in ipairs(tags:GetChildren()) do
+				if child:IsA('BoolValue') then
+					if child.Value ~= false then
+						add(child.Name)
+					end
+				elseif child:IsA('ValueBase') or child:IsA('Folder') then
+					add(child.Name)
+				end
+			end
+		end
+		local cur = prof and prof:FindFirstChild('CurrentTag')
+		if cur and cur:IsA('ValueBase') then
+			local equipped = tostring(cur.Value or ''):gsub('^%s+', ''):gsub('%s+$', '')
+			if equipped ~= '' then
+				add(equipped)
+			end
+		end
+		if #names == 0 then
+			local ui = getCosmeticTagsUi()
+			if ui then
+				for _, child in ipairs(ui:GetChildren()) do
+					if child:IsA('GuiObject') and child.Name ~= 'UIPadding' and child.Name ~= 'UIListLayout' then
+						local locked = child:GetAttribute('Locked')
+							or child:GetAttribute('LockedTag')
+							or child:FindFirstChild('Lock', true)
+							or child:FindFirstChild('Locked', true)
+						if not locked then
+							add(child.Name)
+						end
+					end
+				end
+			end
+		end
+		table.sort(names, function(a, b)
+			return a:lower() < b:lower()
+		end)
+		return names
+	end
+
+	local function readEquippedTitle()
+		local prof = getProfilesFolder() and getProfilesFolder():FindFirstChild(LocalPlayer.Name)
+		local cur = prof and prof:FindFirstChild('CurrentTag')
+		if cur and cur:IsA('ValueBase') then
+			local equipped = tostring(cur.Value or ''):gsub('^%s+', ''):gsub('%s+$', '')
+			if equipped ~= '' then
+				return equipped
+			end
+		end
+		return nil
+	end
+
+	local function fireGuiButton(btn)
+		if not (btn and btn:IsA('GuiButton')) then
+			return false
+		end
+		pcall(function()
+			btn.Visible = true
+			btn.Active = true
+		end)
+		local ran = false
+		if type(getconnections) == 'function' then
+			pcall(function()
+				for _, sigName in ipairs({ 'Activated', 'MouseButton1Click', 'MouseButton1Down' }) do
+					local ok, cons = pcall(getconnections, btn[sigName])
+					if not (ok and type(cons) == 'table') then
+						continue
+					end
+					for _, c in ipairs(cons) do
+						pcall(function()
+							if c.Enabled == false and type(c.Enable) == 'function' then
+								c:Enable()
+							end
+						end)
+						pcall(function()
+							if type(c.Function) == 'function' then
+								c.Function()
+								ran = true
+							end
+						end)
+						pcall(function()
+							if type(c.fn) == 'function' then
+								c.fn()
+								ran = true
+							end
+						end)
+						pcall(function()
+							if type(c.Fire) == 'function' then
+								c:Fire()
+							end
+						end)
+					end
+				end
+			end)
+		end
+		if type(firesignal) == 'function' then
+			pcall(function()
+				firesignal(btn.Activated)
+				ran = true
+			end)
+			pcall(function()
+				firesignal(btn.MouseButton1Click)
+				ran = true
+			end)
+		end
+		pcall(function()
+			btn:Activate()
+			ran = true
+		end)
+		return ran
+	end
+
+	local function findRowButton(row)
+		if not row then
+			return nil
+		end
+		if row:IsA('GuiButton') then
+			return row
+		end
+		for _, child in ipairs(row:GetDescendants()) do
+			if child:IsA('GuiButton') then
+				return child
+			end
+		end
+		return nil
+	end
+
+	local function tryEquipTitleRemote(titleName)
+		local ev = ReplicatedStorage:FindFirstChild('Event')
+		local fn = ReplicatedStorage:FindFirstChild('Function')
+		local actions = { 'SetTag', 'ChangeTag', 'EquipTag', 'SetCurrentTag' }
+		for _, action in ipairs(actions) do
+			if ev and ev:IsA('RemoteEvent') then
+				pcall(function()
+					ev:FireServer('Settings', { action, titleName })
+				end)
+			end
+			if fn and fn:IsA('RemoteFunction') then
+				pcall(function()
+					fn:InvokeServer('Settings', { action, titleName })
+				end)
+			end
+			task.wait(0.15)
+			if readEquippedTitle() == titleName then
+				return true
+			end
+		end
+		return false
+	end
+
 	local function syncStaffIndexForPreview(previewPlayerName, staffIndex)
 		if type(staffIndex) ~= 'number' then
 			return
@@ -829,9 +994,17 @@ return function(env)
 			label:SetAttribute('CommunityStaffIndex', variant.staffIndex)
 			label:SetAttribute('StaffIndex', variant.staffIndex)
 		end
+		-- AliasEffect only starts ShakeText / roar loops on Visible *changes*.
+		-- Copied nameplates already have Visible=true, so force a rising edge.
+		label:SetAttribute('Visible', false)
 		pcall(function()
 			CollectionService:AddTag(label, 'AliasEffect')
 			CollectionService:AddTag(label, 'VisibilityTracker')
+		end)
+		task.defer(function()
+			if label.Parent then
+				label:SetAttribute('Visible', true)
+			end
 		end)
 		return true
 	end
@@ -1225,10 +1398,63 @@ return function(env)
 			return activeFx[label] == fx and fx.token == token and label.Parent ~= nil
 		end
 
-		local wantSlide = anim == 'Gradient slide' or anim == 'Full' or anim == 'Cursed Full'
-		local wantPulse = anim == 'Icon pulse' or anim == 'Full' or anim == 'Cursed Full'
-		local wantSparks = anim == 'Sparks' or anim == 'Full' or anim == 'Cursed Full'
+		local wantRoar = anim == 'Roar shake'
+		local wantSlide = not wantRoar and (anim == 'Gradient slide' or anim == 'Full' or anim == 'Cursed Full')
+		local wantPulse = not wantRoar and (anim == 'Icon pulse' or anim == 'Full' or anim == 'Cursed Full')
+		local wantSparks = not wantRoar and (anim == 'Sparks' or anim == 'Full' or anim == 'Cursed Full')
 		local wantGlitch = anim == 'Glitch text' or anim == 'Cursed' or anim == 'Cursed Full'
+
+		if wantRoar then
+			local origPos = label.Position
+			local roarAsset = sparkAsset
+			if roarAsset == DEFAULT_SPARK_IMAGE or roarAsset == '' then
+				roarAsset = 'rbxassetid://82033827591449'
+			end
+			task.defer(function()
+				local t0 = os.clock()
+				local conn = game:GetService('RunService').RenderStepped:Connect(function()
+					if not alive() then
+						return
+					end
+					local wave = math.sin((os.clock() - t0) * 45) * 1.1
+					label.Position = origPos + UDim2.fromOffset(wave, wave)
+				end)
+				table.insert(fx.conns, conn)
+			end)
+			task.defer(function()
+				while alive() do
+					local roar = Instance.new('ImageLabel')
+					roar.Name = 'Roar'
+					roar.BackgroundTransparency = 1
+					roar.Image = roarAsset
+					roar.AnchorPoint = Vector2.new(0.5, 0.5)
+					roar.Position = UDim2.fromScale(0.5, 0.5)
+					roar.Size = UDim2.fromScale(0, 0)
+					roar.ZIndex = 0
+					local rot0 = math.random(0, 360)
+					roar.Rotation = rot0
+					roar.Parent = label
+					local srcGrad = label:FindFirstChildWhichIsA('UIGradient')
+					if srcGrad then
+						pcall(function()
+							srcGrad:Clone().Parent = roar
+						end)
+					end
+					local tw = TweenService:Create(roar, TweenInfo.new(2.5, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {
+						ImageTransparency = 1,
+						Size = UDim2.fromScale(5, 5),
+						Rotation = rot0 * 2,
+					})
+					tw:Play()
+					task.delay(2.5, function()
+						pcall(function()
+							roar:Destroy()
+						end)
+					end)
+					task.wait(1 / 3)
+				end
+			end)
+		end
 
 		if wantSlide then
 			task.defer(function()
@@ -1637,6 +1863,9 @@ return function(env)
 		if src:find('StartLoop', 1, true) and src:find('"_"', 1, true) then
 			return 'Cursed Full'
 		end
+		if src:find('ShakeText', 1, true) and (src:find('CreateRoar', 1, true) or src:find('Roar', 1, true)) then
+			return 'Roar shake'
+		end
 		local hasTween = src:find('TweenService', 1, true) ~= nil
 		local hasRun = src:find('RunService', 1, true) ~= nil
 		local hasSpawn = src:find('ImageLabel', 1, true) or src:find('ParticleEmitter', 1, true)
@@ -1780,6 +2009,8 @@ return function(env)
 						if icon == '' then
 							icon = img
 						end
+					elseif n == 'Roar' then
+						-- Berserker ring, not a spark.
 					elseif n == 'Image' or n == 'Spark' or n == 'Smoke' or n == 'Petal' or n == 'Snow' then
 						sparkCount += 1
 						if spark == '' then
@@ -1823,6 +2054,9 @@ return function(env)
 
 	boostGameTitleAnim = function(label, tagName, modScript)
 		if not label or activeFx[label] or not modScript then
+			return
+		end
+		if label:GetAttribute('SB2AliasDriven') == true then
 			return
 		end
 		local grad = label:FindFirstChildWhichIsA('UIGradient')
@@ -2016,7 +2250,7 @@ return function(env)
 							if cfg.icon == '' then
 								cfg.icon = img
 							end
-						elseif cfg.spark == '' then
+						elseif ch.Name ~= 'Roar' and cfg.spark == '' then
 							cfg.spark = img
 						end
 					end
@@ -2300,12 +2534,213 @@ return function(env)
 		end
 	end)
 
+	TitlingBox:AddToggle('HideSelfNameAndChar', {
+		Text = 'Hide my name and character',
+		Default = false,
+		Tooltip = 'Local only: hides your username row and body. Title stays on the nameplate.',
+	}):OnChanged(function(on)
+		getgenv().SB2HideSelfOn = on == true
+		local function stopHide()
+			local conn = getgenv().SB2HideSelfConn
+			if conn then
+				pcall(function()
+					conn:Disconnect()
+				end)
+				getgenv().SB2HideSelfConn = nil
+			end
+			local acc = getgenv().SB2HideSelfAdded
+			if acc then
+				pcall(function()
+					acc:Disconnect()
+				end)
+				getgenv().SB2HideSelfAdded = nil
+			end
+		end
+		local function myChars()
+			local out = {}
+			local seen = {}
+			local function add(m)
+				if typeof(m) == 'Instance' and m:IsA('Model') and not seen[m] then
+					seen[m] = true
+					out[#out + 1] = m
+				end
+			end
+			add(LocalPlayer.Character)
+			local folder = workspace:FindFirstChild('Characters')
+			add(folder and folder:FindFirstChild(LocalPlayer.Name))
+			return out
+		end
+		local function applyHide(hide)
+			for _, char in ipairs(myChars()) do
+				local np = char:FindFirstChild('Nameplate')
+				for _, d in ipairs(char:GetDescendants()) do
+					if np and (d == np or d:IsDescendantOf(np)) then
+						if hide then
+							if (d:IsA('TextLabel') or d:IsA('TextButton')) and d.Name ~= 'Tag' then
+								local t = tostring(d.Text or '')
+								if t == LocalPlayer.Name
+									or t == LocalPlayer.DisplayName
+									or d.Name == 'TextLabel'
+								then
+									d.TextTransparency = 1
+									d.Visible = false
+								end
+							elseif d:IsA('Frame') and d.Name == 'Layout' then
+								d.Visible = false
+							end
+						else
+							if (d:IsA('TextLabel') or d:IsA('TextButton')) and d.Name ~= 'Tag' then
+								d.TextTransparency = 0
+								d.Visible = true
+							elseif d:IsA('Frame') and d.Name == 'Layout' then
+								d.Visible = true
+							end
+						end
+					elseif d:IsA('BasePart') or d:IsA('Decal') or d:IsA('Texture') then
+						pcall(function()
+							d.LocalTransparencyModifier = hide and 1 or 0
+						end)
+					elseif d:IsA('ParticleEmitter') or d:IsA('Beam') or d:IsA('Trail')
+						or d:IsA('Fire') or d:IsA('Smoke') or d:IsA('Highlight')
+					then
+						pcall(function()
+							d.Enabled = not hide
+						end)
+					end
+				end
+			end
+		end
+		stopHide()
+		if not on then
+			applyHide(false)
+			return
+		end
+		applyHide(true)
+		getgenv().SB2HideSelfConn = game:GetService('RunService').Heartbeat:Connect(function()
+			if getgenv().SB2HideSelfOn ~= true then
+				stopHide()
+				applyHide(false)
+				return
+			end
+			applyHide(true)
+		end)
+		getgenv().SB2HideSelfAdded = LocalPlayer.CharacterAdded:Connect(function()
+			task.defer(function()
+				if getgenv().SB2HideSelfOn == true then
+					applyHide(true)
+				end
+			end)
+		end)
+	end)
+
 	local function setStatus(text)
 		pcall(function()
 			if statusLabel.SetText then
 				statusLabel:SetText(tostring(text))
 			elseif statusLabel.Text ~= nil then
 				statusLabel.Text = tostring(text)
+			end
+		end)
+	end
+
+	local switcherToken = 0
+	local switcherIndex = 0
+	local switcherBusy = false
+
+	local function applyOwnedTitleLocal(titleName)
+		local playerName = LocalPlayer.Name
+		local char = resolveCharacter(playerName)
+		local label = getNameplateTag(char)
+		if not label then
+			return false, 'nameplate not loaded'
+		end
+		snapshotPlate(playerName, label)
+		titlingLockPlayer(playerName, 8)
+		local _, knownSet = listTitleNames()
+		return applyTitleToLabel(label, titleName, knownSet, LocalPlayer.UserId, playerName)
+	end
+
+	local function equipOwnedTitle(titleName)
+		applyOwnedTitleLocal(titleName)
+		local row = getCosmeticTagUiRow(titleName)
+		local clicked = fireGuiButton(findRowButton(row))
+		if readEquippedTitle() == titleName then
+			return true, clicked and 'ui' or 'already'
+		end
+		if clicked then
+			task.wait(0.25)
+			if readEquippedTitle() == titleName then
+				return true, 'ui'
+			end
+		end
+		if tryEquipTitleRemote(titleName) then
+			return true, 'remote'
+		end
+		return readEquippedTitle() == titleName, 'local'
+	end
+
+	local function rotateOwnedTitle(force)
+		if switcherBusy and not force then
+			return
+		end
+		local owned = listOwnedTitles()
+		if #owned < 2 then
+			setStatus((#owned == 0) and 'No owned titles found' or 'Need at least two owned titles')
+			return
+		end
+		local equipped = readEquippedTitle()
+		local current = 0
+		for i, name in ipairs(owned) do
+			if name == equipped then
+				current = i
+				break
+			end
+		end
+		if current == 0 and switcherIndex > 0 then
+			current = switcherIndex
+		end
+		switcherIndex = (current % #owned) + 1
+		local nextName = owned[switcherIndex]
+		if Options.TitlingTitle and type(Options.TitlingTitle.SetValue) == 'function' then
+			pcall(function()
+				Options.TitlingTitle:SetValue(nextName)
+			end)
+		end
+		switcherBusy = true
+		local ok, how = equipOwnedTitle(nextName)
+		switcherBusy = false
+		setStatus(('Switcher [%d/%d] %s%s'):format(
+			switcherIndex,
+			#owned,
+			nextName,
+			ok and '' or (' — ' .. tostring(how))
+		))
+		if type(Library.Notify) == 'function' then
+			Library:Notify(('Title → %s'):format(nextName), 3)
+		end
+	end
+
+	local function stopTitleSwitcher()
+		switcherToken += 1
+		getgenv().SB2TitleSwitcherOn = false
+	end
+
+	local function startTitleSwitcher()
+		switcherToken += 1
+		local token = switcherToken
+		getgenv().SB2TitleSwitcherOn = true
+		task.spawn(function()
+			while switcherToken == token do
+				rotateOwnedTitle(false)
+				local secs = 15
+				if Options.TitlingSwitcherSeconds then
+					secs = math.max(3, tonumber(Options.TitlingSwitcherSeconds.Value) or 15)
+				end
+				local waited = 0
+				while waited < secs and switcherToken == token do
+					task.wait(0.25)
+					waited += 0.25
+				end
 			end
 		end)
 	end
@@ -2351,6 +2786,45 @@ return function(env)
 		local tn = refreshTitles()
 		setStatus(('Players %d - titles %d'):format(pn, tn))
 		Library:Notify(('Titling - %d players, %d titles'):format(pn, tn), 4)
+	end)
+
+	TitlingBox:AddToggle('TitlingSwitcher', {
+		Text = 'Title switcher',
+		Default = false,
+		Tooltip = 'Cycle every title you own on a timer. Uses Cosmetic Tags, then the Cosmetic Titles rows.',
+	}):OnChanged(function(on)
+		if on then
+			local owned = listOwnedTitles()
+			if #owned < 2 then
+				Library:Notify((#owned == 0) and 'No owned titles found' or 'Need at least two owned titles', 6, true)
+				if Options.TitlingSwitcher and type(Options.TitlingSwitcher.SetValue) == 'function' then
+					task.defer(function()
+						pcall(function()
+							Options.TitlingSwitcher:SetValue(false)
+						end)
+					end)
+				end
+				return
+			end
+			setStatus(('Switcher ready — %d owned titles'):format(#owned))
+			startTitleSwitcher()
+		else
+			stopTitleSwitcher()
+			setStatus('Title switcher off')
+		end
+	end)
+
+	TitlingBox:AddSlider('TitlingSwitcherSeconds', {
+		Text = 'Switch interval (s)',
+		Default = 15,
+		Min = 3,
+		Max = 300,
+		Rounding = 0,
+		Tooltip = 'How long to keep each owned title before swapping to the next.',
+	})
+
+	TitlingBox:AddButton('Next title now', function()
+		rotateOwnedTitle(true)
 	end)
 
 	TitlingBox:AddButton('Apply preview', function()
@@ -2483,6 +2957,7 @@ return function(env)
 			'Sparks',
 			'Icon pulse',
 			'Full',
+			'Roar shake',
 			'Glitch text',
 			'Cursed Full',
 		},
