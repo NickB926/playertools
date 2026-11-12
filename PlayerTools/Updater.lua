@@ -242,9 +242,15 @@ function Updater.check()
 	local localVer = Updater.localVersion()
 	local remoteVer = tostring(remote.version or '')
 	local cmp = Updater.compareVersions(remoteVer, localVer)
+	-- Every publish stamps a new build id, so a re-publish under the same version
+	-- number still reaches friends (1.0.37 went out twice and half-updated people).
+	local localData = readLocalVersion() or {}
+	local remoteBuild = tostring(remote.build or '')
+	local buildChanged = remoteBuild ~= '' and remoteBuild ~= tostring(localData.build or '')
 	local needsUpdate = localVer == ''
 		or (remoteVer ~= '' and cmp == 1)
 		or (remoteVer ~= '' and localVer ~= remoteVer and cmp == nil)
+		or (buildChanged and cmp ~= -1)
 	return {
 		ok = true,
 		localVersion = localVer,

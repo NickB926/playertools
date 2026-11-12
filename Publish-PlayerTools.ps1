@@ -89,6 +89,9 @@ foreach ($n in $names) { $fileList += "PlayerTools/$n" }
 $fileList += 'PlayerTools/backend'
 $fileList += 'PlayerTools/version.json'
 $ver.files = $fileList
+# Unique stamp per publish: friends' updater re-downloads whenever this changes.
+$buildStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss')
+if ($ver.PSObject.Properties.Name -contains 'build') { $ver.build = $buildStamp } else { $ver | Add-Member -NotePropertyName build -NotePropertyValue $buildStamp }
 
 $copied = 0
 foreach ($n in $names) {
