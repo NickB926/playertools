@@ -523,7 +523,7 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'whitelist-self-v1'
+getgenv().SB2PlayerToolsLocalBuild = 'self-tab-fly-v2'
 getgenv().SB2WaveKillTargetUILoaded = false
 getgenv().SB2BetweenPartyUILoaded = false
 pcall(function()
@@ -937,6 +937,11 @@ local unloadExisting = function()
 	pcall(function()
 		if type(getgenv().SB2SetAnchorPlayerNoclip) == 'function' then
 			getgenv().SB2SetAnchorPlayerNoclip(false)
+		end
+	end)
+	pcall(function()
+		if type(getgenv().SB2SelfFlyStop) == 'function' then
+			getgenv().SB2SelfFlyStop()
 		end
 	end)
 	-- Soft-reload path: kill anim ghosts again after GUI teardown (boot kill may race).
@@ -5356,6 +5361,8 @@ local ok, err = pcall(function()
 	local HomeBox = HomeTab:AddLeftGroupbox('Ataraxia')
 	assert(HomeBox, 'Home groupbox nil')
 
+	-- Reserve rail slot before Players (no extra outer local — 200-register cap).
+	Window:AddTab('Self', 'user')
 	local PlayersTab = Window:AddTab('Players', 'users')
 	local PlayersBox = PlayersTab:AddLeftGroupbox('Players')
 	assert(PlayersBox, 'AddLeftGroupbox returned nil')
@@ -8205,7 +8212,7 @@ local ok, err = pcall(function()
 		end)
 
 		-- Must match SERVER_HOP_UI_VER in ServerHop.iy (server list on floor click).
-		local SERVER_HOP_PT_VER = 7
+		local SERVER_HOP_PT_VER = 9
 		local SERVER_HOP_PATHS = {
 			'PlayerTools/ServerHop.iy',
 			'ServerHop.iy',
@@ -8244,8 +8251,8 @@ local ok, err = pcall(function()
 				if type(isfile) == 'function' and isfile(path) and type(readfile) == 'function' then
 					local okRead, src = pcall(readfile, path)
 					if okRead and type(src) == 'string' and #src > 200 then
-						if not string.find(src, 'SERVER_HOP_UI_VER = 7', 1, true) then
-							warn('[PlayerTools] ServerHop.iy outdated (need UI v7): ', path)
+						if not string.find(src, 'SERVER_HOP_UI_VER = 9', 1, true) then
+							warn('[PlayerTools] ServerHop.iy outdated (need UI v9): ', path)
 						end
 						local fn, err = (loadstring or load)(src, path)
 						if fn then
@@ -8310,325 +8317,48 @@ local ok, err = pcall(function()
 		end)
 	end
 
-	-- Walkspeed (local character). Default comes from the same place View stats reads
-	-- (character Walkspeed attribute / Humanoid), not a hardcoded 16.
-	do
-		local FALLBACK_WALKSPEED = 16
-		local WalkBox = PlayersTab:AddLeftGroupbox('Walkspeed')
-		assert(WalkBox, 'Walkspeed groupbox nil')
-
-		local function myCharacter()
-			local char = LocalPlayer.Character
-			if not char then
-				local folder = workspace:FindFirstChild('Characters')
-				char = folder and folder:FindFirstChild(LocalPlayer.Name)
-			end
-			return char
+	-- Self tab lives in PlayerTools/Self.lua (own register budget).
+	;(function()
+		local compile = loadstring or load
+		if type(compile) ~= 'function' or type(readfile) ~= 'function' then
+			warn('[PlayerTools] Self tab skipped: compile/readfile missing')
+			return
 		end
-
-		local function myHumanoid()
-			local char = myCharacter()
-			return char and char:FindFirstChildOfClass('Humanoid')
-		end
-
-		-- Same source as readPlayerStats / View stats (attribute first = game default).
-		local function getDefaultWalkSpeed()
-			local char = myCharacter()
-			if char then
-				local attr = char:GetAttribute('Walkspeed') or char:GetAttribute('WalkSpeed')
-				if type(attr) == 'number' and attr > 0 then
-					return math.clamp(attr, 1, 500)
-				end
-			end
-			local info = readPlayerStats(LocalPlayer.Name)
-			if info and type(info.walkSpeed) == 'number' and info.walkSpeed > 0 then
-				return math.clamp(info.walkSpeed, 1, 500)
-			end
-			local hum = myHumanoid()
-			if hum and type(hum.WalkSpeed) == 'number' and hum.WalkSpeed > 0 and not getgenv().SB2WalkSpeedWant then
-				return math.clamp(hum.WalkSpeed, 1, 500)
-			end
-			return FALLBACK_WALKSPEED
-		end
-
-		local function applyWalkSpeed(spd, pin)
-			spd = math.clamp(tonumber(spd) or getDefaultWalkSpeed(), 1, 500)
-			local hum = myHumanoid()
-			if hum then
-				pcall(function()
-					hum.WalkSpeed = spd
-				end)
-			end
-			if pin then
-				getgenv().SB2WalkSpeedWant = spd
-			else
-				getgenv().SB2WalkSpeedWant = nil
-			end
-		end
-
-		local initialDefault = getDefaultWalkSpeed()
-
-		WalkBox:AddSlider('WalkSpeed', {
-			Text = 'Walkspeed',
-			Default = initialDefault,
-			Min = 1,
-			Max = 500,
-			Rounding = 0,
-			Tooltip = 'Your character walkspeed (1–500). Default uses the same Walkspeed value as View stats.',
-		}):OnChanged(function(value)
-			local base = getDefaultWalkSpeed()
-			local spd = math.clamp(tonumber(value) or base, 1, 500)
-			applyWalkSpeed(spd, math.abs(spd - base) > 0.05)
-		end)
-
-		WalkBox:AddButton('Default walkspeed', function()
-			local base = getDefaultWalkSpeed()
-			if Options.WalkSpeed and type(Options.WalkSpeed.SetValue) == 'function' then
-				pcall(function()
-					Options.WalkSpeed:SetValue(base)
-				end)
-			end
-			applyWalkSpeed(base, false)
-			Library:Notify('Walkspeed → ' .. tostring(base) .. ' (default)')
-		end)
-
-		getgenv().SB2WalkSpeedWant = nil
-		local walkGen = (tonumber(getgenv().SB2WalkSpeedGen) or 0) + 1
-		getgenv().SB2WalkSpeedGen = walkGen
-		task.spawn(function()
-			while getgenv().SB2WalkSpeedGen == walkGen do
-				if getgenv().SB2PlayerToolsManualUnload == true then
-					break
-				end
-				local want = tonumber(getgenv().SB2WalkSpeedWant)
-				if want then
-					local hum = myHumanoid()
-					if hum and math.abs((hum.WalkSpeed or 0) - want) > 0.05 then
-						pcall(function()
-							hum.WalkSpeed = want
-						end)
-					end
-				end
-				task.wait(0.12)
-			end
-		end)
-
-		pcall(function()
-			safeConnect(LocalPlayer.CharacterAdded, function()
-				task.defer(function()
-					local want = tonumber(getgenv().SB2WalkSpeedWant)
-					if want then
-						applyWalkSpeed(want, true)
-					end
-				end)
-			end)
-		end)
-	end
-
-	-- Local character scale (Model:ScaleTo + Humanoid body scales when available).
-	do
-		local MIN_CHAR_SCALE = 0.35
-		local MAX_CHAR_SCALE = 1.5
-		local ScaleBox = PlayersTab:AddLeftGroupbox('Character size')
-		assert(ScaleBox, 'Character size groupbox nil')
-
-		local function resolveCharForScale()
-			return getMyCharacterModel() or LocalPlayer.Character
-		end
-
-		local function clearScaleBaselines()
-			getgenv().SB2HumanoidScaleBase = nil
-			getgenv().SB2CharacterScaleModelId = nil
-		end
-
-		local function captureHumanoidBaselines(hum)
-			if not hum then
-				return
-			end
-			local model = hum.Parent
-			local modelId = model and model:GetFullName() or ''
-			if getgenv().SB2CharacterScaleModelId ~= modelId then
-				clearScaleBaselines()
-				getgenv().SB2CharacterScaleModelId = modelId
-			end
-			if type(getgenv().SB2HumanoidScaleBase) == 'table' then
-				return
-			end
-			local base = {}
-			for _, prop in ipairs({ 'BodyHeightScale', 'BodyWidthScale', 'BodyDepthScale', 'HeadScale' }) do
-				local v = hum[prop]
-				if type(v) == 'number' then
-					base[prop] = v
-				end
-			end
-			if type(hum.HipHeight) == 'number' then
-				base.HipHeight = hum.HipHeight
-			end
-			getgenv().SB2HumanoidScaleBase = base
-		end
-
-		local function applyHumanoidScale(hum, scale)
-			if not hum then
-				return
-			end
-			captureHumanoidBaselines(hum)
-			local base = getgenv().SB2HumanoidScaleBase
-			if type(base) ~= 'table' then
-				return
-			end
-			for _, prop in ipairs({ 'BodyHeightScale', 'BodyWidthScale', 'BodyDepthScale', 'HeadScale' }) do
-				local b = base[prop]
-				if type(b) == 'number' and type(hum[prop]) == 'number' then
-					pcall(function()
-						hum[prop] = b * scale
-					end)
-				end
-			end
-			if type(base.HipHeight) == 'number' then
-				pcall(function()
-					hum.HipHeight = base.HipHeight * scale
-				end)
-			end
-		end
-
-		local function resetCharacterScaleVisual()
-			local model = resolveCharForScale()
-			local hum = model and model:FindFirstChildOfClass('Humanoid')
-			local base = getgenv().SB2HumanoidScaleBase
-			pcall(function()
-				if model and typeof(model.ScaleTo) == 'function' then
-					model:ScaleTo(1)
-				end
-			end)
-			if hum and type(base) == 'table' then
-				for key, val in pairs(base) do
-					if type(val) == 'number' and type(hum[key]) == 'number' then
-						pcall(function()
-							hum[key] = val
-						end)
-					end
-				end
-			end
-			clearScaleBaselines()
-		end
-
-		local function applyCharacterScale(scale, pin)
-			scale = math.clamp(tonumber(scale) or 1, MIN_CHAR_SCALE, MAX_CHAR_SCALE)
-			if math.abs(scale - 1) <= 0.02 then
-				resetCharacterScaleVisual()
-				getgenv().SB2CharacterScaleWant = nil
-				return true
-			end
-
-			local model = resolveCharForScale()
-			if not model then
-				return false
-			end
-			local hum = model:FindFirstChildOfClass('Humanoid')
-
-			pcall(function()
-				if typeof(model.ScaleTo) == 'function' then
-					model:ScaleTo(scale)
-				end
-			end)
-			applyHumanoidScale(hum, scale)
-
-			if pin ~= false then
-				getgenv().SB2CharacterScaleWant = scale
-			else
-				getgenv().SB2CharacterScaleWant = nil
-			end
-			return true
-		end
-
-		ScaleBox:AddSlider('CharacterScale', {
-			Text = 'Scale',
-			Default = 1,
-			Min = MIN_CHAR_SCALE,
-			Max = MAX_CHAR_SCALE,
-			Rounding = 2,
-			Compact = true,
-			Tooltip = 'Shrink or grow your character (local). SB2 may snap back — this re-applies while pinned.',
-		}):OnChanged(function(value)
-			applyCharacterScale(value, true)
-		end)
-
-		ScaleBox:AddButton('Normal size (1.0)', function()
-			if Options.CharacterScale and type(Options.CharacterScale.SetValue) == 'function' then
-				pcall(function()
-					Options.CharacterScale:SetValue(1)
-				end)
-			end
-			resetCharacterScaleVisual()
-			getgenv().SB2CharacterScaleWant = nil
-			Library:Notify('Character scale reset')
-		end)
-
-		getgenv().SB2CharacterScaleWant = nil
-		local scaleGen = (tonumber(getgenv().SB2CharacterScaleGen) or 0) + 1
-		getgenv().SB2CharacterScaleGen = scaleGen
-		task.spawn(function()
-			while getgenv().SB2CharacterScaleGen == scaleGen do
-				if getgenv().SB2PlayerToolsManualUnload == true then
-					break
-				end
-				local want = tonumber(getgenv().SB2CharacterScaleWant)
-				if want then
-					local model = resolveCharForScale()
-					if model then
-						pcall(function()
-							if typeof(model.GetScale) == 'function' and typeof(model.ScaleTo) == 'function' then
-								local cur = model:GetScale()
-								if math.abs(cur - want) > 0.04 then
-									model:ScaleTo(want)
-								end
-							end
-						end)
-						local hum = model:FindFirstChildOfClass('Humanoid')
-						if hum then
-							applyHumanoidScale(hum, want)
+		local loaded = false
+		for _, modPath in ipairs({ 'PlayerTools/Self.lua', 'Self.lua' }) do
+			local exists = type(isfile) ~= 'function' or isfile(modPath)
+			if exists then
+				local okRead, src = pcall(readfile, modPath)
+				if okRead and type(src) == 'string' and src ~= '' then
+					local fn, err = compile(src, modPath)
+					if not fn then
+						warn('[PlayerTools] Self.lua compile failed: ', err)
+					else
+						local ok, result = pcall(fn)
+						if ok and type(result) == 'function' then
+							ok, result = pcall(result, {
+								Window = Window,
+								Library = Library,
+								Options = Options,
+								LocalPlayer = LocalPlayer,
+								readPlayerStats = readPlayerStats,
+								getMyCharacterModel = getMyCharacterModel,
+								safeConnect = safeConnect,
+							})
 						end
+						if ok then
+							loaded = true
+							break
+						end
+						warn('[PlayerTools] Self.lua init failed: ', result)
 					end
 				end
-				task.wait(0.2)
 			end
-		end)
-
-		pcall(function()
-			safeConnect(LocalPlayer.CharacterAdded, function()
-				clearScaleBaselines()
-				task.defer(function()
-					local want = tonumber(getgenv().SB2CharacterScaleWant)
-					if want then
-						applyCharacterScale(want, true)
-					end
-				end)
-			end)
-		end)
-
-		-- SB2 body lives under workspace.Characters — re-apply when that model respawns.
-		task.spawn(function()
-			local lastName = nil
-			while getgenv().SB2CharacterScaleGen == scaleGen do
-				if getgenv().SB2PlayerToolsManualUnload == true then
-					break
-				end
-				local model = resolveCharForScale()
-				local name = model and model.Name
-				if name and name ~= lastName then
-					lastName = name
-					clearScaleBaselines()
-					local want = tonumber(getgenv().SB2CharacterScaleWant)
-					if want then
-						task.defer(function()
-							applyCharacterScale(want, true)
-						end)
-					end
-				end
-				task.wait(0.35)
-			end
-		end)
-	end
+		end
+		if not loaded then
+			warn('[PlayerTools] Self.lua missing — put it next to PlayerTools_Obsidian.lua')
+		end
+	end)()
 
 	-- OS mouse + hide Obsidian's custom + cursor (and SB2 MouseIcon disable).
 	local UserInputService = game:GetService('UserInputService')
@@ -10022,6 +9752,20 @@ local ok, err = pcall(function()
 		local FORCE_ATTACK_SKILLS = {
 			['Summon Pistol'] = true,
 			['Pistol Summon'] = true,
+			['Summon Rifle'] = true,
+			['Summon Minigun'] = true,
+		}
+		-- Rifle / minigun official handlers FireServer then task.wait(3) while usingSkill
+		-- is locked. Remote-only payload matches the game dump (no Direction table).
+		local SUMMON_NO_DIR_SKILLS = {
+			['Summon Rifle'] = true,
+			['Summon Minigun'] = true,
+		}
+		-- Official handlers FireServer once then task.wait(3) while shots tick.
+		-- Interrupting with another UseSkill / clearing usingSkill cuts damage (15k ticks, not 295k).
+		local SUMMON_CHANNEL_SEC = {
+			['Summon Rifle'] = 3,
+			['Summon Minigun'] = 3,
 		}
 		-- Dash / pistol names do not open a DealDamage tag window. CTF / smash do.
 		-- Alts saved on Leaping Slash look like they are hitting and deal 0.
@@ -10029,6 +9773,8 @@ local ok, err = pcall(function()
 			['Leaping Slash'] = true,
 			['Summon Pistol'] = true,
 			['Pistol Summon'] = true,
+			['Summon Rifle'] = true,
+			['Summon Minigun'] = true,
 		}
 		local AURA_SKILL_PRIORITY = {
 			'Cursed Three Fold Slash',
@@ -10355,6 +10101,8 @@ local ok, err = pcall(function()
 						keepMap = collectMultiSkillMap(getgenv().SB2LastCombatOptions.SupportSkillName)
 					elseif option == Options.FarmSupportSkillName then
 						keepMap = collectMultiSkillMap(getgenv().SB2LastCombatOptions.FarmSupportSkillName)
+					elseif option == Options.SkillName then
+						keepMap = collectMultiSkillMap(getgenv().SB2LastCombatOptions.SkillName)
 					end
 				end
 				-- Empty combat support means Cursed Enhancement, unless the user cleared it.
@@ -10563,8 +10311,12 @@ local ok, err = pcall(function()
 			if not skills then
 				return nil
 			end
-			if skills.usingSkill and skills.usingSkill ~= 'none' and skills.usingSkill ~= skillName then
-				return false
+			-- Official UseSkill sets usingSkill for the whole handler (Rifle waits 3s).
+			-- Remote casts ignore that lock so several skills can fire together.
+			if skills.usingSkill and skills.usingSkill ~= 'none' then
+				pcall(function()
+					skills.usingSkill = 'none'
+				end)
 			end
 			local ready = gameSkillReady(skillName)
 			if ready == false then
@@ -10733,6 +10485,18 @@ local ok, err = pcall(function()
 				return syncMultiSkillOrder('SB2SupportSkillOrder', combatMap)
 			end
 			return syncMultiSkillOrder('SB2FarmSupportSkillOrder', farmMap)
+		end
+
+		local function getActiveWeaponSkillNames()
+			local combatMap = collectMultiSkillMap(Options.SkillName and Options.SkillName.Value)
+			local farmMap = collectMultiSkillMap(Options.FarmSkillName and Options.FarmSkillName.Value)
+			local map = combatMap
+			if usingEventFarmSkills() then
+				map = next(farmMap) and farmMap or combatMap
+			elseif not next(combatMap) then
+				map = farmMap
+			end
+			return syncMultiSkillOrder('SB2WeaponSkillOrder', map)
 		end
 
 		local function getActiveWeaponSkillName()
@@ -11032,6 +10796,11 @@ local ok, err = pcall(function()
 				return true
 			end
 			return false
+		end
+
+		local function isRiftObjectiveMob(mob)
+			local n = string.lower(tostring(mob and mob.Name or ''))
+			return n == 'rift'
 		end
 
 		local function isPriorityMob(mob)
@@ -11407,6 +11176,43 @@ local ok, err = pcall(function()
 			return isToggleOn('SupportSkill')
 		end
 
+		local function faceNearestMobForSummon()
+			local mobsRoot = workspace:FindFirstChild('Mobs')
+			local hrp = getMyBringPart()
+				or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart'))
+			if not hrp or not mobsRoot then
+				return false
+			end
+			local origin = hrp.Position
+			local best, bestD = nil, 1e18
+			for _, mob in mobsRoot:GetChildren() do
+				if isDeadMob(mob) or shouldSkipMob(mob) then
+					continue
+				end
+				local root = getMobRoot(mob)
+				if not root then
+					continue
+				end
+				local atkCF = getMobAttackCFrame(mob, root, origin)
+				local d = (atkCF.Position - origin).Magnitude
+				if d < bestD then
+					bestD = d
+					best = atkCF.Position
+				end
+			end
+			if not best then
+				return false
+			end
+			pcall(function()
+				local pos = hrp.Position
+				local look = Vector3.new(best.X, pos.Y, best.Z)
+				if (look - pos).Magnitude > 0.2 then
+					hrp.CFrame = CFrame.lookAt(pos, look)
+				end
+			end)
+			return true
+		end
+
 		local fireUseSkill = function(skillName, info, opts)
 			opts = opts or {}
 			if not opts.ignoreCombatGate then
@@ -11443,6 +11249,12 @@ local ok, err = pcall(function()
 			if not opts.skipReadyCheck and not isSkillReady(skillName) then
 				return false
 			end
+			local channelSec = SUMMON_CHANNEL_SEC[skillName]
+			local channelUntil = tonumber(getgenv().SB2SummonChannelUntil) or 0
+			if os.clock() < channelUntil then
+				-- Do not interrupt an active rifle/minigun stream.
+				return false
+			end
 
 			local hrp = getMyBringPart()
 				or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart'))
@@ -11461,13 +11273,46 @@ local ok, err = pcall(function()
 			getgenv().SB2CombatProbe.lastSkillAt = os.clock()
 			getgenv().SB2CombatProbe.lastSkillDir = { dir.X, dir.Y, dir.Z }
 
-			local fireOk = pcall(function()
-				CombatEvent:FireServer('Skills', {
-					'UseSkill',
-					skillName,
-					{ Direction = dir },
-				})
-			end)
+			local fireOk = false
+			if channelSec then
+				-- Remote only — do not call Skills.UseSkill (client lock / anim / wait).
+				-- Server streams shots for ~3s after this one FireServer.
+				faceNearestMobForSummon()
+				fireOk = pcall(function()
+					CombatEvent:FireServer('Skills', { 'UseSkill', skillName })
+				end)
+				if fireOk then
+					getgenv().SB2SummonChannelUntil = os.clock() + channelSec + 0.15
+					task.spawn(function()
+						local untilT = getgenv().SB2SummonChannelUntil
+						while os.clock() < (tonumber(untilT) or 0) do
+							faceNearestMobForSummon()
+							task.wait(0.05)
+						end
+						if getgenv().SB2SummonChannelUntil == untilT then
+							getgenv().SB2SummonChannelUntil = 0
+						end
+					end)
+				end
+			else
+				fireOk = pcall(function()
+					if SUMMON_NO_DIR_SKILLS[skillName] then
+						CombatEvent:FireServer('Skills', { 'UseSkill', skillName })
+					else
+						CombatEvent:FireServer('Skills', {
+							'UseSkill',
+							skillName,
+							{ Direction = dir },
+						})
+					end
+				end)
+				pcall(function()
+					local skills = getGameSkillsService()
+					if skills then
+						skills.usingSkill = 'none'
+					end
+				end)
+			end
 			if not fireOk then
 				if type(getgenv().SB2SkillCdUntil) == 'table' then
 					getgenv().SB2SkillCdUntil[skillName] = nil
@@ -11554,20 +11399,49 @@ local ok, err = pcall(function()
 					return true
 				end
 			end
-			local skillName, info = getSupportCastTarget()
-			if not skillName then
-				return false
+			local fired = false
+			local lastName = nil
+			local function trySupport(skillName)
+				if not skillName or skillName == '(none)' then
+					return
+				end
+				local forced = SUPPORT_FORCE_INCLUDE[skillName] == true
+				if SKIP_UTILITY_SKILLS[skillName] and not forced then
+					return
+				end
+				local info = getSkillInfo(skillName)
+				if not forced and not (info.anytime == true and not info.class) then
+					return
+				end
+				local mySkills = getLiveProfile() and getLiveProfile():FindFirstChild('Skills')
+				if mySkills and not mySkills:FindFirstChild(skillName) then
+					return
+				end
+				if not isSkillReady(skillName) then
+					return
+				end
+				if getPlayerStamina() < (info.cost or 0) then
+					return
+				end
+				if fireUseSkill(skillName, info, {
+					muteFor = 2.0,
+					silentFail = true,
+					ignoreGap = true,
+				}) then
+					fired = true
+					lastName = skillName
+				end
 			end
-			-- ignoreGap: weapon UseSkill spam was eating the shared cast gap so CE never fired.
-			local ok = fireUseSkill(skillName, info, {
-				muteFor = 2.0,
-				silentFail = true,
-				ignoreGap = true,
-			}) == true
-			if ok then
-				getgenv().SB2LastSupportCast = { skill = skillName, at = os.clock() }
+			trySupport('Cursed Enhancement')
+			for _, skillName in ipairs(getActiveSupportSkillList()) do
+				if skillName ~= 'Cursed Enhancement' then
+					trySupport(skillName)
+				end
 			end
-			return ok
+			if lastName then
+				getgenv().SB2LastSupportCast = { skill = lastName, at = os.clock() }
+			end
+			return fired
 		end
 
 		local ensureSkillWindow = function()
@@ -11595,16 +11469,22 @@ local ok, err = pcall(function()
 			end
 
 			local skillName = getActiveWeaponSkillName()
+			local weaponNames = getActiveWeaponSkillNames()
+			if #weaponNames == 0 and skillName then
+				weaponNames = { skillName }
+			end
+			local function isSkipTag(name)
+				return not name
+					or name == 'Block'
+					or name == 'Roll'
+					or name == 'Sprint'
+					or name == 'Realm Judgement'
+					or name == 'Realm Banishment'
+					or name == 'Meteor Shot'
+					or isPoorAuraTagSkill(name)
+			end
 			local function activeWeaponTag()
-				if not skillName
-					or skillName == 'Block'
-					or skillName == 'Roll'
-					or skillName == 'Sprint'
-					or skillName == 'Realm Judgement'
-					or skillName == 'Realm Banishment'
-					or skillName == 'Meteor Shot'
-					or isPoorAuraTagSkill(skillName)
-				then
+				if isSkipTag(skillName) then
 					return nil
 				end
 				local now = time()
@@ -11617,62 +11497,43 @@ local ok, err = pcall(function()
 				return nil
 			end
 
-			-- Support first: if CE/buff is ready, cast it and skip weapon UseSkill this tick.
-			local supportName = getSupportCastTarget()
-			if supportName then
-				pcall(castSelectedSupportSkill)
-				return activeWeaponTag()
-			end
+			-- Support + every selected weapon skill in the same tick.
+			pcall(castSelectedSupportSkill)
 
-			if not skillName
-				or skillName == 'Block'
-				or skillName == 'Roll'
-				or skillName == 'Sprint'
-				or skillName == 'Realm Judgement'
-				or skillName == 'Realm Banishment'
-				or skillName == 'Meteor Shot'
-				or isPoorAuraTagSkill(skillName)
-			then
-				return nil
-			end
-
-			local info = getSkillInfo(skillName)
-			local forced = FORCE_ATTACK_SKILLS[skillName] == true
-			-- Class gate: skip when Event dive owns the farm skill, or when the
-			-- selected combat skill matches held weapons.
-			if not forced then
-				if not info.class then
-					return nil
+			local tagName = nil
+			for _, name in ipairs(weaponNames) do
+				local info = getSkillInfo(name)
+				local forced = FORCE_ATTACK_SKILLS[name] == true
+				if name == 'Block' or name == 'Roll' or name == 'Sprint' then
+					continue
 				end
-				if not usingEventFarmSkills() then
-					local held = getEquippedWeaponClassesCached()
-					if not skillMatchesHeldWeapon(skillName, info, held) then
-						-- Try first held-class skill instead of silently doing nothing.
-						local avail = getAvailableSkills()
-						local alt = nil
-						for _, name in ipairs(avail) do
-							if name ~= '(none)' and name ~= '(none for held weapon)' then
-								local altInfo = getSkillInfo(name)
-								if skillMatchesHeldWeapon(name, altInfo, held) then
-									alt = name
-									break
-								end
-							end
-						end
-						if not alt then
-							return nil
-						end
-						skillName = alt
-						info = getSkillInfo(skillName)
-						if not info.class or not skillMatchesHeldWeapon(skillName, info, held) then
-							return nil
+				if not forced then
+					if not info.class then
+						continue
+					end
+					if not usingEventFarmSkills() then
+						local held = getEquippedWeaponClassesCached()
+						if not skillMatchesHeldWeapon(name, info, held) then
+							continue
 						end
 					end
 				end
+				if isSkillReady(name) then
+					fireUseSkill(name, info, {
+						muteFor = 1.35,
+						ignoreGap = true,
+						allowPistol = forced,
+					})
+				end
+				if not tagName and not isSkipTag(name) and not forced then
+					tagName = name
+				end
+			end
+			if tagName then
+				skillName = tagName
 			end
 
-			-- Summon Pistol is projectile-only — never open a CTF-style tag window for it.
-			if forced then
+			if isSkipTag(skillName) then
 				return nil
 			end
 
@@ -11681,7 +11542,7 @@ local ok, err = pcall(function()
 				return tagged
 			end
 
-			if not isSkillReady(skillName) then
+			if not skillName then
 				return nil
 			end
 			if getgenv().SB2SkillCastLock then
@@ -11695,7 +11556,7 @@ local ok, err = pcall(function()
 			-- still needs it for DealDamage/Attack tags between casts.
 			getgenv().SB2SkillActiveName = skillName
 
-			local ok = fireUseSkill(skillName, info, { muteFor = 1.35 })
+			local ok = true
 			task.defer(function()
 				task.wait(0.15)
 				getgenv().SB2SkillCastLock = false
@@ -11874,12 +11735,15 @@ local ok, err = pcall(function()
 
 		-- Pistol cast when a mob is close (not full 200-stud killaura).
 		local PISTOL_CAST_RANGE = 30
+		local SUMMON_CAST_RANGE = 90
 		local pistolInCastRange = function(origin)
 			local mobsRoot = workspace:FindFirstChild('Mobs')
 			if not mobsRoot or not origin then
 				return false
 			end
-			local rangeSq = PISTOL_CAST_RANGE * PISTOL_CAST_RANGE
+			local selected = getActiveWeaponSkillName()
+			local range = SUMMON_CHANNEL_SEC[selected] and SUMMON_CAST_RANGE or PISTOL_CAST_RANGE
+			local rangeSq = range * range
 			for _, mob in mobsRoot:GetChildren() do
 				if isDeadMob(mob) or shouldSkipMob(mob) then
 					continue
@@ -12532,6 +12396,14 @@ local ok, err = pcall(function()
 					if a.rewardChest ~= b.rewardChest then
 						return a.rewardChest
 					end
+					-- Rift waves: four portals ate the whole tick. Nearby floor trash
+					-- has to land before far rifts or it sits until the portals die.
+					local closeSq = 72 * 72
+					local aNear = (not isRiftObjectiveMob(a.mob)) and a.distSq <= closeSq
+					local bNear = (not isRiftObjectiveMob(b.mob)) and b.distSq <= closeSq
+					if aNear ~= bNear then
+						return aNear
+					end
 					local aWave = waveKillMob ~= nil and a.mob == waveKillMob
 					local bWave = waveKillMob ~= nil and b.mob == waveKillMob
 					if aWave ~= bWave then
@@ -12558,14 +12430,33 @@ local ok, err = pcall(function()
 				if diving then
 					maxAttacks = math.min(maxAttacks, combatLiteLoadEnabled() and 3 or 6)
 				end
+				local closeSq = 72 * 72
+				local hasNearTrash = false
+				local riftAlive = false
+				for _, entry in ipairs(mobList) do
+					if isRiftObjectiveMob(entry.mob) then
+						riftAlive = true
+					elseif entry.distSq <= closeSq then
+						hasNearTrash = true
+					end
+				end
+				local riftHits = 0
+				local riftCap = (riftAlive and hasNearTrash) and math.max(2, math.floor(maxAttacks * 0.5)) or maxAttacks
 				for _, entry in ipairs(mobList) do
 					local mob = entry.mob
 					if attacked >= maxAttacks then
 						break
 					end
+					local isRift = isRiftObjectiveMob(mob)
+					if isRift and riftHits >= riftCap then
+						continue
+					end
 					local strikes = 1
 					if not diving and (entry.priority or entry.boss or entry.hitLives) then
 						strikes = prof.bossHits
+					end
+					if isRift and hasNearTrash then
+						strikes = 1
 					end
 					for _ = 1, strikes do
 						if attacked >= maxAttacks then
@@ -12576,6 +12467,9 @@ local ok, err = pcall(function()
 						end
 						if fireMobAttack(mob, attackName) then
 							attacked += 1
+							if isRift then
+								riftHits += 1
+							end
 							if not (entry.priority or entry.boss or entry.hitLives) then
 								onCooldown[mob] = true
 								task.delay(delay, function()
@@ -12948,6 +12842,18 @@ local ok, err = pcall(function()
 		local DIVE_LONG_HOP = 350 -- AutoFarm-style approach blinks (mobs + roam)
 		local DIVE_DODGE_RING = 38
 
+		local function rubricatusCoverActive(pos)
+			local fn = getgenv().SB2RubricatusInCoverWindow
+			if type(fn) == 'function' then
+				local ok, on = pcall(fn, os.clock(), typeof(pos) == 'Vector3' and pos or Vector3.zero)
+				if ok then
+					return on == true
+				end
+			end
+			return os.clock() < (tonumber(getgenv().SB2RubricatusNukeUntil) or 0)
+				and typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3'
+		end
+
 		local function diveVecHop(from, to, hop)
 			if typeof(from) ~= 'Vector3' or typeof(to) ~= 'Vector3' then
 				return typeof(to) == 'Vector3' and to or from
@@ -13206,6 +13112,12 @@ local ok, err = pcall(function()
 		getgenv().SB2DiveBlinkTeleport = function(hrp, dest, lookAt)
 			if not hrp or not hrp.Parent or typeof(dest) ~= 'Vector3' then
 				return false
+			end
+			local hopNow = getgenv().SB2WdRiftHopGoal
+			if typeof(hopNow) == 'Vector3' then
+				dest = hopNow
+				getgenv().SB2DiveChaseGoal = nil
+				getgenv().SB2DiveApproachUntil = 0
 			end
 			pcall(function()
 				hrp.Anchored = false
@@ -14034,11 +13946,12 @@ local ok, err = pcall(function()
 			end
 			local wdRiftHop = getgenv().SB2WdRiftHopGoal
 			if typeof(wdRiftHop) == 'Vector3' then
-				dest = Vector3.new(wdRiftHop.X, dest.Y, wdRiftHop.Z)
+				dest = wdRiftHop
+				writeOpts.noClamp = true
+				writeOpts.force = true
 			end
 			local rubCover = getgenv().SB2RubricatusCoverPos
-			local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
-			if typeof(rubCover) == 'Vector3' and os.clock() < rubUntil then
+			if typeof(rubCover) == 'Vector3' and rubricatusCoverActive(hrp.Position) then
 				dest = rubCover
 			end
 			-- Reject absurd blinks (boss respawn / void) that explode physics.
@@ -14272,11 +14185,9 @@ local ok, err = pcall(function()
 			if typeof(getgenv().SB2WdRiftHopGoal) == 'Vector3' then
 				return true
 			end
-			if typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3' then
-				local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
-				if os.clock() < rubUntil then
-					return true
-				end
+			local rubRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart')
+			if typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3' and rubricatusCoverActive(rubRoot and rubRoot.Position) then
+				return true
 			end
 			return false
 		end
@@ -14298,6 +14209,19 @@ local ok, err = pcall(function()
 			if not hrp then
 				return
 			end
+			if not workspace:FindFirstChild('WaveDefenseStuff') then
+				getgenv().SB2WdRiftHopGoal = nil
+				getgenv().SB2WdRiftHopActive = false
+			end
+			local wdRiftHop = getgenv().SB2WdRiftHopGoal
+			if typeof(wdRiftHop) == 'Vector3' then
+				getgenv().SB2DiveChaseGoal = nil
+				getgenv().SB2DiveApproachUntil = 0
+				diveHoldPos = wdRiftHop
+				getgenv().SB2DivePinPos = wdRiftHop
+				diveWriteCFrame(hrp, wdRiftHop, nil, { force = true, noClamp = true, hoverHold = true })
+				return
+			end
 			local approachUntil = tonumber(getgenv().SB2DiveApproachUntil) or 0
 			if os.clock() < approachUntil or typeof(getgenv().SB2DiveChaseGoal) == 'Vector3' then
 				pcall(function()
@@ -14314,20 +14238,22 @@ local ok, err = pcall(function()
 			if typeof(pin) ~= 'Vector3' then
 				pin = getgenv().SB2DivePinPos
 			end
-			if not workspace:FindFirstChild('WaveDefenseStuff') then
-				getgenv().SB2WdRiftHopGoal = nil
-				getgenv().SB2WdRiftHopActive = false
+			local vaelithMissile = getgenv().SB2VaelithMissileGoal
+			if typeof(vaelithMissile) == 'Vector3' then
+				local py = pin and pin.Y or vaelithMissile.Y
+				pin = Vector3.new(vaelithMissile.X, py, vaelithMissile.Z)
+				diveHoldPos = pin
+				getgenv().SB2DivePinPos = pin
 			end
-			local wdRiftHop = getgenv().SB2WdRiftHopGoal
-			if typeof(wdRiftHop) == 'Vector3' then
-				local py = pin and pin.Y or wdRiftHop.Y
-				pin = Vector3.new(wdRiftHop.X, py, wdRiftHop.Z)
+			local lightningGoal = getgenv().SB2LightningGoal
+			if typeof(lightningGoal) == 'Vector3' then
+				local py = pin and pin.Y or lightningGoal.Y
+				pin = Vector3.new(lightningGoal.X, py, lightningGoal.Z)
 				diveHoldPos = pin
 				getgenv().SB2DivePinPos = pin
 			end
 			local rubCover = getgenv().SB2RubricatusCoverPos
-			local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
-			local rubCoverActive = typeof(rubCover) == 'Vector3' and os.clock() < rubUntil
+			local rubCoverActive = typeof(rubCover) == 'Vector3' and rubricatusCoverActive(hrp.Position)
 			if rubCoverActive then
 				pin = rubCover
 				diveHoldPos = pin
@@ -16077,6 +16003,10 @@ local ok, err = pcall(function()
 			local circles = {}
 			local function namedDanger(n)
 				n = string.lower(tostring(n or ''))
+				-- Meatball / BallsBarrage markers: AutoFloorDodge lifts Y. A 6-stud XZ sidestep stays in the ball.
+				if n == 'indicatororb' or string.find(n, 'meatball', 1, true) then
+					return false
+				end
 				return string.find(n, 'circle', 1, true)
 					or string.find(n, 'ring', 1, true)
 					or string.find(n, 'aoe', 1, true)
@@ -16087,6 +16017,8 @@ local ok, err = pcall(function()
 					or string.find(n, 'slam', 1, true)
 					or string.find(n, 'meteor', 1, true)
 					or string.find(n, 'nova', 1, true)
+					or string.find(n, 'hitbox', 1, true)
+					or string.find(n, 'lightning', 1, true)
 			end
 			local function underTelegraphFolder(part)
 				local p = part
@@ -16169,6 +16101,11 @@ local ok, err = pcall(function()
 			scan(workspace:FindFirstChild('Lines'), 60)
 			scan(workspace:FindFirstChild('Circle'), 40)
 			scan(workspace:FindFirstChild('Telegraphs'), 120)
+			for _, ch in ipairs(workspace:GetChildren()) do
+				if ch:IsA('BasePart') then
+					addPart(ch)
+				end
+			end
 			pcall(function()
 				local CS = game:GetService('CollectionService')
 				local tags = { 'FillIn', 'EnemySkillHitbox' }
@@ -17165,6 +17102,9 @@ local ok, err = pcall(function()
 
 			-- Long-hop blink chain toward mobs (AutoFarm-style), without dumping on floor feet.
 			local function diveApproachMob(hrp, goalPos, lookAt, clampOpts)
+				if typeof(getgenv().SB2WdRiftHopGoal) == 'Vector3' then
+					return false
+				end
 				if not stillActive() or not hrp or not hrp.Parent or typeof(goalPos) ~= 'Vector3' then
 					return false
 				end
@@ -17643,12 +17583,14 @@ local ok, err = pcall(function()
 						tostring(diveFarmZone() and diveFarmZone().label or 'none')
 					)
 				)
-				diveHoldPos = approach
-				getgenv().SB2DivePinPos = approach
-				if dist0 > DIVE_ARRIVE + 2 then
-					diveApproachMob(myPart, approach, lookFocus, approachClamp)
-				elseif stillActive() and (myPart.Position - approach).Magnitude > DIVE_ARRIVE then
-					diveSnapTo(myPart, approach, lookFocus, approachClamp)
+				if typeof(getgenv().SB2WdRiftHopGoal) ~= 'Vector3' then
+					diveHoldPos = approach
+					getgenv().SB2DivePinPos = approach
+					if dist0 > DIVE_ARRIVE + 2 then
+						diveApproachMob(myPart, approach, lookFocus, approachClamp)
+					elseif stillActive() and (myPart.Position - approach).Magnitude > DIVE_ARRIVE then
+						diveSnapTo(myPart, approach, lookFocus, approachClamp)
+					end
 				end
 				if not stillActive() then
 					return
@@ -17706,6 +17648,19 @@ local ok, err = pcall(function()
 					end)
 					setDiveNoclip(true)
 					diveTickHeals()
+					do
+						local hopNow = getgenv().SB2WdRiftHopGoal
+						if typeof(hopNow) == 'Vector3' then
+							getgenv().SB2DiveChaseGoal = nil
+							getgenv().SB2DiveApproachUntil = 0
+							diveHoldPos = hopNow
+							getgenv().SB2DivePinPos = hopNow
+							diveWriteCFrame(myPart, hopNow, bossAim or lockedPos, { force = true, noClamp = true })
+							lastMoveAt = os.clock()
+							task.wait(0.05)
+							continue
+						end
+					end
 
 					local hpFrac = diveHealthFrac()
 					if hpFrac <= DIVE_HP_PANIC then
@@ -17784,14 +17739,16 @@ local ok, err = pcall(function()
 						nukeCharge, nukeWhy = detectBossNukeCharge(myPart.Position, mob)
 					end
 					if nukeCharge then
-						if os.clock() >= diveNukeUntil then
-							diveNukeAnchor = nil
+						local rubMob = mob and string.find(normBossKey(mob.Name), 'rubricatus', 1, true)
+						-- Rubricatus nuke is pillar cover, not under-map. Combo fill-ins
+						-- look like growing telegraphs and used to re-arm a 9s cover hold.
+						if not rubMob then
+							if os.clock() >= diveNukeUntil then
+								diveNukeAnchor = nil
+							end
+							diveNukeUntil = os.clock() + DIVE_NUKE_HOLD
+							diveDebug('nuke-charge', tostring(nukeWhy))
 						end
-						diveNukeUntil = os.clock() + DIVE_NUKE_HOLD
-						if mob and string.find(normBossKey(mob.Name), 'rubricatus', 1, true) then
-							getgenv().SB2RubricatusNukeUntil = os.clock() + 9
-						end
-						diveDebug('nuke-charge', tostring(nukeWhy))
 					end
 					local nukeFlee = os.clock() < diveNukeUntil
 					if wasNukeFlee and not nukeFlee and not panic then
@@ -17811,31 +17768,26 @@ local ok, err = pcall(function()
 					-- Rubricatus nuke: blink behind spawned pillar (not 16-stud beam shuffle).
 					do
 						local rkey = mob and normBossKey(mob.Name) or ''
-						if string.find(rkey, 'rubricatus', 1, true) then
-							local pillarsNear = type(getgenv().SB2RubricatusNukeTelegraph) == 'function'
-								and getgenv().SB2RubricatusNukeTelegraph(myPart.Position)
-							local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
-							if pillarsNear or os.clock() < rubUntil or nukeFlee then
-								local coverFn = getgenv().SB2RubricatusPillarCoverGoal
-								local snapFn = getgenv().SB2RubricatusSnapToCover
-								if type(coverFn) == 'function' then
-									local coverDest = coverFn(myPart.Position, stickyFightY, mob)
-									if typeof(coverDest) == 'Vector3' then
-										local bossFlat = getMobRoot(mob)
-										local look = bossFlat and bossFlat.Position or lockedPos
-										if type(snapFn) == 'function' then
-											pcall(snapFn, myPart, coverDest, look)
-										else
-											diveWriteCFrame(myPart, coverDest, look, {
-												force = true,
-												noClamp = true,
-											})
-										end
-										diveHoldPos = coverDest
-										getgenv().SB2DivePinPos = coverDest
-										task.wait(0.1)
-										continue
+						if string.find(rkey, 'rubricatus', 1, true) and rubricatusCoverActive(myPart.Position) then
+							local coverFn = getgenv().SB2RubricatusPillarCoverGoal
+							local snapFn = getgenv().SB2RubricatusSnapToCover
+							if type(coverFn) == 'function' then
+								local coverDest = coverFn(myPart.Position, stickyFightY, mob)
+								if typeof(coverDest) == 'Vector3' then
+									local bossFlat = getMobRoot(mob)
+									local look = bossFlat and bossFlat.Position or lockedPos
+									if type(snapFn) == 'function' then
+										pcall(snapFn, myPart, coverDest, look)
+									else
+										diveWriteCFrame(myPart, coverDest, look, {
+											force = true,
+											noClamp = true,
+										})
 									end
+									diveHoldPos = coverDest
+									getgenv().SB2DivePinPos = coverDest
+									task.wait(0.1)
+									continue
 								end
 							end
 						end
@@ -17865,7 +17817,9 @@ local ok, err = pcall(function()
 						end
 						dodgePos, needDash, dashDir, chargeThreat = telegraphEscape(myPart.Position, lockedPos)
 					end
-					if chargeThreat and isNukeBossMob(mob) and os.clock() >= diveNukeCooldownUntil then
+					if chargeThreat and isNukeBossMob(mob) and os.clock() >= diveNukeCooldownUntil
+						and not (mob and string.find(normBossKey(mob.Name), 'rubricatus', 1, true))
+					then
 						if os.clock() >= diveNukeUntil then
 							diveNukeAnchor = nil
 						end
@@ -17877,8 +17831,7 @@ local ok, err = pcall(function()
 					if dodgePos and not nukeFlee and not panic and (os.clock() - lastDodgeAt) >= 0.45 then
 						local rubShuffleBlock = mob
 							and string.find(normBossKey(mob.Name), 'rubricatus', 1, true)
-							and type(getgenv().SB2RubricatusNukeTelegraph) == 'function'
-							and getgenv().SB2RubricatusNukeTelegraph(myPart.Position)
+							and rubricatusCoverActive(myPart.Position)
 						if rubShuffleBlock then
 							dodgePos = nil
 						end
@@ -17903,7 +17856,7 @@ local ok, err = pcall(function()
 					if fleeing then
 						if nukeFlee and mob then
 							local rkey = normBossKey(mob.Name)
-							if string.find(rkey, 'rubricatus', 1, true) then
+							if string.find(rkey, 'rubricatus', 1, true) and rubricatusCoverActive(myPart.Position) then
 								local coverFn = getgenv().SB2RubricatusPillarCoverGoal
 								local snapFn = getgenv().SB2RubricatusSnapToCover
 								if type(coverFn) == 'function' then
@@ -18133,11 +18086,10 @@ local ok, err = pcall(function()
 					end
 					local wdRiftHop = getgenv().SB2WdRiftHopGoal
 					if typeof(wdRiftHop) == 'Vector3' then
-						stickPos = Vector3.new(wdRiftHop.X, stickyFightY, wdRiftHop.Z)
+						stickPos = wdRiftHop
 					end
 					local rubCover = getgenv().SB2RubricatusCoverPos
-					local rubUntil = tonumber(getgenv().SB2RubricatusNukeUntil) or 0
-					if typeof(rubCover) == 'Vector3' and os.clock() < rubUntil then
+					if typeof(rubCover) == 'Vector3' and rubricatusCoverActive(myPart.Position) then
 						stickPos = rubCover
 					end
 					if typeof(stickPos) == 'Vector3' then
@@ -18146,6 +18098,13 @@ local ok, err = pcall(function()
 					end
 					if not aimAt then
 						aimAt = bossAim or lockedPos
+					end
+					if typeof(wdRiftHop) == 'Vector3' then
+						getgenv().SB2DiveChaseGoal = nil
+						getgenv().SB2DiveApproachUntil = 0
+						diveWriteCFrame(myPart, wdRiftHop, aimAt, { force = true, noClamp = true })
+						lastMoveAt = os.clock()
+						continue
 					end
 					local flatNow = Vector3.new(myPart.Position.X - stickPos.X, 0, myPart.Position.Z - stickPos.Z)
 					local distNow = flatNow.Magnitude
@@ -19117,11 +19076,13 @@ local ok, err = pcall(function()
 				table.insert(supportValues, 1, defaultSupport)
 			end
 			CombatBox:AddDropdown('SkillName', {
-				Text = 'Skill (held weapon)',
+				Text = 'Skills (held weapon)',
 				Values = skillValues,
-				Default = defaultSkill,
-				AllowNull = false,
+				Default = {},
+				Multi = true,
+				AllowNull = true,
 				Searchable = true,
+				Tooltip = 'Multi-select. Ready skills all FireServer UseSkill the same tick. Summon Rifle/Minigun skip the game 3s lock.',
 			})
 			CombatBox:AddDropdown('SupportSkillName', {
 				Text = 'Support skills (buffs)',
@@ -19171,11 +19132,12 @@ local ok, err = pcall(function()
 					if getgenv().SB2ConfigLoading then
 						return
 					end
-					local skill = flattenOptionValue(value) or flattenOptionValue(Options.SkillName.Value)
-					if skill and skill ~= '' then
+					local map = collectMultiSkillMap(value)
+					syncMultiSkillOrder('SB2WeaponSkillOrder', map)
+					if next(map) then
 						getgenv().SB2UserPickedCombatSkill = true
 						getgenv().SB2HonorSavedCombatSkill = true
-						rememberPickedSkills(skill, nil)
+						rememberPickedSkills(map, nil)
 					end
 				end)
 			end)
@@ -19348,15 +19310,6 @@ local ok, err = pcall(function()
 							support:SetValue(true)
 						end
 					end)
-					if getgenv().SB2StrangerDodgeWasOn == true then
-						getgenv().SB2StrangerDodgeWasOn = nil
-						pcall(function()
-							local dodge = Toggles.AutoFloorDodge
-							if type(dodge) == 'table' and type(dodge.SetValue) == 'function' and dodge.Value ~= true then
-								dodge:SetValue(true)
-							end
-						end)
-					end
 				end
 				getgenv().SB2CombatAnchorOn = false
 				pcall(function()
@@ -19851,7 +19804,7 @@ local ok, err = pcall(function()
 		SoloBox:AddToggle('SoloCombatResume', {
 			Text = 'Resume',
 			Default = false,
-			Tooltip = 'When a stranger joins: Auto skill / Auto attack / Anchor / Event dive turn OFF. Resume stays on — when only you/alts remain, TP to WP, turn combat back on, and turn on Auto support skill. Saved with your profile.',
+			Tooltip = 'When a stranger joins: Auto skill / Auto attack / Anchor / Event dive / Auto dodge turn OFF. Resume stays on — when only you/alts remain, TP to WP and turn combat back on (Auto dodge stays as you left it). Saved with your profile.',
 		}):OnChanged(function(value)
 			-- Autoload Default=false must not wipe the sidecar / leave Resume off after profile load.
 			if getgenv().SB2ConfigLoading then
@@ -19904,16 +19857,10 @@ local ok, err = pcall(function()
 				if type(profile) == 'table' then
 					profile.SoloCombatResume = false
 				end
-				-- Resume owns the combat trio — turn them off with it.
+				-- Resume owns Auto skill / Auto attack. Auto dodge is a separate toggle.
 				getgenv().SB2StrangerDodgeWasOn = nil
 				setCombatTrio(false)
-				pcall(function()
-					local dodge = Toggles.AutoFloorDodge
-					if type(dodge) == 'table' and type(dodge.SetValue) == 'function' and dodge.Value == true then
-						dodge:SetValue(false)
-					end
-				end)
-				Library:Notify('Resume off — Auto skill / Auto attack / Combat Anchor / Auto dodge off', 3)
+				Library:Notify('Resume off — Auto skill / Auto attack / Combat Anchor off', 3)
 				return
 			end
 			getgenv().SB2StickyResumeWanted = true
@@ -19958,26 +19905,6 @@ local ok, err = pcall(function()
 				end
 			end
 		end
-
-		SoloBox:AddButton('Who is blocking Resume', function()
-			local names = {}
-			local listFn = getgenv().SB2ListStrangerPlayers
-			if type(listFn) == 'function' then
-				for _, plr in ipairs(listFn()) do
-					names[#names + 1] = ('%s (%d)'):format(plr.Name, plr.UserId)
-				end
-			end
-			if #names == 0 then
-				Library:Notify('Nobody blocking — only you/whitelist here', 5)
-			else
-				Library:Notify('Blocking Resume: ' .. table.concat(names, ', '), 8)
-			end
-		end)
-		SoloBox:AddButton('Reload whitelist.txt', function()
-			local fn = getgenv().SB2ReloadWhitelistFile or loadLocalWhitelistFile
-			pcall(fn)
-			Library:Notify('Reloaded PlayerTools/whitelist.txt — check F9 for added= / pending=', 6)
-		end)
 
 		local function assertResumeOn(reason)
 			-- Restore Resume when sticky/force says ON. Soft during load; also for a
@@ -20081,29 +20008,6 @@ local ok, err = pcall(function()
 				end
 			end)
 		end)
-		SoloBox:AddButton('Arm auto-block now', function()
-			getgenv().SB2ConfigLoading = false
-			getgenv().SB2SoloBlockProfileReady = true
-			pcall(function()
-				local t = Toggles.AutoBlockJoin
-				if type(t) == 'table' and type(t.SetValue) == 'function' then
-					t:SetValue(true)
-				end
-			end)
-			AutoBlock.sync(true, false)
-			AutoBlock.armPresent()
-			if getgenv().SB2AutoBlockIyOwner ~= true then
-				Library:Notify('Install IY plugin AutoBlock.iy first', 5)
-			else
-				Library:Notify('Auto block armed via IY', 4)
-			end
-		end)
-		SoloBox:AddButton('IY abarm (present)', function()
-			AutoBlock.sync(true, true)
-			AutoBlock.armPresent()
-			Library:Notify('Told IY to arm everyone already here', 4)
-		end)
-
 		-- Own IIFE: fresh-finder locals were tipping the Solo/Combat 200-register limit.
 		;(function()
 		local freshFinderLabel
@@ -25812,8 +25716,8 @@ local ok, err = pcall(function()
 					if type(readfile) == 'function' and type(isfile) == 'function' and isfile(p) then
 						local okRead, src = pcall(readfile, p)
 						if okRead and type(src) == 'string' and src ~= '' then
-							if not string.find(src, 'weapon-aura-preview-v7', 1, true) then
-								warn('[WeaponAuraPreview] stale WeaponAuraPreview.lua (expected v7) path=', p)
+							if not string.find(src, 'weapon-aura-preview-v9', 1, true) then
+								warn('[WeaponAuraPreview] stale WeaponAuraPreview.lua (expected v9) path=', p)
 							end
 							local fn, err = (loadstring or load)(src, p)
 							if fn then
@@ -28845,42 +28749,26 @@ local ok, err = pcall(function()
 			end)
 
 			local lines = {
-				('[[File:%s.png|center|thumb]]'):format(chestName),
-				'{| class="fandom-table" style="text-align:center;"',
-				'!Aura',
-				'!Image',
-				'!In-game Effect',
+				'{{Aura Chest Page',
+				('|chest = %s'):format(chestName),
 			}
-			for _, row in ipairs(wikiRows) do
-				lines[#lines + 1] = '|-'
-				lines[#lines + 1] = '{{Aura Gallery'
-				lines[#lines + 1] = '| title = ' .. row.name
-				lines[#lines + 1] = '| icon = ' .. row.name .. '.png'
-				lines[#lines + 1] = '| image1 = '
-				lines[#lines + 1] = '| image2 = '
-				lines[#lines + 1] = '}}'
+			local lower = chestName:lower()
+			if lower:find('event', 1, true) then
+				lines[#lines + 1] = '|event = yes'
 			end
-			lines[#lines + 1] = '|}'
-			lines[#lines + 1] = '==Trivia=='
-			lines[#lines + 1] = ''
-			lines[#lines + 1] = '[[Category:Burst Store]]'
-			lines[#lines + 1] = '[[Category:Aura]]'
-			lines[#lines + 1] = '[[Category:Accessory]]'
-			lines[#lines + 1] = '[[Category:Robux]]'
-			lines[#lines + 1] = '[[Category:Items]]'
-			lines[#lines + 1] = '[[Category:Accessories]]'
-			lines[#lines + 1] = '[[Category:Chest]]'
-			lines[#lines + 1] = '[[Category:Event]]'
-			lines[#lines + 1] = '[[Category:Event Aura]]'
+			for i, row in ipairs(wikiRows) do
+				lines[#lines + 1] = ('|%d = %s'):format(i, row.name)
+			end
+			lines[#lines + 1] = '}}'
 			return table.concat(lines, '\n')
 		end
 
 		-- Burst Store subpage body (not a duplicate of full [[Auras]]). Bot target: [[Auras/Burst Store]].
 		local WIKI_AURAS_HUB_INTRO = table.concat({
-			'<!-- PlayerTools BURST_STORE_PAGE: upload to [[Auras/Burst Store]] via sync_burst_store.py (not the whole Auras page). -->',
+			'<!-- Burst Store auras page (not the whole Auras hub). -->',
 			'{{DISPLAYTITLE:Burst Store auras}}',
 			'<div style="background-color: #2a4a3a; border: 1px solid #393756; padding: 8px; margin: 8px 0;">',
-			"<i><b>Editors:</b> Legacy + event chests stay on [[Auras]]. This page is <b>robux Burst Store only</b> — regenerate from PlayerTools → <b>Copy wiki: hub full (burst)</b>, then bot-upload <code>PlayerTools/auras_burst_store.wikitext</code> (or paste once). Nav + span IDs come from Cash Shop order.</i>",
+			"<i>Legacy and event chests stay on [[Auras]]. This page is the current robux Burst Store only.</i>",
 			'</div>',
 			'',
 			'__NOTOC__',
@@ -29986,57 +29874,6 @@ local ok, err = pcall(function()
 				return
 			end
 			copyWiki(dumpWikiChest(name))
-		end)
-
-		ChestBox:AddButton('Copy wiki: hub full (burst)', function()
-			local w = #listNormalAuraChests()
-			local b = #listBodyAuraChests()
-			if w + b == 0 then
-				Library:Notify('Open Cash Shop once, then Scan chests')
-				return
-			end
-			local text = dumpWikiAurasHubPage('burst_all')
-			writeWikiBurstStoreFiles(text)
-			copyWiki(text)
-			Library:Notify(
-				('Burst Store page: %d weapon + %d body → clipboard + auras_burst_store.wikitext (bot uploads [[Auras/Burst Store]])'):format(
-					w,
-					b
-				),
-				9
-			)
-		end)
-
-		ChestBox:AddButton('Copy wiki: hub chests only', function()
-			local w = #listNormalAuraChests()
-			local b = #listBodyAuraChests()
-			if w + b == 0 then
-				Library:Notify('Open Cash Shop once, then Scan chests')
-				return
-			end
-			copyWiki(dumpWikiAurasHubSections('burst_all'))
-			Library:Notify(
-				('Chest blocks only (%d) — paste into [[Auras/Burst Store]] or replace burst section; use hub full for nav too'):format(
-					w + b
-				),
-				7
-			)
-		end)
-
-		ChestBox:AddButton('Copy wiki: hub (weapon)', function()
-			if #listNormalAuraChests() == 0 then
-				Library:Notify('Open Cash Shop once, then Scan chests')
-				return
-			end
-			copyWiki(dumpWikiAurasHubPage('weapon'))
-		end)
-
-		ChestBox:AddButton('Copy wiki: hub (body)', function()
-			if #listBodyAuraChests() == 0 then
-				Library:Notify('Open Cash Shop once, then Scan chests')
-				return
-			end
-			copyWiki(dumpWikiAurasHubPage('body'))
 		end)
 
 		ChestBox:AddButton('Chest page copy', function()

@@ -767,24 +767,17 @@ return function(env)
 	local function tryEquipTitleRemote(titleName)
 		local ev = ReplicatedStorage:FindFirstChild('Event')
 		local fn = ReplicatedStorage:FindFirstChild('Function')
-		local actions = { 'SetTag', 'ChangeTag', 'EquipTag', 'SetCurrentTag' }
-		for _, action in ipairs(actions) do
-			if ev and ev:IsA('RemoteEvent') then
-				pcall(function()
-					ev:FireServer('Settings', { action, titleName })
-				end)
-			end
-			if fn and fn:IsA('RemoteFunction') then
-				pcall(function()
-					fn:InvokeServer('Settings', { action, titleName })
-				end)
-			end
-			task.wait(0.15)
-			if readEquippedTitle() == titleName then
-				return true
-			end
+		if ev and ev:IsA('RemoteEvent') then
+			pcall(function()
+				ev:FireServer('Settings', { 'SetTag', titleName })
+			end)
 		end
-		return false
+		if fn and fn:IsA('RemoteFunction') then
+			pcall(function()
+				fn:InvokeServer('Settings', { 'SetTag', titleName })
+			end)
+		end
+		return readEquippedTitle() == titleName
 	end
 
 	local function syncStaffIndexForPreview(previewPlayerName, staffIndex)
@@ -2667,12 +2660,6 @@ return function(env)
 		if readEquippedTitle() == titleName then
 			return true, clicked and 'ui' or 'already'
 		end
-		if clicked then
-			task.wait(0.25)
-			if readEquippedTitle() == titleName then
-				return true, 'ui'
-			end
-		end
 		if tryEquipTitleRemote(titleName) then
 			return true, 'remote'
 		end
@@ -2732,14 +2719,15 @@ return function(env)
 		task.spawn(function()
 			while switcherToken == token do
 				rotateOwnedTitle(false)
-				local secs = 15
+				local secs = 0.5
 				if Options.TitlingSwitcherSeconds then
-					secs = math.max(3, tonumber(Options.TitlingSwitcherSeconds.Value) or 15)
+					secs = math.clamp(tonumber(Options.TitlingSwitcherSeconds.Value) or 0.5, 0.2, 3)
 				end
 				local waited = 0
 				while waited < secs and switcherToken == token do
-					task.wait(0.25)
-					waited += 0.25
+					local step = math.min(0.05, secs - waited)
+					task.wait(step)
+					waited += step
 				end
 			end
 		end)
@@ -2788,44 +2776,37 @@ return function(env)
 		Library:Notify(('Titling - %d players, %d titles'):format(pn, tn), 4)
 	end)
 
-	TitlingBox:AddToggle('TitlingSwitcher', {
-		Text = 'Title switcher',
-		Default = false,
-		Tooltip = 'Cycle every title you own on a timer. Uses Cosmetic Tags, then the Cosmetic Titles rows.',
-	}):OnChanged(function(on)
-		if on then
-			local owned = listOwnedTitles()
-			if #owned < 2 then
-				Library:Notify((#owned == 0) and 'No owned titles found' or 'Need at least two owned titles', 6, true)
-				if Options.TitlingSwitcher and type(Options.TitlingSwitcher.SetValue) == 'function' then
-					task.defer(function()
-						pcall(function()
-							Options.TitlingSwitcher:SetValue(false)
-						end)
-					end)
-				end
-				return
-			end
-			setStatus(('Switcher ready — %d owned titles'):format(#owned))
-			startTitleSwitcher()
-		else
-			stopTitleSwitcher()
-			setStatus('Title switcher off')
+	local function disableSwitcherToggle()
+		if Options.TitlingSwitcher and type(Options.TitlingSwitcher.SetValue) == 'function' then
+			task.defer(function()
+				pcall(function()
+					Options.TitlingSwitcher:SetValue(false)
+				end)
+			end)
 		end
-	end)
+	end
 
-	TitlingBox:AddSlider('TitlingSwitcherSeconds', {
-		Text = 'Switch interval (s)',
-		Default = 15,
-		Min = 3,
-		Max = 300,
-		Rounding = 0,
-		Tooltip = 'How long to keep each owned title before swapping to the next.',
-	})
-
-	TitlingBox:AddButton('Next title now', function()
+	getgenv().SB2TitleSwitcherStart = function()
+		local owned = listOwnedTitles()
+		if #owned < 2 then
+			Library:Notify((#owned == 0) and 'No owned titles found' or 'Need at least two owned titles', 6, true)
+			disableSwitcherToggle()
+			setStatus((#owned == 0) and 'No owned titles found' or 'Need at least two owned titles')
+			return false
+		end
+		setStatus(('Switcher ready — %d owned titles'):format(#owned))
+		startTitleSwitcher()
+		return true
+	end
+	getgenv().SB2TitleSwitcherStop = stopTitleSwitcher
+	getgenv().SB2TitleSwitcherNext = function()
 		rotateOwnedTitle(true)
-	end)
+	end
+	if Options.TitlingSwitcher and Options.TitlingSwitcher.Value == true then
+		task.defer(function()
+			getgenv().SB2TitleSwitcherStart()
+		end)
+	end
 
 	TitlingBox:AddButton('Apply preview', function()
 		local playerName = Options.TitlingPlayer and Options.TitlingPlayer.Value

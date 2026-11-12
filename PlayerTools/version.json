@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.35",
+    "version":  "1.0.36",
     "message":  "Wave Defense panel loads WD highlight module at UI build (wd-panel-fix-v1)",
     "files":  [
                   "PlayerTools/launch.lua",
@@ -8,6 +8,7 @@
                   "PlayerTools/Updater.lua",
                   "PlayerTools/HiveMind.lua",
                   "PlayerTools/PlayerTools_Obsidian.lua",
+                  "PlayerTools/WeaponAuraPreview.lua",
                   "PlayerTools/PlayerTools_Starlight.lua",
                   "PlayerTools/PlayerTools_event_dive.lua",
                   "PlayerTools/StarlightAdapter.lua",

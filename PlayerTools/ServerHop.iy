@@ -35,7 +35,7 @@ pcall(function()
 end)
 
 -- Bump when Join panel click behavior changes (forces new floor rows / handlers).
-local SERVER_HOP_UI_VER = 7
+local SERVER_HOP_UI_VER = 9
 getgenv().SB2ServerHopUiVerExpected = SERVER_HOP_UI_VER
 if getgenv().SB2ServerHopUiVer ~= SERVER_HOP_UI_VER then
 	pcall(function()
@@ -459,31 +459,80 @@ local function httpRequest(opts)
 	return res
 end
 
+local joinBusyUntil = 0
+
+local function serverInstanceId(srv)
+	if type(srv) == 'string' and srv ~= '' then
+		return srv
+	end
+	if type(srv) ~= 'table' then
+		return nil
+	end
+	local id = srv.id or srv.Id or srv.jobId or srv.JobId or srv.instanceId or srv.InstanceId
+	if type(id) == 'string' and id ~= '' then
+		return id
+	end
+	if id ~= nil then
+		id = tostring(id)
+		if id ~= '' and id ~= 'nil' then
+			return id
+		end
+	end
+	return nil
+end
+
+local function teleportToJob(placeId, jobId)
+	-- TeleportToPlaceInstance often returns without error and never teleports.
+	-- TeleportAsync + ServerInstanceId is the current public-server join.
+	local okAsync = pcall(function()
+		local opts = Instance.new('TeleportOptions')
+		opts.ServerInstanceId = jobId
+		TeleportService:TeleportAsync(placeId, { LocalPlayer }, opts)
+	end)
+	if okAsync then
+		return true
+	end
+	local okInst = pcall(function()
+		TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+	end)
+	if okInst then
+		return true
+	end
+	return pcall(function()
+		TeleportService:TeleportToPlaceInstance(placeId, jobId)
+	end)
+end
+
 local function joinPlaceInstance(placeId, jobId, label)
 	placeId = tonumber(placeId)
-	jobId = type(jobId) == 'string' and jobId or nil
-	if not placeId or not jobId or jobId == '' then
+	jobId = serverInstanceId(jobId)
+	if not placeId or not jobId then
+		say('that server has no join id')
 		return false
 	end
 	if placeId == game.PlaceId and jobId == game.JobId then
 		say('already in that server')
 		return false
 	end
+	local now = os.clock()
+	if now < joinBusyUntil then
+		return false
+	end
+	joinBusyUntil = now + 2
 	if type(getgenv().SB2PlayerToolsArmTeleport) == 'function' then
 		pcall(getgenv().SB2PlayerToolsArmTeleport)
 	end
 	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
 		pcall(getgenv().SB2CloseAllPillPanels)
 	end
-	setFloorPanelOpen(false)
 	say('joining ' .. tostring(label or jobId:sub(1, 8)) .. '…')
-	local ok, err = pcall(function()
-		TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
-	end)
+	local ok = teleportToJob(placeId, jobId)
 	if not ok then
-		say('instance join failed: ' .. tostring(err))
+		joinBusyUntil = 0
+		say('instance join failed')
 		return false
 	end
+	setFloorPanelOpen(false)
 	return true
 end
 
@@ -558,39 +607,53 @@ local function fetchPublicServersPage(placeId, cursor)
 	end
 	local urls = {
 		('https://games.roblox.com/v1/games/%.0f/servers/Public?%s'):format(placeId, q),
+		('https://games.roblox.com/v1/games/%.0f/servers/0?%s'):format(placeId, q),
 		('https://games.roproxy.com/v1/games/%.0f/servers/Public?%s'):format(placeId, q),
+	}
+	local headers = {
+		Accept = 'application/json',
+		['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+		Referer = ('https://www.roblox.com/games/%.0f'):format(placeId),
 	}
 	local lastErr = 'HTTP failed'
 	for _, url in ipairs(urls) do
-		local res, err = httpRequest({
-			Url = url,
-			Method = 'GET',
-			Headers = { Accept = 'application/json' },
-		})
-		if not res then
-			lastErr = err or lastErr
-			continue
+		for attempt = 1, 2 do
+			local res, err = httpRequest({
+				Url = url,
+				Method = 'GET',
+				Headers = headers,
+			})
+			if not res then
+				lastErr = err or lastErr
+				break
+			end
+			local status = tonumber(res.StatusCode) or tonumber(res.Status) or 0
+			local rawBody = res.Body or res.body or ''
+			if status == 403 or status == 429 then
+				lastErr = (status == 429) and 'rate limited — wait, then Refresh'
+					or 'Roblox blocked the server list (403) — use Join random'
+				task.wait(0.35)
+				continue
+			end
+			if status < 200 or status >= 300 or type(rawBody) ~= 'string' or rawBody == '' then
+				lastErr = ('HTTP %s'):format(tostring(status))
+				break
+			end
+			local okDecode, data = pcall(function()
+				return HttpService:JSONDecode(rawBody)
+			end)
+			if not okDecode or type(data) ~= 'table' then
+				lastErr = 'bad JSON'
+				break
+			end
+			local rows = data.data or data.Data
+			if type(rows) ~= 'table' then
+				lastErr = 'no servers array'
+				break
+			end
+			local nextCursor = data.nextPageCursor or data.NextPageCursor
+			return rows, nil, nextCursor
 		end
-		local status = tonumber(res.StatusCode) or tonumber(res.Status) or 0
-		local rawBody = res.Body or res.body or ''
-		if status < 200 or status >= 300 or type(rawBody) ~= 'string' or rawBody == '' then
-			lastErr = ('HTTP %s'):format(tostring(status))
-			continue
-		end
-		local okDecode, data = pcall(function()
-			return HttpService:JSONDecode(rawBody)
-		end)
-		if not okDecode or type(data) ~= 'table' then
-			lastErr = 'bad JSON'
-			continue
-		end
-		local rows = data.data or data.Data
-		if type(rows) ~= 'table' then
-			lastErr = 'no servers array'
-			continue
-		end
-		local nextCursor = data.nextPageCursor or data.NextPageCursor
-		return rows, nil, nextCursor
 	end
 	return nil, lastErr, nil
 end
@@ -792,6 +855,9 @@ local function fillServerList(list, rec, nextCursor, accumulated)
 	addActionButton('Join random server', Color3.fromRGB(45, 70, 95), function()
 		joinPlace(rec)
 	end)
+	addActionButton('Refresh servers', Color3.fromRGB(55, 72, 58), function()
+		fillServerList(list, rec)
+	end)
 
 	local loading = Instance.new('TextLabel')
 	loading.Size = UDim2.new(1, -4, 0, 28)
@@ -834,7 +900,7 @@ local function fillServerList(list, rec, nextCursor, accumulated)
 		end
 
 		for _, srv in ipairs(page) do
-			if type(srv) == 'table' and srv.id then
+			if type(srv) == 'table' and serverInstanceId(srv) then
 				accumulated[#accumulated + 1] = srv
 			end
 		end
@@ -874,9 +940,12 @@ local function fillServerList(list, rec, nextCursor, accumulated)
 		local hereJob = tostring(game.JobId or '')
 
 		for _, srv in ipairs(accumulated) do
-			local job = tostring(srv.id)
-			local playing = tonumber(srv.playing) or 0
-			local maxP = tonumber(srv.maxPlayers) or 20
+			local job = serverInstanceId(srv)
+			if not job then
+				continue
+			end
+			local playing = tonumber(srv.playing or srv.Playing) or 0
+			local maxP = tonumber(srv.maxPlayers or srv.MaxPlayers) or 20
 			local friends = friendsMap[job]
 			local friendLine = ''
 			if type(friends) == 'table' and #friends > 0 then
@@ -891,6 +960,7 @@ local function fillServerList(list, rec, nextCursor, accumulated)
 			row.Size = UDim2.new(1, -4, 0, friendLine ~= '' and 52 or 40)
 			row.BackgroundColor3 = Color3.fromRGB(36, 40, 48)
 			row.BorderSizePixel = 0
+			row.Active = true
 			row.AutoButtonColor = true
 			row.Font = Enum.Font.GothamMedium
 			row.TextSize = 12
@@ -908,9 +978,11 @@ local function fillServerList(list, rec, nextCursor, accumulated)
 			rowOrder += 1
 			row.Parent = list
 			Instance.new('UICorner', row).CornerRadius = UDim.new(0, 6)
-			row.MouseButton1Click:Connect(function()
+			local function onJoinClick()
 				joinPlaceInstance(rec.placeId, job, label .. ' · ' .. playing .. ' players')
-			end)
+			end
+			row.Activated:Connect(onJoinClick)
+			row.MouseButton1Click:Connect(onJoinClick)
 		end
 
 		if gen ~= serverBrowseGen then
