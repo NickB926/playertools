@@ -2,7 +2,7 @@
 	The Between (Wave Defense party lobby) — create party, set mode/status, start run.
 	Split from PlayerTools_Obsidian.lua (register / size).
 ]]
-getgenv().SB2BetweenPartyBuild = 'follow-friend-v24-panel-sync'
+getgenv().SB2BetweenPartyBuild = 'follow-friend-v25-no-solo-wipe'
 
 -- Keep the in-game party panel in sync with the real party (Status/Mode).
 -- One loop per client: newest loader wins via a token.
@@ -1208,6 +1208,21 @@ return function(env)
 		return tostring(btn.Text or '') == 'Pay to revive?'
 	end
 
+	-- Anyone else in this run still alive? (Run servers only hold the run's own players.)
+	-- "Pay to revive?" shows as soon as YOU are out of lives, even while the others keep going;
+	-- restarting then dragged the whole party out of a live run (e.g. dying to Rubricatus at wave 100).
+	local function othersStillAlive()
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LocalPlayer then
+				local hum = plr.Character and plr.Character:FindFirstChildOfClass('Humanoid')
+				if hum and hum.Health > 0 then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
 	local followBlocksChain -- set below (follow-friend mode)
 
 	local function tryAutoChainStart()
@@ -1806,6 +1821,13 @@ return function(env)
 			if typeof(lives) == 'number' and lives > 0 and wipe then
 				clearRunFinished()
 				wipe = false
+			elseif payToReviveVisible() and othersStillAlive() then
+				-- Only you are out: the run goes on without you. Don't start a new one.
+				local now = os.clock()
+				if now - (tonumber(getgenv().SB2SoloWipeLogAt) or 0) > 30 then
+					getgenv().SB2SoloWipeLogAt = now
+					chainLog('out of lives but teammates still alive - not restarting')
+				end
 			elseif payToReviveVisible() then
 				local mode = workspace:GetAttribute('WaveDefenseMode') or currentPartyMode()
 				if type(mode) == 'string' and mode ~= '' then

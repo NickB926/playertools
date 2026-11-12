@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.39",
+    "version":  "1.0.40",
     "message":  "Wave Defense panel loads WD highlight module at UI build (wd-panel-fix-v1)",
     "files":  [
                   "PlayerTools/Ataraxia.iy",
@@ -47,5 +47,5 @@
                   "PlayerTools/backend",
                   "PlayerTools/version.json"
               ],
-    "build":  "20261112212259"
+    "build":  "20261112222239"
 }

@@ -3,9 +3,12 @@
 	(both accounts running it = they walk / dodge through each other). Local physics only.
 	Part of the whitelist rule: while someone NOT on the whitelist is in the server it pauses
 	(collisions come back) and resumes by itself when they leave.
+	v4: also moves their parts into the game's own "NoCollision" collision group (which the
+	"Players" group never collides with). CanCollide alone gets switched back on by their Humanoid
+	inside the physics step, which is what still launched you upward now and then.
 	Used by PlayerTools (Combat box) and AutoBetween (Dodge box).
 ]]
-getgenv().SB2NoCollideBuild = 'no-collide-v3'
+getgenv().SB2NoCollideBuild = 'no-collide-v4'
 
 return function(env)
 	local box = env.Box
@@ -45,6 +48,26 @@ return function(env)
 	end
 
 	local changed = setmetatable({}, { __mode = 'k' }) -- parts we turned off
+	-- A collision group that never touches "Players" (The Between has "NoCollision").
+	local NOCOLL
+	pcall(function()
+		local PS = game:GetService('PhysicsService')
+		for _, name in ipairs({ 'NoCollision', 'MobsNoCollision' }) do
+			if PS:IsCollisionGroupRegistered(name) and not PS:CollisionGroupsAreCollidable('Players', name)
+				and not PS:CollisionGroupsAreCollidable('Default', name) then
+				NOCOLL = name
+				break
+			end
+		end
+		if not NOCOLL then
+			for _, name in ipairs({ 'NoCollision', 'MobsNoCollision' }) do
+				if PS:IsCollisionGroupRegistered(name) and not PS:CollisionGroupsAreCollidable('Players', name) then
+					NOCOLL = name
+					break
+				end
+			end
+		end
+	end)
 	local cache = {} -- [player] = { char = Model, parts = { BasePart } }
 	local cacheAt = 0
 
@@ -62,6 +85,9 @@ return function(env)
 				if part.Parent then
 					part.CanCollide = type(orig) ~= 'table' or orig[1] == true
 					part.CanTouch = type(orig) ~= 'table' or orig[2] == true
+					if type(orig) == 'table' and orig[3] then
+						part.CollisionGroup = orig[3]
+					end
 				end
 			end)
 			changed[part] = nil
@@ -134,12 +160,15 @@ return function(env)
 		for _, entry in pairs(cache) do
 			for _, part in ipairs(entry.parts) do
 				-- Humanoids turn the root/torso back on every physics step, so this runs on every step
-				if part.Parent and (part.CanCollide or part.CanTouch) then
+				if part.Parent and (part.CanCollide or part.CanTouch or (NOCOLL and part.CollisionGroup ~= NOCOLL)) then
 					if not changed[part] then
-						changed[part] = { part.CanCollide, part.CanTouch } -- remember the originals
+						changed[part] = { part.CanCollide, part.CanTouch, part.CollisionGroup } -- remember the originals
 					end
 					part.CanCollide = false
 					part.CanTouch = false
+					if NOCOLL and part.CollisionGroup ~= NOCOLL then
+						part.CollisionGroup = NOCOLL
+					end
 				end
 			end
 		end

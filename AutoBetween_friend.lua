@@ -1893,7 +1893,7 @@ FILES['BetweenParty.lua'] = [=[
 	The Between (Wave Defense party lobby) — create party, set mode/status, start run.
 	Split from PlayerTools_Obsidian.lua (register / size).
 ]]
-getgenv().SB2BetweenPartyBuild = 'follow-friend-v24-panel-sync'
+getgenv().SB2BetweenPartyBuild = 'follow-friend-v25-no-solo-wipe'
 
 -- Keep the in-game party panel in sync with the real party (Status/Mode).
 -- One loop per client: newest loader wins via a token.
@@ -3099,6 +3099,21 @@ return function(env)
 		return tostring(btn.Text or '') == 'Pay to revive?'
 	end
 
+	-- Anyone else in this run still alive? (Run servers only hold the run's own players.)
+	-- "Pay to revive?" shows as soon as YOU are out of lives, even while the others keep going;
+	-- restarting then dragged the whole party out of a live run (e.g. dying to Rubricatus at wave 100).
+	local function othersStillAlive()
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LocalPlayer then
+				local hum = plr.Character and plr.Character:FindFirstChildOfClass('Humanoid')
+				if hum and hum.Health > 0 then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
 	local followBlocksChain -- set below (follow-friend mode)
 
 	local function tryAutoChainStart()
@@ -3697,6 +3712,13 @@ return function(env)
 			if typeof(lives) == 'number' and lives > 0 and wipe then
 				clearRunFinished()
 				wipe = false
+			elseif payToReviveVisible() and othersStillAlive() then
+				-- Only you are out: the run goes on without you. Don't start a new one.
+				local now = os.clock()
+				if now - (tonumber(getgenv().SB2SoloWipeLogAt) or 0) > 30 then
+					getgenv().SB2SoloWipeLogAt = now
+					chainLog('out of lives but teammates still alive - not restarting')
+				end
 			elseif payToReviveVisible() then
 				local mode = workspace:GetAttribute('WaveDefenseMode') or currentPartyMode()
 				if type(mode) == 'string' and mode ~= '' then
@@ -10545,9 +10567,12 @@ FILES['NoPlayerCollide.lua'] = [=[
 	(both accounts running it = they walk / dodge through each other). Local physics only.
 	Part of the whitelist rule: while someone NOT on the whitelist is in the server it pauses
 	(collisions come back) and resumes by itself when they leave.
+	v4: also moves their parts into the game's own "NoCollision" collision group (which the
+	"Players" group never collides with). CanCollide alone gets switched back on by their Humanoid
+	inside the physics step, which is what still launched you upward now and then.
 	Used by PlayerTools (Combat box) and AutoBetween (Dodge box).
 ]]
-getgenv().SB2NoCollideBuild = 'no-collide-v3'
+getgenv().SB2NoCollideBuild = 'no-collide-v4'
 
 return function(env)
 	local box = env.Box
@@ -10587,6 +10612,26 @@ return function(env)
 	end
 
 	local changed = setmetatable({}, { __mode = 'k' }) -- parts we turned off
+	-- A collision group that never touches "Players" (The Between has "NoCollision").
+	local NOCOLL
+	pcall(function()
+		local PS = game:GetService('PhysicsService')
+		for _, name in ipairs({ 'NoCollision', 'MobsNoCollision' }) do
+			if PS:IsCollisionGroupRegistered(name) and not PS:CollisionGroupsAreCollidable('Players', name)
+				and not PS:CollisionGroupsAreCollidable('Default', name) then
+				NOCOLL = name
+				break
+			end
+		end
+		if not NOCOLL then
+			for _, name in ipairs({ 'NoCollision', 'MobsNoCollision' }) do
+				if PS:IsCollisionGroupRegistered(name) and not PS:CollisionGroupsAreCollidable('Players', name) then
+					NOCOLL = name
+					break
+				end
+			end
+		end
+	end)
 	local cache = {} -- [player] = { char = Model, parts = { BasePart } }
 	local cacheAt = 0
 
@@ -10604,6 +10649,9 @@ return function(env)
 				if part.Parent then
 					part.CanCollide = type(orig) ~= 'table' or orig[1] == true
 					part.CanTouch = type(orig) ~= 'table' or orig[2] == true
+					if type(orig) == 'table' and orig[3] then
+						part.CollisionGroup = orig[3]
+					end
 				end
 			end)
 			changed[part] = nil
@@ -10676,12 +10724,15 @@ return function(env)
 		for _, entry in pairs(cache) do
 			for _, part in ipairs(entry.parts) do
 				-- Humanoids turn the root/torso back on every physics step, so this runs on every step
-				if part.Parent and (part.CanCollide or part.CanTouch) then
+				if part.Parent and (part.CanCollide or part.CanTouch or (NOCOLL and part.CollisionGroup ~= NOCOLL)) then
 					if not changed[part] then
-						changed[part] = { part.CanCollide, part.CanTouch } -- remember the originals
+						changed[part] = { part.CanCollide, part.CanTouch, part.CollisionGroup } -- remember the originals
 					end
 					part.CanCollide = false
 					part.CanTouch = false
+					if NOCOLL and part.CollisionGroup ~= NOCOLL then
+						part.CollisionGroup = NOCOLL
+					end
 				end
 			end
 		end
