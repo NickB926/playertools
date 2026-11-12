@@ -1,0 +1,738 @@
+--[[
+    CheaterWatch.iy — movement flags for other players.
+
+    Watches positions the game already replicates. Includes you when Watch me is on.     Flags:
+      teleport  — one step of 180+ studs
+      speed     — 100+ studs/sec on the ground plane, held 0.7s
+                  (Watch me: 50+ studs/sec, held 0.4s)
+      fly       — a measured floor is far below, held 2.4s
+                  (Watch me: PlatformStand hover also counts; works while alone)
+
+    A jump that moves 3 or more people in the same moment is treated as a
+    game teleport and ignored. Does not punish anyone.
+    Pill: CD on the shared dock. Click opens the list.
+]]
+
+local Players = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local UserInputService = game:GetService('UserInputService')
+
+local LocalPlayer = Players.LocalPlayer
+	or Players:GetPropertyChangedSignal('LocalPlayer'):Wait()
+	or Players.LocalPlayer
+
+local GENV = 'SB2CheaterWatch'
+local GENV_STOP = 'SB2CheaterWatchStop'
+local GENV_CONN = 'SB2CheaterWatchConn'
+local GENV_LEAVE = 'SB2CheaterWatchLeave'
+local GENV_GUI = 'SB2CheaterWatchGui'
+
+local TELEPORT_STUDS = 180
+local SPEED_STUDS = 100
+local SPEED_HOLD = 0.7
+local SELF_SPEED_STUDS = 50
+local SELF_SPEED_HOLD = 0.4
+local FLY_HOLD = 2.4
+local FLY_CLEARANCE = 18
+local SELF_FLY_GAP = 8
+local FLY_ARM_SEC = 8
+local FLY_SEEN_SEC = 6
+local SELF_FLY_SEEN = 1
+local GROUND_MEMORY = 20
+local SAMPLE_GAP_MAX = 0.75
+local FLAG_MERGE_SEC = 10
+local RAY_GAP = 0.15
+local DEBUG_GAP = 0.25
+
+if type(getgenv()[GENV_STOP]) == 'function' then
+	pcall(getgenv()[GENV_STOP])
+end
+
+local state = getgenv()[GENV]
+if type(state) ~= 'table' then
+	state = {}
+	getgenv()[GENV] = state
+end
+if type(state.flags) ~= 'table' then
+	state.flags = {}
+end
+state.open = state.open == true
+if state.watchSelf == nil then
+	state.watchSelf = true
+end
+state.flyArmAt = os.clock() + FLY_ARM_SEC
+state.selfDebug = state.selfDebug or 'you  —'
+
+local function watching(plr)
+	if not plr then
+		return false
+	end
+	if plr == LocalPlayer then
+		return state.watchSelf == true
+	end
+	return true
+end
+
+local samples = {}
+
+local function parentGui()
+	local ok, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and hui then
+		return hui
+	end
+	return game:GetService('CoreGui') or (LocalPlayer and LocalPlayer:FindFirstChild('PlayerGui'))
+end
+
+local function getCharacter(plr)
+	if not plr then
+		return nil
+	end
+	local char = plr.Character
+	if char and char.Parent then
+		return char
+	end
+	local folder = workspace:FindFirstChild('Characters')
+	local alt = folder and folder:FindFirstChild(plr.Name)
+	if alt and alt.Parent then
+		return alt
+	end
+	return nil
+end
+
+local function getRoot(char)
+	if not char then
+		return nil
+	end
+	return char:FindFirstChild('HumanoidRootPart')
+		or char:FindFirstChild('UpperTorso')
+		or char:FindFirstChild('Torso')
+		or char.PrimaryPart
+end
+
+local function displayLine(plr)
+	if not plr then
+		return '?'
+	end
+	local name = plr.Name
+	local display = plr.DisplayName
+	if type(display) == 'string' and display ~= '' and display ~= name then
+		return name .. ' (' .. display .. ')'
+	end
+	return name
+end
+
+local function uniqueFlagged()
+	local seen = {}
+	local n = 0
+	for _, row in ipairs(state.flags) do
+		if row.userId and not seen[row.userId] then
+			seen[row.userId] = true
+			n += 1
+		end
+	end
+	return n
+end
+
+local refreshGui
+local refreshPill
+local refreshSelfLine
+
+local function loadPillDock()
+	if type(getgenv().SB2RegisterPill) == 'function' then
+		return true
+	end
+	for _, path in ipairs({ 'PlayerTools/PillDock.lua', 'PillDock.lua' }) do
+		local ok, src = pcall(function()
+			return readfile(path)
+		end)
+		if ok and type(src) == 'string' and #src > 50 then
+			local okLoad = pcall(function()
+				assert(loadstring(src))()
+			end)
+			if okLoad and type(getgenv().SB2RegisterPill) == 'function' then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+refreshPill = function()
+	local n = uniqueFlagged()
+	local text = n > 0 and ('CD ' .. tostring(n)) or 'CD'
+	local color = n > 0 and Color3.fromRGB(255, 186, 120) or Color3.fromRGB(210, 214, 220)
+	if type(getgenv().SB2SetPillText) == 'function' then
+		getgenv().SB2SetPillText('CD', text)
+	end
+	local dock = getgenv().SB2PillDock
+	local pill = dock and dock.pills and dock.pills.CD
+	if pill then
+		pill.Text = text
+		pill.TextColor3 = color
+	end
+end
+
+local function registerPill()
+	if not loadPillDock() then
+		return nil
+	end
+	local btn = getgenv().SB2RegisterPill({
+		id = 'CD',
+		text = 'CD',
+		textColor = Color3.fromRGB(210, 214, 220),
+		strokeColor = Color3.fromRGB(140, 110, 60),
+		onClick = function()
+			local fn = getgenv().SB2CheaterWatchToggle
+			if type(fn) == 'function' then
+				fn()
+			end
+		end,
+	})
+	refreshPill()
+	return btn
+end
+
+local function note(plr, reason)
+	if not watching(plr) then
+		return
+	end
+	local now = os.clock()
+	for _, row in ipairs(state.flags) do
+		if row.userId == plr.UserId and row.reason == reason and (now - row.at) <= FLAG_MERGE_SEC then
+			row.count = (row.count or 1) + 1
+			row.at = now
+			row.name = displayLine(plr)
+			if refreshGui then
+				refreshGui()
+			end
+			refreshPill()
+			return
+		end
+	end
+	table.insert(state.flags, 1, {
+		userId = plr.UserId,
+		name = displayLine(plr),
+		reason = reason,
+		count = 1,
+		at = now,
+	})
+	while #state.flags > 40 do
+		table.remove(state.flags)
+	end
+	if refreshGui then
+		refreshGui()
+	end
+	refreshPill()
+end
+
+local function groundGap(char, root)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = { char }
+	local mine = getCharacter(LocalPlayer)
+	if mine and mine ~= char then
+		ignore[#ignore + 1] = mine
+	end
+	params.FilterDescendantsInstances = ignore
+	local origin = root.Position + Vector3.new(0, 8, 0)
+	for _ = 1, 6 do
+		local hit = workspace:Raycast(origin, Vector3.new(0, -4000, 0), params)
+		if not hit then
+			return nil
+		end
+		local gap = root.Position.Y - hit.Position.Y
+		-- A hit above the root is a ceiling. Skip it and keep looking for the floor.
+		if gap >= -2 then
+			return gap
+		end
+		ignore[#ignore + 1] = hit.Instance
+		params.FilterDescendantsInstances = ignore
+		origin = hit.Position - Vector3.new(0, 0.5, 0)
+	end
+	return nil
+end
+
+local function standingOnFloor(char, root, gap, ignoreMaterial)
+	local hum = char:FindFirstChildOfClass('Humanoid')
+	if not ignoreMaterial and hum and hum.FloorMaterial and hum.FloorMaterial ~= Enum.Material.Air then
+		return true
+	end
+	if gap == nil then
+		gap = groundGap(char, root)
+	end
+	return gap ~= nil and gap <= FLY_CLEARANCE and gap >= -2
+end
+
+local function isSelf(plr)
+	return plr == LocalPlayer
+end
+
+local function flyClearance(plr)
+	return isSelf(plr) and SELF_FLY_GAP or FLY_CLEARANCE
+end
+
+local function markGround()
+	state.groundSeenAt = os.clock()
+end
+
+local function recentlySawGround()
+	local at = tonumber(state.groundSeenAt) or 0
+	return (os.clock() - at) <= GROUND_MEMORY
+end
+
+local function step(dt)
+	if dt ~= dt or dt <= 0 or dt > SAMPLE_GAP_MAX then
+		dt = nil
+	end
+	local teleports = {}
+	local airborne = {}
+	local worldHasGround = false
+	local mine = getCharacter(LocalPlayer)
+	local myRoot = getRoot(mine)
+	if myRoot and standingOnFloor(mine, myRoot) then
+		worldHasGround = true
+	end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if watching(plr) then
+			local char = getCharacter(plr)
+			local root = getRoot(char)
+			local prev = samples[plr.UserId]
+			if not root then
+				samples[plr.UserId] = nil
+			else
+				local pos = root.Position
+				local now = os.clock()
+				local hum = char:FindFirstChildOfClass('Humanoid')
+				local selfWatch = isSelf(plr)
+				local ownHold = getgenv().SB2DiveFarmOn == true
+				local platform = hum and hum.PlatformStand == true and not ownHold
+				if not prev or prev.char ~= char or not dt then
+					samples[plr.UserId] = {
+						pos = pos,
+						t = now,
+						seenAt = now,
+						char = char,
+						speedHold = 0,
+						airHold = 0,
+						speedLatch = 0,
+						flyLatch = false,
+						rayAt = 0,
+						debugAt = 0,
+					}
+					if selfWatch then
+						state.selfDebug = string.format(
+							'you  wait  gap %s  %s',
+							'—',
+							hum and tostring(hum.FloorMaterial):gsub('Enum.Material.', '') or '—'
+						)
+						if refreshSelfLine then
+							refreshSelfLine()
+						end
+					end
+				else
+					local delta = pos - prev.pos
+					local dist = delta.Magnitude
+					local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
+					local speed = flat / dt
+					local vy = delta.Y / dt
+					local gap = prev.gap
+					if (now - (prev.rayAt or 0)) >= RAY_GAP then
+						gap = groundGap(char, root)
+						prev.gap = gap
+						prev.rayAt = now
+					end
+					if selfWatch and (now - (prev.debugAt or 0)) >= DEBUG_GAP then
+						prev.debugAt = now
+						state.selfDebug = string.format(
+							'you  %.0f st/s  gap %s  %s%s',
+							speed,
+							gap and string.format('%.0f', gap) or '—',
+							hum and tostring(hum.FloorMaterial):gsub('Enum.Material.', '') or '—',
+							platform and '  hover' or ''
+						)
+						if refreshSelfLine then
+							refreshSelfLine()
+						end
+					end
+					if dist >= TELEPORT_STUDS then
+						teleports[#teleports + 1] = plr
+						prev.speedHold = 0
+						prev.airHold = 0
+						prev.flyLatch = false
+					else
+						local needSpeed = selfWatch and SELF_SPEED_STUDS or SPEED_STUDS
+						local needHold = selfWatch and SELF_SPEED_HOLD or SPEED_HOLD
+						if speed >= needSpeed then
+							prev.speedHold = (prev.speedHold or 0) + dt
+							if prev.speedHold >= needHold and (now - (prev.speedLatch or 0)) >= 3 then
+								prev.speedLatch = now
+								note(plr, 'speed')
+							end
+						else
+							prev.speedHold = 0
+						end
+						local ignoreMat = selfWatch and platform
+						local onFloor = standingOnFloor(char, root, gap, ignoreMat)
+						local seenNeed = selfWatch and SELF_FLY_SEEN or FLY_SEEN_SEC
+						local seenLong = (now - (prev.seenAt or now)) >= seenNeed
+						local clear = flyClearance(plr)
+						if onFloor then
+							worldHasGround = true
+						end
+						local hovering = selfWatch and platform
+						if (onFloor and not hovering) or vy < -25 or (gap == nil and not hovering) then
+							-- A missed ray is not flying. Floors sit at very different heights.
+							prev.airHold = 0
+							prev.flyLatch = false
+						elseif seenLong and (hovering or (gap ~= nil and gap > clear)) then
+							prev.airHold = (prev.airHold or 0) + dt
+							if prev.airHold >= FLY_HOLD then
+								airborne[#airborne + 1] = plr
+							end
+						else
+							prev.airHold = 0
+							prev.flyLatch = false
+						end
+					end
+					prev.pos = pos
+					prev.t = now
+					prev.char = char
+				end
+			end
+		end
+	end
+	if worldHasGround then
+		markGround()
+	end
+	if #teleports < 3 then
+		for _, plr in ipairs(teleports) do
+			note(plr, 'teleport')
+		end
+	end
+	-- One person high above a real floor can be flying. The whole server at once is a load.
+	-- Remember a recent floor so a solo flyer (or Watch me while alone) can still flag.
+	local now = os.clock()
+	local groundOk = worldHasGround or recentlySawGround()
+	if #airborne > 0 and #airborne < 3 then
+		for _, plr in ipairs(airborne) do
+			local armed = isSelf(plr) or (groundOk and now >= (state.flyArmAt or 0))
+			local prev = samples[plr.UserId]
+			if armed and prev and not prev.flyLatch then
+				prev.flyLatch = true
+				note(plr, 'fly')
+			end
+		end
+	end
+	for userId in pairs(samples) do
+		local still = false
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr.UserId == userId then
+				still = true
+				break
+			end
+		end
+		if not still then
+			samples[userId] = nil
+		end
+	end
+end
+
+local function copyNames()
+	local lines = {}
+	local seen = {}
+	for _, row in ipairs(state.flags) do
+		if row.name and not seen[row.name] then
+			seen[row.name] = true
+			lines[#lines + 1] = row.name
+		end
+	end
+	local text = table.concat(lines, '\n')
+	if text == '' then
+		return
+	end
+	if type(setclipboard) == 'function' then
+		pcall(setclipboard, text)
+	elseif type(toclipboard) == 'function' then
+		pcall(toclipboard, text)
+	end
+end
+
+local function destroyGui()
+	local gui = getgenv()[GENV_GUI]
+	if gui and gui.Parent then
+		pcall(function()
+			gui:Destroy()
+		end)
+	end
+	getgenv()[GENV_GUI] = nil
+	state.open = false
+end
+
+local function buildGui()
+	destroyGui()
+	local gui = Instance.new('ScreenGui')
+	gui.Name = 'SB2CheaterWatch'
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.DisplayOrder = 1900
+	pcall(function()
+		gui.Parent = parentGui()
+	end)
+	if not gui.Parent and LocalPlayer then
+		gui.Parent = LocalPlayer:WaitForChild('PlayerGui')
+	end
+	getgenv()[GENV_GUI] = gui
+
+	local main = Instance.new('Frame')
+	main.Name = 'Main'
+	main.Size = UDim2.fromOffset(280, 320)
+	main.Position = UDim2.fromOffset(104, 80)
+	main.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
+	main.BorderSizePixel = 0
+	main.Parent = gui
+	Instance.new('UICorner', main).CornerRadius = UDim.new(0, 10)
+	local stroke = Instance.new('UIStroke')
+	stroke.Color = Color3.fromRGB(140, 110, 60)
+	stroke.Thickness = 1
+	stroke.Parent = main
+
+	local title = Instance.new('TextLabel')
+	title.Name = 'Title'
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.fromOffset(12, 8)
+	title.Size = UDim2.new(1, -24, 0, 22)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = Color3.fromRGB(240, 230, 210)
+	title.Text = 'Cheater watch'
+	title.Parent = main
+
+	local hint = Instance.new('TextLabel')
+	hint.BackgroundTransparency = 1
+	hint.Position = UDim2.fromOffset(12, 28)
+	hint.Size = UDim2.new(1, -24, 0, 20)
+	hint.Font = Enum.Font.Gotham
+	hint.TextSize = 12
+	hint.TextWrapped = true
+	hint.TextXAlignment = Enum.TextXAlignment.Left
+	hint.TextYAlignment = Enum.TextYAlignment.Top
+	hint.TextColor3 = Color3.fromRGB(160, 164, 172)
+	hint.Text = 'Teleport, held super-speed, or hovering. Watch me includes you. Fly while alone still counts.'
+	hint.Parent = main
+
+	local live = Instance.new('TextLabel')
+	live.Name = 'SelfLine'
+	live.BackgroundTransparency = 1
+	live.Position = UDim2.fromOffset(12, 50)
+	live.Size = UDim2.new(1, -24, 0, 16)
+	live.Font = Enum.Font.Gotham
+	live.TextSize = 11
+	live.TextXAlignment = Enum.TextXAlignment.Left
+	live.TextColor3 = Color3.fromRGB(190, 176, 140)
+	live.Text = state.selfDebug or 'you  —'
+	live.Parent = main
+	refreshSelfLine = function()
+		if live and live.Parent then
+			live.Text = state.selfDebug or 'you  —'
+		end
+	end
+
+	local copyBtn = Instance.new('TextButton')
+	copyBtn.Size = UDim2.fromOffset(88, 24)
+	copyBtn.Position = UDim2.fromOffset(12, 70)
+	copyBtn.BackgroundColor3 = Color3.fromRGB(72, 56, 28)
+	copyBtn.TextColor3 = Color3.fromRGB(240, 220, 180)
+	copyBtn.Font = Enum.Font.GothamBold
+	copyBtn.TextSize = 12
+	copyBtn.Text = 'Copy names'
+	copyBtn.AutoButtonColor = true
+	copyBtn.BorderSizePixel = 0
+	copyBtn.Parent = main
+	Instance.new('UICorner', copyBtn).CornerRadius = UDim.new(0, 6)
+	copyBtn.MouseButton1Click:Connect(copyNames)
+
+	local clearBtn = Instance.new('TextButton')
+	clearBtn.Size = UDim2.fromOffset(64, 24)
+	clearBtn.Position = UDim2.fromOffset(108, 70)
+	clearBtn.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+	clearBtn.TextColor3 = Color3.fromRGB(210, 214, 220)
+	clearBtn.Font = Enum.Font.GothamBold
+	clearBtn.TextSize = 12
+	clearBtn.Text = 'Clear'
+	clearBtn.AutoButtonColor = true
+	clearBtn.BorderSizePixel = 0
+	clearBtn.Parent = main
+	Instance.new('UICorner', clearBtn).CornerRadius = UDim.new(0, 6)
+	clearBtn.MouseButton1Click:Connect(function()
+		table.clear(state.flags)
+		refreshGui()
+		refreshPill()
+	end)
+
+	local selfBtn = Instance.new('TextButton')
+	selfBtn.Size = UDim2.fromOffset(78, 24)
+	selfBtn.Position = UDim2.fromOffset(180, 70)
+	selfBtn.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+	selfBtn.TextColor3 = Color3.fromRGB(210, 214, 220)
+	selfBtn.Font = Enum.Font.GothamBold
+	selfBtn.TextSize = 12
+	selfBtn.AutoButtonColor = true
+	selfBtn.BorderSizePixel = 0
+	selfBtn.Parent = main
+	Instance.new('UICorner', selfBtn).CornerRadius = UDim.new(0, 6)
+	local function paintSelf()
+		if state.watchSelf then
+			selfBtn.BackgroundColor3 = Color3.fromRGB(72, 56, 28)
+			selfBtn.TextColor3 = Color3.fromRGB(240, 220, 180)
+			selfBtn.Text = 'Watch me'
+		else
+			selfBtn.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+			selfBtn.TextColor3 = Color3.fromRGB(210, 214, 220)
+			selfBtn.Text = 'Me off'
+		end
+	end
+	paintSelf()
+	selfBtn.MouseButton1Click:Connect(function()
+		state.watchSelf = not state.watchSelf
+		paintSelf()
+	end)
+
+	local list = Instance.new('ScrollingFrame')
+	list.Name = 'List'
+	list.Position = UDim2.fromOffset(10, 102)
+	list.Size = UDim2.new(1, -20, 1, -114)
+	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 4
+	list.CanvasSize = UDim2.new()
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Parent = main
+	local layout = Instance.new('UIListLayout')
+	layout.Padding = UDim.new(0, 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	local dragging = false
+	local dragStart
+	local startPos
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging or not dragStart or not startPos then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+
+	refreshGui = function()
+		if not list.Parent then
+			return
+		end
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA('GuiObject') then
+				child:Destroy()
+			end
+		end
+		if #state.flags == 0 then
+			local empty = Instance.new('TextLabel')
+			empty.BackgroundTransparency = 1
+			empty.Size = UDim2.new(1, 0, 0, 36)
+			empty.Font = Enum.Font.Gotham
+			empty.TextSize = 13
+			empty.TextXAlignment = Enum.TextXAlignment.Left
+			empty.TextColor3 = Color3.fromRGB(140, 144, 152)
+			empty.Text = 'Nobody flagged yet.'
+			empty.Parent = list
+			return
+		end
+		for i, row in ipairs(state.flags) do
+			local label = Instance.new('TextLabel')
+			label.BackgroundColor3 = Color3.fromRGB(28, 32, 40)
+			label.Size = UDim2.new(1, -4, 0, 36)
+			label.Font = Enum.Font.Gotham
+			label.TextSize = 13
+			label.TextXAlignment = Enum.TextXAlignment.Left
+			label.TextYAlignment = Enum.TextYAlignment.Center
+			label.TextColor3 = Color3.fromRGB(230, 232, 236)
+			label.TextWrapped = true
+			label.Text = string.format('  %s\n  %s ×%d', row.name, row.reason, row.count or 1)
+			label.LayoutOrder = i
+			label.BorderSizePixel = 0
+			label.Parent = list
+			Instance.new('UICorner', label).CornerRadius = UDim.new(0, 6)
+		end
+	end
+
+	state.open = true
+	refreshGui()
+	refreshPill()
+end
+
+local function toggleGui()
+	if state.open and getgenv()[GENV_GUI] and getgenv()[GENV_GUI].Parent then
+		destroyGui()
+		return
+	end
+	if type(getgenv().SB2CloseAllPillPanels) == 'function' then
+		pcall(getgenv().SB2CloseAllPillPanels)
+	end
+	buildGui()
+end
+
+getgenv().SB2CheaterWatchToggle = toggleGui
+
+local function stopPlugin()
+	if getgenv()[GENV_CONN] then
+		pcall(function()
+			getgenv()[GENV_CONN]:Disconnect()
+		end)
+		getgenv()[GENV_CONN] = nil
+	end
+	if getgenv()[GENV_LEAVE] then
+		pcall(function()
+			getgenv()[GENV_LEAVE]:Disconnect()
+		end)
+		getgenv()[GENV_LEAVE] = nil
+	end
+	destroyGui()
+end
+
+getgenv()[GENV_STOP] = stopPlugin
+
+if getgenv()[GENV_CONN] then
+	pcall(function()
+		getgenv()[GENV_CONN]:Disconnect()
+	end)
+end
+getgenv()[GENV_CONN] = RunService.Heartbeat:Connect(function(dt)
+	pcall(step, dt)
+end)
+
+getgenv()[GENV_LEAVE] = Players.PlayerRemoving:Connect(function(plr)
+	samples[plr.UserId] = nil
+end)
+
+pcall(registerPill)
+
+return {
+	['PluginName'] = 'CheaterWatch',
+	['PluginDescription'] = 'Flag players for teleport, held super-speed, or hovering. Watch me tests on you.',
+	['Commands'] = {},
+}

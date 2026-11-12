@@ -1,5 +1,5 @@
 --[[
-	bootstrap.lua — one-line install / update for PlayerTools (Neuublue-style)
+	bootstrap.lua — one-line install / update for PlayerTools
 
 	Friend load:
 
@@ -7,16 +7,39 @@
 
 	Optional feed override:
 	  getgenv().SB2PlayerToolsUpdateBase = "https://raw.githubusercontent.com/NickB926/playertools/main"
+
+	Every step is guarded: if anything fails, you get an on-screen notification
+	and PlayerTools/_bootstrap_err.txt says why (instead of silently showing nothing).
 ]]
 
-if getgenv().SB2PlayerToolsBootstrapBusy == true then
-	warn('[PlayerTools bootstrap] already running — skip duplicate')
+local G = getgenv()
+
+local function notify(title, text, dur)
+	pcall(function()
+		game:GetService('StarterGui'):SetCore('SendNotification', {
+			Title = title,
+			Text = text,
+			Duration = dur or 6,
+		})
+	end)
+end
+
+local function say(msg)
+	warn('[PlayerTools bootstrap] ' .. tostring(msg))
+end
+
+-- A previous run that crashed used to leave this flag set forever, so every
+-- later run was skipped silently. Treat it as stale after 90 seconds.
+local busy = G.SB2PlayerToolsBootstrapBusy
+if type(busy) == 'number' and os.clock() - busy < 90 then
+	say('already running - skip duplicate')
+	notify('PlayerTools', 'Already loading - wait a few seconds.')
 	return
 end
-getgenv().SB2PlayerToolsBootstrapBusy = true
+G.SB2PlayerToolsBootstrapBusy = os.clock()
 
-local BASE = (type(getgenv().SB2PlayerToolsUpdateBase) == 'string' and getgenv().SB2PlayerToolsUpdateBase ~= ''
-	and getgenv().SB2PlayerToolsUpdateBase:gsub('/+$', ''))
+local BASE = (type(G.SB2PlayerToolsUpdateBase) == 'string' and G.SB2PlayerToolsUpdateBase ~= ''
+	and G.SB2PlayerToolsUpdateBase:gsub('/+$', ''))
 	or 'https://raw.githubusercontent.com/NickB926/playertools/main'
 
 local function httpGet(url)
@@ -34,123 +57,102 @@ local function httpGet(url)
 	local ok, body = pcall(function()
 		return game:HttpGet(url)
 	end)
-	if ok and type(body) == 'string' and body ~= '' then
+	if ok and type(body) == 'string' and body ~= '' and not body:match('^%s*404: Not Found') then
 		return body
 	end
 	return nil
 end
 
-local function say(msg)
-	warn('[PlayerTools bootstrap] ' .. tostring(msg))
-end
-
-local function finish(err)
-	getgenv().SB2PlayerToolsBootstrapBusy = nil
-	if err then
-		error(err)
+local function main()
+	if type(writefile) ~= 'function' or type(readfile) ~= 'function' or type(isfile) ~= 'function' then
+		error('your executor has no file functions (writefile/readfile/isfile) - PlayerTools needs them', 0)
 	end
-end
-
-if type(makefolder) == 'function' then
-	pcall(makefolder, 'PlayerTools')
-end
-if type(writefile) ~= 'function' then
-	finish('[PlayerTools bootstrap] writefile required')
-end
-
--- Refresh updater, then only pull files when remote version differs (or launch missing).
-local updaterSrc = httpGet(BASE .. '/PlayerTools/Updater.lua')
-if not updaterSrc then
-	finish('[PlayerTools bootstrap] could not download Updater.lua from ' .. BASE)
-end
-pcall(writefile, 'PlayerTools/Updater.lua', updaterSrc)
-pcall(writefile, 'PlayerTools/update_url.txt', BASE)
-
-local fn, err = (loadstring or load)(updaterSrc, 'PlayerTools/Updater.lua')
-if not fn then
-	finish('[PlayerTools bootstrap] Updater compile failed: ' .. tostring(err))
-end
-local Updater = fn()
-getgenv().SB2PlayerToolsUpdateBase = BASE
-
-local hasLaunch = type(isfile) == 'function' and isfile('PlayerTools/launch.lua')
-local function localHasWaveDefenseAllow()
-	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
-		return false
+	if type(makefolder) == 'function' then
+		pcall(makefolder, 'PlayerTools')
 	end
-	if not isfile('PlayerTools/PlayerTools_Obsidian.lua') then
-		return false
+
+	notify('PlayerTools', 'Checking for updates...', 4)
+
+	local updaterSrc = httpGet(BASE .. '/PlayerTools/Updater.lua')
+	local Updater
+	if updaterSrc then
+		local fn, err = (loadstring or load)(updaterSrc, 'PlayerTools/Updater.lua')
+		if fn then
+			pcall(writefile, 'PlayerTools/Updater.lua', updaterSrc)
+			Updater = fn()
+		else
+			say('remote Updater compile failed: ' .. tostring(err))
+		end
 	end
-	local ok, body = pcall(readfile, 'PlayerTools/PlayerTools_Obsidian.lua')
-	return ok and type(body) == 'string' and body:find('121252145396212', 1, true) ~= nil
-end
-local info = Updater.check and Updater.check() or { ok = false }
-local needWave = not localHasWaveDefenseAllow()
-if info.ok and not info.needsUpdate and hasLaunch and not needWave then
-	say(('Already on %s — skip download'):format(tostring(info.remoteVersion)))
-else
-	-- First install, new version, or missing Wave Defense allow (same-version publish used to skip).
-	local ok, detail = Updater.apply({
-		force = not hasLaunch or needWave,
-		notify = say,
-		quietWarn = true,
-	})
+	if not Updater and isfile('PlayerTools/Updater.lua') then
+		local fn = (loadstring or load)(readfile('PlayerTools/Updater.lua'), 'PlayerTools/Updater.lua')
+		Updater = fn and fn()
+	end
+	if type(Updater) ~= 'table' then
+		error('could not download Updater.lua from ' .. BASE .. ' (is HttpGet blocked?)', 0)
+	end
+	pcall(writefile, 'PlayerTools/update_url.txt', BASE)
+	G.SB2PlayerToolsUpdateBase = BASE
+
+	local firstInstall = not isfile('PlayerTools/launch.lua') or not isfile('PlayerTools/PlayerTools_Obsidian.lua')
+	if firstInstall then
+		notify('PlayerTools', 'First install - downloading files (about 2 MB)...', 8)
+	end
+	-- apply() handles: new version, first install, and restoring any missing files.
+	local ok, detail = Updater.apply({ force = firstInstall, notify = say, quietWarn = true })
 	if not ok then
-		say('Update finished with issues: ' .. tostring(detail))
-	else
-		say('Files ready.')
+		say('update finished with issues: ' .. tostring(detail))
 	end
-end
 
--- Friends stuck on Obsidian chrome: ensure Ataraxia bits even when version matches.
-do
-	local function ensureFile(rel)
-		local path = rel
-		if type(isfile) == 'function' and isfile(path) then
-			return true
+	-- Ataraxia chrome is the only UI; make sure it is there and selected.
+	if not isfile('PlayerTools/AtaraxiaLibrary.lua') then
+		local body = httpGet(BASE .. '/PlayerTools/AtaraxiaLibrary.lua')
+		if body then
+			pcall(writefile, 'PlayerTools/AtaraxiaLibrary.lua', body)
 		end
-		local body = httpGet(BASE .. '/' .. rel)
-		if type(body) == 'string' and body ~= '' then
-			pcall(writefile, path, body)
-			return true
-		end
-		return false
 	end
-	ensureFile('PlayerTools/AtaraxiaLibrary.lua')
-	-- Migrate default chrome. Explicit starlight pin is left alone.
 	local be = ''
-	if type(isfile) == 'function' and isfile('PlayerTools/backend') and type(readfile) == 'function' then
+	if isfile('PlayerTools/backend') then
 		local okBe, bodyBe = pcall(readfile, 'PlayerTools/backend')
 		if okBe then
 			be = tostring(bodyBe):lower():gsub('%s', '')
 		end
 	end
-	if be ~= 'starlight' then
+	if be ~= 'starlight' and be ~= 'ataraxia' then
 		pcall(writefile, 'PlayerTools/backend', 'ataraxia\n')
-		if be == 'obsidian' or be == '' then
-			say('chrome → ataraxia (was ' .. (be == '' and 'unset' or be) .. ')')
+	end
+
+	for _, need in ipairs({ 'PlayerTools/launch.lua', 'PlayerTools/PlayerTools_Obsidian.lua', 'PlayerTools/AtaraxiaLibrary.lua' }) do
+		if not isfile(need) then
+			error(need .. ' is missing after download - check your executor can reach raw.githubusercontent.com', 0)
 		end
 	end
-end
 
-local launch = (isfile and isfile('PlayerTools/launch.lua') and readfile('PlayerTools/launch.lua')) or nil
-if type(launch) ~= 'string' or launch == '' then
-	launch = httpGet(BASE .. '/PlayerTools/launch.lua')
-	if launch then
-		pcall(writefile, 'PlayerTools/launch.lua', launch)
+	-- A stale flag from an earlier crashed run makes the app think it is a reload.
+	if G.SB2PlayerTools and not G.SB2PlayerToolsLibrary then
+		G.SB2PlayerTools = false
 	end
-end
-if type(launch) ~= 'string' or launch == '' then
-	finish('[PlayerTools bootstrap] launch.lua missing')
-end
-local run, runErr = (loadstring or load)(launch, 'PlayerTools/launch.lua')
-if not run then
-	finish('[PlayerTools bootstrap] launch compile failed: ' .. tostring(runErr))
+
+	local launch = readfile('PlayerTools/launch.lua')
+	local run, runErr = (loadstring or load)(launch, 'PlayerTools/launch.lua')
+	if not run then
+		error('launch.lua compile failed: ' .. tostring(runErr), 0)
+	end
+	return run()
 end
 
-local okRun, result = pcall(run)
-getgenv().SB2PlayerToolsBootstrapBusy = nil
-if not okRun then
-	error(result)
+local okMain, result = pcall(main)
+G.SB2PlayerToolsBootstrapBusy = nil
+if not okMain then
+	local msg = tostring(result)
+	say('FAILED: ' .. msg)
+	notify('PlayerTools failed to load', msg:sub(1, 180), 15)
+	pcall(writefile, 'PlayerTools/_bootstrap_err.txt', os.date('%Y-%m-%d %H:%M:%S') .. '\n' .. msg .. '\n')
+	return nil
 end
+pcall(function()
+	if isfile('PlayerTools/_bootstrap_err.txt') then
+		writefile('PlayerTools/_bootstrap_err.txt', '')
+	end
+end)
 return result

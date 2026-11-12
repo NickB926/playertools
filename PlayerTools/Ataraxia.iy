@@ -1,0 +1,62 @@
+--[[
+    Ataraxia.iy — Infinite Yield plugin for shared AtaraxiaLibrary helpers.
+
+    Install: workspace/PlayerTools/Ataraxia.iy → IY Plugins → Add → Ataraxia
+    (or copy to workspace root as Ataraxia.iy)
+
+    Commands: fullbright | loopfb | fullbrightoff | unloopfb | fullbrighttoggle
+    Uses PlayerTools' library when loaded; otherwise boots AtaraxiaLibrary.lua from disk.
+]]
+
+local function fileExists(path)
+	return type(isfile) == 'function' and isfile(path) == true
+end
+
+local function resolveLibrary()
+	local lib = getgenv().SB2PlayerToolsLibrary or getgenv().AtaraxiaLibraryApi
+	if lib and type(lib.BuildIyPlugin) == 'function' then
+		return lib
+	end
+	if getgenv().AtaraxiaIyBootLib and type(getgenv().AtaraxiaIyBootLib.BuildIyPlugin) == 'function' then
+		return getgenv().AtaraxiaIyBootLib
+	end
+	for _, path in ipairs({
+		'PlayerTools/AtaraxiaLibrary.lua',
+		'AtaraxiaLibrary.lua',
+	}) do
+		if fileExists(path) and type(readfile) == 'function' and type(loadstring) == 'function' then
+			local ok, src = pcall(readfile, path)
+			if ok and type(src) == 'string' and src ~= '' then
+				local fn = loadstring(src, path)
+				if fn then
+					local okRun, boot = pcall(fn)
+					if okRun and type(boot) == 'table' and type(boot.BuildIyPlugin) == 'function' then
+						getgenv().AtaraxiaIyBootLib = boot
+						getgenv().AtaraxiaLibraryApi = boot
+						return boot
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local lib = resolveLibrary()
+if lib then
+	pcall(function()
+		if type(isfile) == 'function' and isfile('Ataraxia/fullbright') then
+			local ok, body = pcall(readfile, 'Ataraxia/fullbright')
+			if ok and tostring(body):lower():find('true', 1, true) then
+				lib:SetFullbright(true)
+			end
+		end
+	end)
+	return lib:BuildIyPlugin()
+end
+
+return {
+	['PluginName'] = 'Ataraxia',
+	['PluginDescription'] = 'AtaraxiaLibrary.lua not found — install PlayerTools or AtaraxiaLibrary.lua',
+	['Commands'] = {},
+}

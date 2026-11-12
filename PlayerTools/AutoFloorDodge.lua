@@ -1,7 +1,21 @@
 --[[
 	Split from PlayerTools_Obsidian.lua (Luau 200-local register cap).
 ]]
-getgenv().SB2AutoFloorDodgeBuild = 'ground-dodge-v1'
+	getgenv().SB2AutoFloorDodgeBuild = 'ground-dodge-v66-corrupted-nuke'
+
+-- Per-account file names for the standalone AutoBetween (several accounts on one PC).
+-- Global, not a local: the factory below is at Luau's 200-local limit.
+getgenv().SB2AcctPath = function(p)
+	local tag = getgenv().SB2AcctFileTag
+	if type(tag) ~= 'string' or tag == '' then
+		return p
+	end
+	local base, ext = string.match(p, '^(.-)(%.%w+)$')
+	if base then
+		return base .. '_' .. tag .. ext
+	end
+	return p .. '_' .. tag
+end
 
 return function(env)
 	local CombatBox = env.CombatBox
@@ -60,7 +74,11 @@ return function(env)
 		end
 		local best, bestPush = nil, nil
 		local function consider(beam)
-			if not beam:IsA('Beam') or beam.Enabled ~= true or beam.Width0 < 3 then
+			if not beam:IsA('Beam') or beam.Enabled ~= true or beam.Width0 < 3 or beam.Width0 > 12 then
+				return
+			end
+			local myModel = LocalPlayer.Character
+			if myModel and beam:IsDescendantOf(myModel) then
 				return
 			end
 			local a0, a1 = beam.Attachment0, beam.Attachment1
@@ -69,13 +87,15 @@ return function(env)
 			end
 			local dist, px, pz = segDistXZ(origin, a0.WorldPosition, a1.WorldPosition)
 			local half = beam.Width0 * 0.5
-			-- Land well past the beam. 150ms+ ping replicates the jump late, and the
-			-- hit circle is wider than the visible beam, so 8 studs still got clipped.
-			local clear = 26
-			if dist >= half + 16 then
+			-- Just clear the beam. A wide cone used to march you to the rim.
+			local clear = 8
+			if dist >= half + 4 then
 				return
 			end
-			local push = (half + clear) - dist
+			local push = math.min(12, (half + clear) - dist)
+			if push < 1 then
+				return
+			end
 			if not bestPush or push > bestPush then
 				bestPush = push
 				best = Vector3.new(origin.X + px * push, origin.Y, origin.Z + pz * push)
@@ -106,6 +126,380 @@ return function(env)
 		return best
 	end
 
+	-- Rubricatus line attacks, read straight from the game's own client code:
+	--  * RedLightningLaser: aimed once at where you stood when it starts charging; 1s charge then
+	--    1s of 8% ticks to anything within ~12.4 studs of that line (dead in ~1s if you stay).
+	--  * RedLightningDiscs: 3 discs thrown at the spot you were in (Model attribute LockedTarget),
+	--    25% each to anything within ~6 studs of their flight path.
+	-- Neither tracks you, so getting off the line is a full dodge. This works for EVERY hold the
+	-- dodge uses (ground, hover-160, final lift, low-HP lift): writeHeldCF / resetHold route
+	-- their spot through SB2RedLaser.escape, and a Heartbeat safety net moves you if a branch
+	-- that never asks still has you on a live line. Kept in getgenv() (Luau 200-local cap).
+	do
+		local RL = getgenv().SB2RedLaser
+		if type(RL) == 'table' and type(RL.conns) == 'table' then
+			for _, c in ipairs(RL.conns) do
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+		end
+		RL = { lasers = {}, conns = {}, last = nil }
+		getgenv().SB2RedLaser = RL
+		local CHARGE, FIRE, FADE_PAD = 1, 1, 0.35
+		local RANGE = 250
+		local LASER_CLEAR = 26 -- 12.4 hit radius + body + margin
+		local DISC_CLEAR = 15 -- 6.35 hit radius + body + margin
+		local function rubHrp(near)
+			local mobs = workspace:FindFirstChild('Mobs')
+			if not mobs then
+				return nil
+			end
+			local best, bestD = nil, nil
+			for _, m in ipairs(mobs:GetChildren()) do
+				if string.find(string.lower(m.Name), 'rubricatus', 1, true) then
+					local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+					if r then
+						local d = near and (r.Position - near).Magnitude or 0
+						if not bestD or d < bestD then
+							best, bestD = r, d
+						end
+					end
+				end
+			end
+			return best
+		end
+		local function add(origin, target, why)
+			if typeof(origin) ~= 'Vector3' or typeof(target) ~= 'Vector3' then
+				return
+			end
+			local v = target - origin
+			if v.Magnitude < 0.05 then
+				return
+			end
+			local now = os.clock()
+			for _, l in ipairs(RL.lasers) do
+				if now - l.t0 < 0.4 and (l.origin - origin).Magnitude < 20 and l.dir:Dot(v.Unit) > 0.97 then
+					return
+				end
+			end
+			RL.lasers[#RL.lasers + 1] = {
+				origin = origin,
+				dir = v.Unit,
+				t0 = now,
+				untilT = now + CHARGE + FIRE + FADE_PAD,
+			}
+			local logFn = getgenv().SB2DodgeLog
+			if type(logFn) == 'function' then
+				pcall(logFn, 'red-laser', why, target)
+			end
+		end
+		local function segDist(p, a, b)
+			local ab = b - a
+			local len2 = ab:Dot(ab)
+			local t = len2 > 0.01 and math.clamp((p - a):Dot(ab) / len2, 0, 1) or 0
+			return (p - (a + ab * t)).Magnitude
+		end
+		-- Big telegraphed ground nukes (Atheon-style): a tall 'Circle' cylinder (~170 wide,
+		-- 150 tall) plus a flat 'EffectHitbox' disc, ~1s before a 100% hit. The floor-circle
+		-- finder skips anything over 80 studs (floor decor), so these are tracked here.
+		RL.circles = {}
+		local BIG_NUKE_SPAN = 100
+		local BIG_NUKE_MARGIN = 16
+		-- Only the exact wave-86 nuke shape. v45-v47 also matched Bob's attack boxes (300-370
+		-- wide) and other 120-155 circles, and the safety net then teleported you around the
+		-- arena at hover height (and out of Bob's perch) straight into his shards.
+		--   Circle (tall cylinder): ~170 wide, >=100 tall, round
+		--   EffectHitbox (its floor disc): ~170 wide, flat, round
+		--   Box (the wall that comes with it): ~50 long, ~0 thick, >=100 tall
+		local function bigNukeThreat(part)
+			if not part.Parent or not part:IsA('BasePart') then
+				return nil
+			end
+			if getgenv().SB2BobEscapeActive == true then
+				return nil -- Bob perch owns positioning
+			end
+			local sz = part.Size
+			local span = math.max(sz.X, sz.Z)
+			local thin = math.min(sz.X, sz.Z)
+			local round = math.abs(sz.X - sz.Z) <= span * 0.1
+			if part.Name == 'Box' then
+				if span < 40 or span > 60 or thin > 1 or sz.Y < 100 then
+					return nil
+				end
+				local axis = sz.X >= sz.Z and part.CFrame.RightVector or part.CFrame.LookVector
+				local c = part.Position
+				return { a = c - axis * (span * 0.5), b = c + axis * (span * 0.5), clear = 14, flat = true }
+			end
+			-- Corrupted Atheon (Elite WD wave 97): same slam, 209 wide, Circle only 50 tall,
+			-- lands 3s after it appears for 100% HP. v65 ignored it (span > 185) and you stood still.
+			local corrupted = span >= 195 and span <= 225
+			if (span < 160 or span > 185) and not corrupted or not round then
+				return nil
+			end
+			if part.Name == 'Circle' and sz.Y < (corrupted and 40 or 100) then
+				return nil
+			end
+			if part.Name == 'EffectHitbox' and sz.Y > 5 then
+				return nil
+			end
+			-- The slam keeps growing after it appears: the Atheon fight showed it reaches ~150 studs
+			-- from the centre (AtheonNukeDash NUKE_SAFE). Wave 86 killed you 116 out of a 170 circle.
+			return { a = part.Position, b = part.Position, clear = math.max(span * 0.5 + BIG_NUKE_MARGIN, corrupted and 185 or 165), flat = true }
+		end
+		RL.bigNukeThreat = bigNukeThreat
+		-- Every live line threat as { a, b, clear }.
+		function RL.threats(now)
+			now = now or os.clock()
+			local out = {}
+			for part in pairs(RL.circles) do
+				local t = part.Parent and bigNukeThreat(part)
+				if t then
+					out[#out + 1] = t
+				elseif not part.Parent then
+					RL.circles[part] = nil
+				end
+			end
+			local live = {}
+			for _, l in ipairs(RL.lasers) do
+				if now < l.untilT then
+					live[#live + 1] = l
+					out[#out + 1] = { a = l.origin, b = l.origin + l.dir * RANGE, clear = LASER_CLEAR }
+				end
+			end
+			RL.lasers = live
+			for _, f in ipairs(workspace:GetChildren()) do
+				if f.Name == 'RedLightningDiscEffects' then
+					for _, m in ipairs(f:GetChildren()) do
+						local tgt = m:GetAttribute('LockedTarget')
+						if typeof(tgt) == 'Vector3' then
+							local ok, piv = pcall(m.GetPivot, m)
+							local from = ok and piv.Position or tgt
+							out[#out + 1] = { a = from, b = tgt, clear = DISC_CLEAR }
+						end
+					end
+				end
+			end
+			return out
+		end
+		function RL.active(now)
+			return RL.threats(now)
+		end
+		local function hitBy(p, threats)
+			for _, t in ipairs(threats) do
+				local q = p
+				if t.flat then
+					-- Ground nukes hit the whole column: compare on the floor plane only.
+					q = Vector3.new(p.X, t.a.Y, p.Z)
+				end
+				if segDist(q, t.a, t.b) < t.clear - 2 then
+					return true
+				end
+			end
+			return false
+		end
+		RL.hitBy = hitBy
+		local function arenaMid()
+			local wd = workspace:FindFirstChild('WaveDefenseStuff')
+			local o = wd and wd:FindFirstChild('WaveDefenseOrigin')
+			return (o and o:IsA('BasePart')) and o.Position or nil
+		end
+		-- Returns a safe spot at pos.Y, or nil when pos is already clear.
+		function RL.escape(pos, center)
+			if typeof(pos) ~= 'Vector3' then
+				return nil
+			end
+			-- Behind a nuke pillar the 100% blast matters more than a 25% disc; lasers can't
+			-- reach you there anyway (they need line of sight). Stay in cover.
+			if typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3' then
+				return nil
+			end
+			local threats = RL.threats()
+			if #threats == 0 or not hitBy(pos, threats) then
+				return nil
+			end
+			local now = os.clock()
+			local last = RL.last
+			if last and now - last.t < 3 and (Vector3.new(last.from.X - pos.X, 0, last.from.Z - pos.Z)).Magnitude < 40 then
+				local c = Vector3.new(last.to.X, pos.Y, last.to.Z)
+				if not hitBy(c, threats) then
+					return c
+				end
+			end
+			local mid = arenaMid()
+			local best, bestScore = nil, nil
+			for _, dist in ipairs({ 18, 28, 40, 56, 75, 95, 115, 135, 155 }) do
+				for i = 0, 15 do
+					local ang = i * math.pi / 8
+					local c = Vector3.new(pos.X + math.cos(ang) * dist, pos.Y, pos.Z + math.sin(ang) * dist)
+					if not hitBy(c, threats) then
+						local score = -dist
+						if mid then
+							local off = Vector3.new(c.X - mid.X, 0, c.Z - mid.Z).Magnitude
+							if off > 150 then
+								score -= (off - 150) * 2
+							end
+						end
+						if typeof(center) == 'Vector3' then
+							score -= Vector3.new(c.X - center.X, 0, c.Z - center.Z).Magnitude * 0.1
+						end
+						if not bestScore or score > bestScore then
+							best, bestScore = c, score
+						end
+					end
+				end
+				if best then
+					break
+				end
+			end
+			if best then
+				RL.last = { from = pos, to = best, t = now }
+			end
+			return best
+		end
+		local RS = game:GetService('ReplicatedStorage')
+		local rep = RS:FindFirstChild('ReplicateSkill')
+		if rep then
+			RL.conns[#RL.conns + 1] = rep.OnClientEvent:Connect(function(mob, phase, skill, a, b)
+				if skill ~= 'RedLightningLaser' or phase ~= 'Initial' then
+					return
+				end
+				local target = typeof(b) == 'Vector3' and b or (typeof(a) == 'Vector3' and a or nil)
+				local origin = (typeof(a) == 'Vector3' and typeof(b) == 'Vector3') and a or nil
+				if not origin and typeof(mob) == 'Instance' then
+					local r = mob:FindFirstChild('HumanoidRootPart')
+					origin = r and r.Position or mob:GetPivot().Position
+				end
+				add(origin, target, 'event')
+			end)
+		end
+		RL.conns[#RL.conns + 1] = workspace.ChildAdded:Connect(function(ch)
+			if ch.Name ~= 'RedLightningLaserEffects' then
+				return
+			end
+			local char = LocalPlayer.Character
+			local me = char and char:FindFirstChild('HumanoidRootPart')
+			if not me then
+				return
+			end
+			local r = rubHrp(me.Position)
+			if r then
+				add(r.Position, me.Position, 'folder')
+			end
+		end)
+		RL.conns[#RL.conns + 1] = workspace.ChildAdded:Connect(function(ch)
+			local n = ch.Name
+			if (n == 'Circle' or n == 'EffectHitbox' or n == 'Box') and ch:IsA('BasePart') then
+				RL.circles[ch] = true
+				task.delay(6, function()
+					RL.circles[ch] = nil
+				end)
+				if bigNukeThreat(ch) then
+					local logFn = getgenv().SB2DodgeLog
+					if type(logFn) == 'function' then
+						pcall(logFn, 'big-nuke', n .. ' ' .. math.floor(math.max(ch.Size.X, ch.Size.Z)), ch.Position)
+					end
+				end
+			end
+		end)
+		-- Blackout waves: a light orb (attribute LightDuration, light Range = that value) whose
+		-- light shrinks over time; outside it you take ~5% HP every tick (killed you at the high
+		-- hover spot, 106 studs above it). Keep every hold inside the light.
+		local orbCache = { at = -1, part = nil, orb = nil }
+		local function findBlackoutOrb()
+			local now = os.clock()
+			if now - orbCache.at < 1 and (orbCache.part == nil or orbCache.part.Parent ~= nil) then
+				return orbCache.part, orbCache.orb
+			end
+			orbCache.at, orbCache.part, orbCache.orb = now, nil, nil
+			local function check(inst)
+				if inst:GetAttribute('LightDuration') == nil and inst.Name ~= 'DarknerOrb' then
+					return nil
+				end
+				local p = inst:FindFirstChild('Part')
+				if not (p and p:IsA('BasePart')) then
+					p = inst:IsA('BasePart') and inst or (inst:IsA('Model') and inst.PrimaryPart) or inst:FindFirstChildWhichIsA('BasePart', true)
+				end
+				return p
+			end
+			local roots = { workspace }
+			local wds = workspace:FindFirstChild('WaveDefenseStuff')
+			if wds then
+				roots[#roots + 1] = wds
+			end
+			for _, root in ipairs(roots) do
+				for _, ch in ipairs(root:GetChildren()) do
+					local p = check(ch)
+					if p then
+						orbCache.part, orbCache.orb = p, ch
+						return p, ch
+					end
+				end
+			end
+			return nil
+		end
+		RL.findBlackoutOrb = findBlackoutOrb
+		-- Returns the closest spot inside the orb light, or nil when pos is already inside.
+		function RL.blackoutClamp(pos)
+			if typeof(pos) ~= 'Vector3' then
+				return nil
+			end
+			local part, orb = findBlackoutOrb()
+			if not part then
+				return nil
+			end
+			local light = part:FindFirstChildWhichIsA('Light')
+			local r = (light and tonumber(light.Range)) or tonumber(orb and orb:GetAttribute('LightDuration')) or 20
+			local safe = math.max(6, r * 0.7)
+			-- Sideways only: the orb sits low, and a 3D pull dragged you down into the floor
+			-- every frame (then the floor pushed you back up = rapid up/down jitter).
+			local d = Vector3.new(pos.X - part.Position.X, 0, pos.Z - part.Position.Z)
+			local m = d.Magnitude
+			if m <= safe then
+				return nil
+			end
+			local out = part.Position + d.Unit * safe
+			return Vector3.new(out.X, pos.Y, out.Z)
+		end
+		-- Safety net for any branch that holds you without asking: if you are on a live line,
+		-- move off it now and repoint the dive pin there too.
+		RL.conns[#RL.conns + 1] = game:GetService('RunService').Heartbeat:Connect(function()
+			if #RL.lasers == 0 and next(RL.circles) == nil and not workspace:FindFirstChild('RedLightningDiscEffects') and not findBlackoutOrb() then
+				return
+			end
+			if getgenv().SB2AutoFloorDodgeOn ~= true then
+				return
+			end
+			local char = LocalPlayer.Character
+			local hrp = char and char:FindFirstChild('HumanoidRootPart')
+			if not hrp then
+				return
+			end
+			local out = RL.escape(hrp.Position, nil)
+			if not out then
+				out = RL.blackoutClamp(hrp.Position)
+			end
+			if out then
+				pcall(function()
+					hrp.CFrame = CFrame.new(out) * (hrp.CFrame - hrp.CFrame.Position)
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				end)
+				if typeof(getgenv().SB2DivePinPos) == 'Vector3' then
+					local pin = getgenv().SB2DivePinPos
+					getgenv().SB2DivePinPos = Vector3.new(out.X, pin.Y, out.Z)
+				end
+				local now = os.clock()
+				if now - (RL.lastLogAt or 0) > 0.5 then
+					RL.lastLogAt = now
+					local logFn = getgenv().SB2DodgeLog
+					if type(logFn) == 'function' then
+						pcall(logFn, 'line-escape', 'laser/disc/nuke', out)
+					end
+				end
+			end
+		end)
+	end
+
 	local function flatXZ(v)
 		return Vector3.new(v.X, 0, v.Z)
 	end
@@ -125,11 +519,18 @@ return function(env)
 		local playerFlat = flatXZ(hrpPos)
 		local threats = {}
 		local scanned = 0
-		local function considerPart(d)
+		local nearestWhy, nearestD = nil, math.huge
+		local chars = workspace:FindFirstChild('Characters')
+		local charItems = workspace:FindFirstChild('CharacterItems')
+		local function considerPart(d, fromTelegraph)
 			if not d or not d:IsA('BasePart') then
 				return
 			end
 			if d.Transparency >= 0.995 then
+				return
+			end
+			-- Your own skill FX / weapons and map decor are never incoming attacks.
+			if (chars and d:IsDescendantOf(chars)) or (charItems and d:IsDescendantOf(charItems)) then
 				return
 			end
 			local n = string.lower(tostring(d.Name or ''))
@@ -137,20 +538,44 @@ return function(env)
 			local blob = n .. ' ' .. pn
 			local meteor = string.find(blob, 'meteor', 1, true)
 				or string.find(blob, 'fireball', 1, true)
+				or string.find(blob, 'firey', 1, true)
+				or string.find(blob, 'fireorb', 1, true)
 				or string.find(blob, 'rock', 1, true)
 				or string.find(blob, 'boulder', 1, true)
+			local s = d.Size
+			local span0 = math.max(s.X, s.Y, s.Z)
+			local minS = math.min(s.X, s.Y, s.Z)
+			local redBall = d.Material == Enum.Material.Neon
+				and span0 >= 6 and minS >= 4 and (span0 / math.max(minS, 0.05)) <= 1.8
+				and d.Color.R > 0.75 and d.Color.G < 0.6 and d.Color.B < 0.4
 			local floorSlam = string.find(blob, 'smash', 1, true)
 				or string.find(blob, 'slam', 1, true)
 				or string.find(blob, 'strike', 1, true)
 				or string.find(blob, 'gyzer', 1, true)
 				or string.find(blob, 'geyser', 1, true)
-			if not meteor and not floorSlam then
+			if not meteor and not floorSlam and not redBall then
 				return
+			end
+			-- Outside the telegraph folders only something actually moving is a threat:
+			-- static rocks / red decor / leftover "strike" parts kept you sidestepping off mobs.
+			local vel = d.AssemblyLinearVelocity
+			local moving = vel.Y < -4 or vel.Magnitude > 8
+			if not fromTelegraph then
+				if floorSlam and not (meteor or redBall) then
+					return
+				end
+				if not moving then
+					return
+				end
 			end
 			local flat = flatXZ(d.Position)
 			local near = (flat - playerFlat).Magnitude
 			if near > 95 then
 				return
+			end
+			if near < nearestD then
+				nearestD = near
+				nearestWhy = d:GetFullName()
 			end
 			local land = flat
 			local vy = d.AssemblyLinearVelocity.Y
@@ -179,7 +604,19 @@ return function(env)
 					if scanned > 900 then
 						break
 					end
-					considerPart(d)
+					considerPart(d, true)
+				end
+			end
+		end
+		-- Red fireballs spawn as workspace parts, not telegraph markers.
+		for _, ch in ipairs(workspace:GetChildren()) do
+			if BEAM_SKIP_ROOT[ch.Name] then
+				continue
+			end
+			considerPart(ch, false)
+			if ch:IsA('Model') or ch:IsA('Folder') then
+				for _, d in ipairs(ch:GetChildren()) do
+					considerPart(d, false)
 				end
 			end
 		end
@@ -204,6 +641,7 @@ return function(env)
 			end
 		end
 		if bestScore > 1.5 and bestGoal then
+			getgenv().SB2DodgeWhyDetail = nearestWhy
 			return bestGoal
 		end
 		return nil
@@ -223,23 +661,33 @@ return function(env)
 
 	local function resolveFloorDodgeGoal(hrp, fightY)
 		local y = fightY or hrp.Position.Y
+		local laserOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.escape(hrp.Position, nil)
+		if laserOut then
+			getgenv().SB2DodgeWhy = 'red-laser'
+			return Vector3.new(laserOut.X, y, laserOut.Z)
+		end
 		local sky = wdSkyThreatDodgeGoal(hrp.Position, y)
 		if sky then
+			getgenv().SB2DodgeWhy = 'sky'
 			return sky
 		end
+		getgenv().SB2DodgeWhyDetail = nil
 		local tele = telegraphDodgeGoal(hrp.Position, y)
 		if tele then
+			getgenv().SB2DodgeWhy = 'telegraph'
 			return tele
 		end
 		local findGoal = getgenv().SB2FindFloorCircleDodgeGoal
 		if type(findGoal) == 'function' then
 			local g = findGoal(hrp.Position, y, nil)
 			if g then
+				getgenv().SB2DodgeWhy = 'circle'
 				return flattenDodgeY(g, y)
 			end
 		end
 		local beam = beamDodgeGoal(hrp.Position)
 		if beam then
+			getgenv().SB2DodgeWhy = 'beam'
 			return Vector3.new(beam.X, y, beam.Z)
 		end
 		return nil
@@ -570,7 +1018,7 @@ return function(env)
 			return nil
 		end
 		for _, mob in ipairs(folder:GetChildren()) do
-			if mobIsDead(mob) then
+			if getgenv().SB2AFD_mobIsDead(mob) then
 				continue
 			end
 			if textIsAeganatos(mob.Name) then
@@ -586,7 +1034,7 @@ return function(env)
 	end
 
 	local function aeganatosHeadTopY(mob)
-		if not mob or mobIsDead(mob) then
+		if not mob or getgenv().SB2AFD_mobIsDead(mob) then
 			return nil
 		end
 		local topY = nil
@@ -640,35 +1088,71 @@ return function(env)
 		return aeganatosStandY
 	end
 
-	local function uiSaysFloorLava()
-		local pg = LocalPlayer:FindFirstChild('PlayerGui')
-		if not pg then
+	local uiSaysFloorLava
+	do
+		local LAVA_UI_SKIP = {
+			InventoryFrame = true, CashShop = true, Quests = true,
+			SB2PlayerTools = true, SB2ThemePicker = true, Blessings = true, NPCDialogue = true,
+		}
+		-- Text labels outside the big menus, kept up to date by events. Scanning all of PlayerGui
+		-- here was 41k objects (32k inventory tiles once the inventory tab was opened), 4x a second.
+		local lavaLabels = {}
+		local lavaLabelsReady = false
+		local function lavaLabelSkipped(d, pg)
+			local p = d
+			while p and p ~= pg do
+				if LAVA_UI_SKIP[p.Name] then
+					return true
+				end
+				p = p.Parent
+			end
 			return false
 		end
-		local n = 0
-		for _, d in ipairs(pg:GetDescendants()) do
-			n += 1
-			if n > 3500 then
-				break
+		local function lavaLabelAdd(d, pg)
+			if (d:IsA('TextLabel') or d:IsA('TextButton')) and not lavaLabelSkipped(d, pg) then
+				lavaLabels[d] = true
 			end
-			if d:IsA('TextLabel') or d:IsA('TextButton') then
-				local full = d:GetFullName()
-				if string.find(full, 'CashShop', 1, true)
-					or string.find(full, 'InventoryFrame', 1, true)
-					or string.find(full, 'Quests', 1, true)
-				then
-					continue
+		end
+		local function lavaLabelsInit(pg)
+			lavaLabelsReady = true
+			for _, key in ipairs({ 'SB2AfdLavaLblAdd', 'SB2AfdLavaLblRem' }) do
+				local c = getgenv()[key]
+				if c then
+					pcall(function()
+						c:Disconnect()
+					end)
 				end
-				local t = string.lower(tostring(d.Text or ''))
-				if string.find(t, 'floor is lava', 1, true)
-					or string.find(t, 'floorislava', 1, true)
-					or string.find(t, 'lava wave', 1, true)
+			end
+			for _, d in ipairs(pg:GetDescendants()) do
+				lavaLabelAdd(d, pg)
+			end
+			getgenv().SB2AfdLavaLblAdd = pg.DescendantAdded:Connect(function(d)
+				lavaLabelAdd(d, pg)
+			end)
+			getgenv().SB2AfdLavaLblRem = pg.DescendantRemoving:Connect(function(d)
+				lavaLabels[d] = nil
+			end)
+		end
+		function uiSaysFloorLava()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			if not pg then
+				return false
+			end
+			if not lavaLabelsReady then
+				lavaLabelsInit(pg)
+			end
+			for d in pairs(lavaLabels) do
+				local t = string.lower(d.Text)
+				if string.find(t, 'lava', 1, true)
+					and (string.find(t, 'floor is lava', 1, true)
+						or string.find(t, 'floorislava', 1, true)
+						or string.find(t, 'lava wave', 1, true))
 				then
 					return true
 				end
 			end
+			return false
 		end
-		return false
 	end
 
 	local function partIsFireOrb(part)
@@ -683,43 +1167,84 @@ return function(env)
 		return part.Material == Enum.Material.Neon and c.R > 0.8 and c.G < 0.55 and c.B < 0.3
 	end
 
-	local function worldSaysFloorLava()
-		local wd = workspace:FindFirstChild('WaveDefenseStuff')
-		local region = wd and wd:FindFirstChild('LavaHazardRegion')
-		-- Inactive placeholder parts exist in WD hub/arena — only treat as lava when visible/active.
-		if region and region:IsA('BasePart') then
-			local active = region.Transparency < 0.55
-				or (#region:GetChildren() > 0 and region:GetAttribute('Active') == true)
-			if active then
-				return true
+	local worldSaysFloorLava
+	do
+		local lavaWorldDirty, lavaWorldSweepAt, lavaWorldLast = true, 0, false
+		do
+			local prevC = getgenv().SB2AfdLavaDirtyConn
+			if prevC then
+				pcall(function()
+					prevC:Disconnect()
+				end)
 			end
+			getgenv().SB2AfdLavaDirtyConn = workspace.ChildAdded:Connect(function(c)
+				local n = string.lower(c.Name)
+				if n == 'lava' or string.find(n, 'firey', 1, true) or c:IsA('Model') or c:IsA('Folder')
+					or (c:IsA('BasePart') and c.Material == Enum.Material.Neon)
+				then
+					lavaWorldDirty = true
+				end
+			end)
 		end
-		for _, c in ipairs(workspace:GetChildren()) do
-			local n = string.lower(c.Name)
-			-- Rubricatus leftover discs / slam boxes are red neon; they are not floor-is-lava.
-			if string.find(n, 'lightning', 1, true) or string.find(n, 'disc', 1, true)
-				or n == 'box' or n == 'effecthitbox' or n == 'circle'
-			then
-				continue
+		local worldSaysFloorLavaFull
+		function worldSaysFloorLava()
+			-- Sweep all of workspace only when something new was added, or once a second
+			-- (fire orbs can light up in place). It was ~8ms, 4x a second, in big maps.
+			local wd = workspace:FindFirstChild('WaveDefenseStuff')
+			local region = wd and wd:FindFirstChild('LavaHazardRegion')
+			if region and region:IsA('BasePart') then
+				local active = region.Transparency < 0.55
+					or (#region:GetChildren() > 0 and region:GetAttribute('Active') == true)
+				if active then
+					return true
+				end
 			end
-			if c ~= region and (n == 'lava' or n == 'fireyorb' or string.find(n, 'firey', 1, true)) then
-				return true
+			local now = os.clock()
+			if lavaWorldDirty or lavaWorldLast or now - lavaWorldSweepAt >= 1 then
+				lavaWorldDirty = false
+				lavaWorldSweepAt = now
+				lavaWorldLast = worldSaysFloorLavaFull()
 			end
-			if c:IsA('BasePart') and partIsFireOrb(c) then
-				return true
+			return lavaWorldLast
+		end
+		worldSaysFloorLavaFull = function()
+			local wd = workspace:FindFirstChild('WaveDefenseStuff')
+			local region = wd and wd:FindFirstChild('LavaHazardRegion')
+			-- Inactive placeholder parts exist in WD hub/arena — only treat as lava when visible/active.
+			if region and region:IsA('BasePart') then
+				local active = region.Transparency < 0.55
+					or (#region:GetChildren() > 0 and region:GetAttribute('Active') == true)
+				if active then
+					return true
+				end
 			end
-			if c:IsA('Model') or c:IsA('Folder') then
-				for _, d in ipairs(c:GetChildren()) do
-					if d:IsA('BasePart') and partIsFireOrb(d) then
-						return true
-					end
-					if string.lower(d.Name) == 'fireyorb' or string.lower(d.Name) == 'lava' then
-						return true
+			for _, c in ipairs(workspace:GetChildren()) do
+				local n = string.lower(c.Name)
+				-- Rubricatus leftover discs / slam boxes are red neon; they are not floor-is-lava.
+				if string.find(n, 'lightning', 1, true) or string.find(n, 'disc', 1, true)
+					or n == 'box' or n == 'effecthitbox' or n == 'circle'
+				then
+					continue
+				end
+				if c ~= region and (n == 'lava' or n == 'fireyorb' or string.find(n, 'firey', 1, true)) then
+					return true
+				end
+				if c:IsA('BasePart') and partIsFireOrb(c) then
+					return true
+				end
+				if c:IsA('Model') or c:IsA('Folder') then
+					for _, d in ipairs(c:GetChildren()) do
+						if d:IsA('BasePart') and partIsFireOrb(d) then
+							return true
+						end
+						if string.lower(d.Name) == 'fireyorb' or string.lower(d.Name) == 'lava' then
+							return true
+						end
 					end
 				end
 			end
+			return false
 		end
-		return false
 	end
 
 	local function isWdWaveInstance()
@@ -811,6 +1336,7 @@ return function(env)
 		end
 		return false
 	end
+	getgenv().SB2AFD_mobIsDead = mobIsDead -- used by code above its definition
 
 	local function bossNameMatch(text)
 		local lower = string.lower(tostring(text or ''))
@@ -994,7 +1520,7 @@ return function(env)
 			or string.find(key, 'grim', 1, true)
 			or string.find(key, 'overseer', 1, true)
 			or string.find(key, 'wendigo', 1, true)
-			or textIsBob(mob.Name)
+			or getgenv().SB2AFD_textIsBob(mob.Name)
 		then
 			return nil
 		end
@@ -1006,7 +1532,7 @@ return function(env)
 		if label and textIsAeganatos(label.Text) then
 			return AEGANATOS_CLEARANCE
 		end
-		local p = mobStrikePos(mob)
+		local p = getgenv().SB2AFD_mobStrikePos(mob)
 		-- Floor bosses (Nythrane / Aegor ~Y30–50): 4-spot hop at fight height, not +120.
 		if p and p.Y <= 60 then
 			return nil
@@ -1082,7 +1608,8 @@ return function(env)
 		end
 		local params = RaycastParams.new()
 		params.FilterType = Enum.RaycastFilterType.Exclude
-		local ignore = { hrp.Parent }
+		-- Mobs are not floor: a boss under you made "the floor" its head (low-HP lift went to Y235).
+		local ignore = { hrp.Parent, workspace:FindFirstChild('Mobs') }
 		params.FilterDescendantsInstances = ignore
 		local origin = Vector3.new(wx, wy + 8, wz)
 		for _ = 1, 5 do
@@ -1090,7 +1617,9 @@ return function(env)
 			if not hit then
 				break
 			end
-			if not partIsFireOrb(hit.Instance) then
+			-- Skip non-solid parts: WaveDefenseStuff.LavaHazardRegion sits ~2 studs over the real
+			-- floor, so every "stand on the floor" held you hovering at Y~32.
+			if not partIsFireOrb(hit.Instance) and hit.Instance.CanCollide then
 				return hit.Position.Y
 			end
 			ignore[#ignore + 1] = hit.Instance
@@ -1142,6 +1671,42 @@ return function(env)
 		return st == Enum.HumanoidStateType.Jumping or st == Enum.HumanoidStateType.Freefall
 	end
 
+	-- workspace.Barriers.Roof is an invisible collidable block over the whole arena starting
+	-- at ~Y 170. Anything held above it ends up inside it and the physics shoves you back out
+	-- (logs showed you bouncing between Y 360 and Y 168). Keep every air hold under it.
+	do
+		local cache = {}
+		getgenv().SB2AFD_roofClamp = function(pos)
+			if typeof(pos) ~= 'Vector3' or not workspace:FindFirstChild('WaveDefenseStuff') then
+				return pos
+			end
+			local barriers = workspace:FindFirstChild('Barriers')
+			if not barriers then
+				return pos
+			end
+			local key = math.floor(pos.X / 10) .. ':' .. math.floor(pos.Z / 10)
+			local now = os.clock()
+			local c = cache[key]
+			local ceil
+			if c and now - c.at < 30 then
+				ceil = c.y
+			else
+				local params = RaycastParams.new()
+				params.FilterType = Enum.RaycastFilterType.Include
+				params.FilterDescendantsInstances = { barriers }
+				local ok, hit = pcall(function()
+					return workspace:Raycast(Vector3.new(pos.X, WD_LAVA_FLOOR_Y + 6, pos.Z), Vector3.new(0, 2000, 0), params)
+				end)
+				ceil = (ok and hit) and hit.Position.Y or false
+				cache[key] = { at = now, y = ceil }
+			end
+			if ceil and pos.Y > ceil - 8 then
+				return Vector3.new(pos.X, ceil - 8, pos.Z)
+			end
+			return pos
+		end
+	end
+
 	local function writeHeldCF(hrp, dest, lookAt, minMove, skipPin, forceY)
 		minMove = tonumber(minMove) or 0
 		local lavaLock = getgenv().SB2LavaEscapeActive == true
@@ -1154,12 +1719,25 @@ return function(env)
 			dest = Vector3.new(dest.X, hrp.Position.Y, dest.Z)
 			skipPin = true
 		end
+		dest = getgenv().SB2AFD_roofClamp(dest)
+		-- Never hold a spot sitting on a live Rubricatus laser / disc line (any dodge mode).
+		local lineOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.escape(dest, nil)
+		if lineOut then
+			dest = Vector3.new(lineOut.X, dest.Y, lineOut.Z)
+		end
 		local liftY = dest.Y - hrp.Position.Y
 		local airborne = humAirborne(hrp) and not lavaLock and not bobLock and not rubLock
 			and forceY ~= true and liftY <= 2
 		if airborne then
 			dest = Vector3.new(dest.X, hrp.Position.Y, dest.Z)
 			skipPin = true
+		end
+		-- Blackout: never hold outside the orb light (it drains 5% a tick out there).
+		local boOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.blackoutClamp
+			and getgenv().SB2RedLaser.blackoutClamp(dest)
+		if boOut then
+			dest = boOut
+			airborne = false
 		end
 		if skipPin ~= true then
 			local dx = math.abs(dest.X - hrp.Position.X)
@@ -1190,7 +1768,8 @@ return function(env)
 			hrp.Anchored = false
 			hrp.CFrame = cf
 			local v = hrp.AssemblyLinearVelocity
-			hrp.AssemblyLinearVelocity = Vector3.new(v.X * 0.2, v.Y, v.Z * 0.2)
+			-- A hit's upward speed is not a jump. Keep the sidestep, drop the launch.
+			hrp.AssemblyLinearVelocity = Vector3.new(v.X * 0.2, 0, v.Z * 0.2)
 			return true
 		end
 		hrp.AssemblyLinearVelocity = Vector3.zero
@@ -1431,6 +2010,9 @@ return function(env)
 
 	local function rubricatusReleaseCover()
 		local cover = getgenv().SB2RubricatusCoverPos
+		if typeof(cover) == 'Vector3' then
+			getgenv().SB2RubCoverExit = cover
+		end
 		rubricatusNukeUntil = 0
 		rubricatusNukeStartedAt = 0
 		getgenv().SB2RubricatusNukeUntil = 0
@@ -1449,16 +2031,50 @@ return function(env)
 	local function rubricatusInCoverWindow(nowPre, hrpPos)
 		local pillars = collectRubricatusPillars(hrpPos or Vector3.zero, 480)
 		local n = #pillars
+		-- The 7 pillars rise once and then stand for the whole fight, and boss attacks knock
+		-- them around. Counting them / their velocity kept "the nuke is coming" on with no
+		-- nuke, freezing you in cover while discs hit you. Only a pillar still coming up out
+		-- of the floor (bottom below floor level) means a nuke was just cast.
 		local rising = false
 		for i = 1, n do
-			if rubricatusPillarRising(pillars[i]) then
+			if pillars[i].bottom < WD_LAVA_FLOOR_Y - 6 then
 				rising = true
 				break
 			end
 		end
-		if n > rubricatusPillarCount or rising then
+		-- The nuke's own blast effect: once it has gone off, leave cover.
+		if not getgenv().SB2RubNukeHook then
+			getgenv().SB2RubNukeHook = workspace.Terrain.ChildAdded:Connect(function(ch)
+				if not ch:IsA('Attachment') then
+					return
+				end
+				task.defer(function()
+					local s = ch:FindFirstChildWhichIsA('Sound')
+					if s and string.find(tostring(s.SoundId), '132218659554859', 1, true) then
+						getgenv().SB2RubNukeBoomAt = os.clock()
+						local logFn = getgenv().SB2DodgeLog
+						if type(logFn) == 'function' then
+							logFn('rub-nuke-boom', nil, ch.WorldPosition)
+						end
+					end
+				end)
+			end)
+		end
+		local boomAt = tonumber(getgenv().SB2RubNukeBoomAt) or -1e9
+		if rubricatusNukeStartedAt > 0 and boomAt >= rubricatusNukeStartedAt and nowPre - boomAt > 1 then
+			rising = false
+			rubricatusNukeUntil = 0
+			rubricatusNukeStartedAt = 0
+			getgenv().SB2RubricatusNukeUntil = 0
+		end
+		if rising then
 			if rubricatusNukeStartedAt == 0 then
 				rubricatusNukeStartedAt = nowPre
+				getgenv().SB2RubNukeT0 = nowPre
+				local logFn = getgenv().SB2DodgeLog
+				if type(logFn) == 'function' then
+					logFn('rub-nuke-cast', nil, hrpPos)
+				end
 			end
 			rubricatusNukeUntil = nowPre + RUBRICATUS_NUKE_HOLD
 			getgenv().SB2RubricatusNukeUntil = rubricatusNukeUntil
@@ -1486,6 +2102,8 @@ return function(env)
 		end
 		local flat = Vector3.new(dest.X - hrp.Position.X, 0, dest.Z - hrp.Position.Z)
 		local look = typeof(lookAt) == 'Vector3' and lookAt or nil
+		-- Collision stays ON: turning it off locally is the likely reason the blast went through
+		-- the pillar in v14. The hold re-pins you every tick; on release you are walked out (no pop-up).
 		-- Dive blink was sending you 150 studs off the pillar. Stay on writeHeldCF.
 		writeHeldCF(hrp, dest, look, 0, true, true)
 		getgenv().SB2RubricatusCoverPos = dest
@@ -1859,8 +2477,164 @@ return function(env)
 		return bestSafe
 	end
 
+	-- Rubricatus melee swings / slam. Each one spawns a "Box" hitbox tagged "<Mob> Attack" or
+	-- "<Mob> Slam". The hit lands after the Box's Lifetime (Attack) or 0.3 / AttackSpeed (Slam).
+	-- The general threat scan only polls, and the pillar cover window skipped it entirely,
+	-- so swings were landing. This tracks boxes the moment they spawn and steps out over
+	-- the nearest edge. Lives in a do-block + getgenv(): this function is at Luau's
+	-- 200-local cap, so it must not add a top-level local.
+	do
+	local RubSwing = { boxes = {} }
+	getgenv().SB2RubSwing = RubSwing
+	do
+		local CS = game:GetService('CollectionService')
+		local function track(part, slam)
+			if typeof(part) ~= 'Instance' or not part:IsA('BasePart') or part.Name ~= 'Box' then
+				return
+			end
+			if RubSwing.boxes[part] then
+				return
+			end
+			RubSwing.boxes[part] = { born = os.clock(), slam = slam == true }
+		end
+		for _, old in ipairs(getgenv().SB2RubSwingConns or {}) do
+			pcall(function()
+				old:Disconnect()
+			end)
+		end
+		local conns = {}
+		local function hookTag(tag, slam)
+			conns[#conns + 1] = CS:GetInstanceAddedSignal(tag):Connect(function(inst)
+				track(inst, slam)
+			end)
+			for _, inst in ipairs(CS:GetTagged(tag)) do
+				track(inst, slam)
+			end
+		end
+		hookTag('Rubricatus Attack', false)
+		hookTag('Rubricatus Slam', true)
+		-- Fallback if the boss name / tag differs: any Box tagged "... Attack" / "... Slam"
+		-- or carrying an AttackState attribute.
+		conns[#conns + 1] = workspace.ChildAdded:Connect(function(inst)
+			if inst.Name ~= 'Box' or not inst:IsA('BasePart') then
+				return
+			end
+			task.defer(function()
+				if RubSwing.boxes[inst] or not inst.Parent then
+					return
+				end
+				local kind = nil
+				pcall(function()
+					for _, t in ipairs(inst:GetTags()) do
+						local lt = string.lower(t)
+						if string.sub(lt, -7) == ' attack' then
+							kind = 'attack'
+						elseif string.sub(lt, -5) == ' slam' then
+							kind = 'slam'
+						end
+					end
+				end)
+				if kind or inst:GetAttribute('AttackState') ~= nil then
+					track(inst, kind == 'slam')
+				end
+			end)
+		end)
+		getgenv().SB2RubSwingConns = conns
+	end
+
+	-- Live boxes (purges finished ones) and an "is this spot inside any box" test.
+	function RubSwing.live(now)
+		local list = {}
+		for part, e in pairs(RubSwing.boxes) do
+			local speed = tonumber(part:GetAttribute('AttackSpeed')) or 1
+			local life = tonumber(part:GetAttribute('Lifetime'))
+			local hitIn = e.slam and (0.3 / math.max(speed, 0.1)) or (life or 0.9)
+			if not part.Parent or now > e.born + hitIn + 0.45 then
+				RubSwing.boxes[part] = nil
+			else
+				list[#list + 1] = part
+			end
+		end
+		return list
+	end
+
+	function RubSwing.insideAny(list, x, z, margin)
+		for i = 1, #list do
+			local p = list[i]
+			local rel = p.CFrame:PointToObjectSpace(Vector3.new(x, p.Position.Y, z))
+			if math.abs(rel.X) <= p.Size.X * 0.5 + margin and math.abs(rel.Z) <= p.Size.Z * 0.5 + margin then
+				return p
+			end
+		end
+		return nil
+	end
+
+	function RubSwing.blocks(pos, now)
+		if typeof(pos) ~= 'Vector3' then
+			return false
+		end
+		return RubSwing.insideAny(RubSwing.live(now), pos.X, pos.Z, 3) ~= nil
+	end
+
+	-- Exit spot when standing in a live box, else nil. `prefer` (cover spot) biases the pick.
+	function RubSwing.escape(hrpPos, fightY, now, prefer)
+		local list = RubSwing.live(now)
+		if #list == 0 or not RubSwing.insideAny(list, hrpPos.X, hrpPos.Z, 4) then
+			return nil
+		end
+		local best, bestScore = nil, math.huge
+		local function consider(x, z)
+			if RubSwing.insideAny(list, x, z, 3) then
+				return
+			end
+			local dx, dz = x - hrpPos.X, z - hrpPos.Z
+			local score = math.sqrt(dx * dx + dz * dz)
+			if typeof(prefer) == 'Vector3' then
+				local px, pz = x - prefer.X, z - prefer.Z
+				score += 0.6 * math.sqrt(px * px + pz * pz)
+			end
+			if score < bestScore then
+				best, bestScore = Vector3.new(x, fightY, z), score
+			end
+		end
+		for i = 1, #list do
+			local p = list[i]
+			local rel = p.CFrame:PointToObjectSpace(Vector3.new(hrpPos.X, p.Position.Y, hrpPos.Z))
+			local hx, hz = p.Size.X * 0.5, p.Size.Z * 0.5
+			if math.abs(rel.X) <= hx + 4 and math.abs(rel.Z) <= hz + 4 then
+				for _, side in ipairs({
+					Vector3.new(hx + 9, 0, rel.Z),
+					Vector3.new(-(hx + 9), 0, rel.Z),
+					Vector3.new(rel.X, 0, hz + 9),
+					Vector3.new(rel.X, 0, -(hz + 9)),
+				}) do
+					local w = p.CFrame:PointToWorldSpace(Vector3.new(side.X, 0, side.Z))
+					consider(w.X, w.Z)
+				end
+			end
+		end
+		if not best then
+			-- Overlapping boxes: ring search for the nearest clear spot.
+			for di = 2, 10 do
+				for a = 0, 23 do
+					local ang = a * math.pi / 12
+					consider(hrpPos.X + math.cos(ang) * di * 10, hrpPos.Z + math.sin(ang) * di * 10)
+				end
+				if best then
+					break
+				end
+			end
+		end
+		return best
+	end
+	end
+
 	local function rubricatusGeneralDodgeGoal(hrpPos, fightY, bossMob, now)
 		local keepFlat = bossMob and lastRubricatusFlat or nil
+		local laserOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.escape(hrpPos, nil)
+		if laserOut then
+			return rubricatusLimitStep(hrpPos, Vector3.new(laserOut.X, fightY, laserOut.Z), fightY, nil)
+		end
 		local threats = rubricatusThreatsCached(hrpPos, now or os.clock())
 		local resolved = rubricatusResolveThreats(hrpPos, fightY, threats)
 		if resolved then
@@ -1911,7 +2685,10 @@ return function(env)
 		if bhMag < 2 then
 			return Vector3.new(ph.X, fightY, ph.Z)
 		end
-		local inset = math.clamp(entry.halfW * 0.3, 1.2, PILLAR_BEHIND_OFFSET)
+		-- Stand just OUTSIDE the pillar's back face, not inside it. Inside its body the hold got
+		-- shoved up onto the top (exposed above it: one-shot at wave 100 Elite), and a ray that
+		-- starts inside a part never hits that part, so the pillar may not count as cover at all.
+		local inset = entry.halfW + PILLAR_BEHIND_OFFSET + 1.5
 		local stand = ph + (bh / bhMag) * inset
 		return Vector3.new(stand.X, fightY, stand.Z)
 	end
@@ -1930,7 +2707,7 @@ return function(env)
 		end
 		local perp = (entry.flat - (bossFlat + dir * t)).Magnitude
 		return perp <= math.max(entry.halfW - PILLAR_SHADOW_MARGIN, 1.2)
-			and (playerFlat - entry.flat).Magnitude <= math.max(entry.halfW * 0.65, 2.5)
+			and (playerFlat - entry.flat).Magnitude <= entry.halfW + PILLAR_BEHIND_OFFSET + 4
 	end
 
 	-- Above the pillar top the boss still sees you, so cover height must sit inside its span.
@@ -1945,12 +2722,14 @@ return function(env)
 
 	local function rubricatusPillarCoverGoal(hrpPos, fightY, bossMob)
 		bossMob = bossMob or findRubricatusMob()
-		if not bossMob then
+		-- He can die with a nuke still charging: hide from where he last stood.
+		local deadFlat = (not bossMob) and typeof(lastRubricatusFlat) == 'Vector3' and lastRubricatusFlat or nil
+		if not bossMob and not deadFlat then
 			rubricatusCoverPart = nil
 			rubricatusCoverGoalFlat = nil
 			return nil
 		end
-		local bossFlat = rubricatusBossFlat(bossMob)
+		local bossFlat = deadFlat or rubricatusBossFlat(bossMob)
 		if not bossFlat then
 			return nil
 		end
@@ -1999,7 +2778,9 @@ return function(env)
 			return nil
 		end
 		rubricatusCoverPart = pick.part
-		local coverY = rubricatusCoverY(pick, fightY)
+		-- The blast goes off at floor level (Y~27). At the pillar's base (v14) it killed you; high
+		-- inside it (Y~68, v13) you took nothing. Sit at the middle of the pillar's height.
+		local coverY = rubricatusCoverY(pick, (pick.bottom + pick.top) * 0.5)
 		if rubricatusShadowedBy(bossFlat, playerFlat, pick) and math.abs(hrpPos.Y - coverY) < 4 then
 			rubricatusCoverGoalFlat = playerFlat
 			return Vector3.new(hrpPos.X, coverY, hrpPos.Z)
@@ -2238,6 +3019,7 @@ return function(env)
 		-- Nameplate often arrives before Entity.Health replicates (0 HP = false dead).
 		return string.sub(key, 1, 3) == 'bob' and string.find(key, 'bobbin', 1, true) == nil
 	end
+	getgenv().SB2AFD_textIsBob = textIsBob -- used by code above its definition
 
 	local function bobMobAlive(mob)
 		if not mob or not mob.Parent then
@@ -2337,10 +3119,14 @@ return function(env)
 		return hrp.Position.Y - gy - humanoidHip(hrp) - hrp.Size.Y * 0.5 >= AIR_STUCK_MIN_HEIGHT
 	end
 
-	-- writeHeldCF zeros velocity while leaving Freefall. Near the floor that parks you
-	-- until WASD sets MoveDirection. Plant on the ground instead of waiting for W.
+	-- Hit knockups look like a jump (Freefall + upward speed). The old check ignored
+	-- anything faster than a small hop, so normal attacks carried you into the air.
+	-- Lava, Bob's perch, and Rubricatus cover still own Y.
 	local function unstickIdleFreefall(hrp)
 		if getgenv().SB2BobEscapeActive == true then
+			return
+		end
+		if getgenv().SB2RubricatusSurviveActive == true or typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3' then
 			return
 		end
 		local fightY = getgenv().SB2LavaFightY
@@ -2351,22 +3137,25 @@ return function(env)
 		if not hum then
 			return
 		end
-		local st = hum:GetState()
-		if st ~= Enum.HumanoidStateType.Freefall and st ~= Enum.HumanoidStateType.Jumping then
-			return
-		end
 		local vel = hrp.AssemblyLinearVelocity
-		if math.abs(vel.Y) > 6 or vel.Magnitude > 12 then
-			return
-		end
 		local gy = groundYAt(hrp)
 		if not gy then
 			return
 		end
 		local standY = gy + humanoidHip(hrp) + hrp.Size.Y * 0.5 + 0.15
 		local above = hrp.Position.Y - standY
-		if above > 14 then
+		if above <= 2.5 and vel.Y <= 8 then
 			return
+		end
+		for _, d in ipairs(hrp:GetChildren()) do
+			local cls = d.ClassName
+			if cls == 'BodyVelocity' and d.Velocity.Y > 0 then
+				d.Velocity = Vector3.new(d.Velocity.X, 0, d.Velocity.Z)
+			elseif cls == 'LinearVelocity' and d.VectorVelocity.Y > 0 then
+				d.VectorVelocity = Vector3.new(d.VectorVelocity.X, 0, d.VectorVelocity.Z)
+			elseif cls == 'VectorForce' and d.Force.Y > 0 then
+				d.Force = Vector3.new(d.Force.X, 0, d.Force.Z)
+			end
 		end
 		getgenv().SB2AnchorLockCF = nil
 		local look = hrp.CFrame.LookVector
@@ -2377,7 +3166,8 @@ return function(env)
 		else
 			hrp.CFrame = CFrame.new(dest)
 		end
-		hrp.AssemblyLinearVelocity = Vector3.new(0, -2, 0)
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
 		pcall(function()
 			hum:ChangeState(Enum.HumanoidStateType.Landed)
 		end)
@@ -2402,6 +3192,7 @@ return function(env)
 		end
 		return nil
 	end
+	getgenv().SB2AFD_mobStrikePos = mobStrikePos -- used by code above its definition
 
 	local function refreshStrikeBossPos(hrp)
 		strikeBossPos = nil
@@ -2533,16 +3324,26 @@ return function(env)
 	end
 
 	local function bobEscapeDest(hrp, holdY)
+		local bob = findBobMob()
+		local bobP = bob and mobStrikePos(bob)
+		-- His body is ~200 studs across. If he walks onto the perch, flip to the far side.
 		if typeof(bobEscapeFlat) == 'Vector3' then
-			return Vector3.new(bobEscapeFlat.X, holdY, bobEscapeFlat.Z)
+			local keep = true
+			if bobP then
+				local dx = bobEscapeFlat.X - bobP.X
+				local dz = bobEscapeFlat.Z - bobP.Z
+				keep = (dx * dx + dz * dz) > (170 * 170)
+			end
+			if keep then
+				return getgenv().SB2AFD_roofClamp(Vector3.new(bobEscapeFlat.X, holdY, bobEscapeFlat.Z))
+			end
+			bobEscapeFlat = nil
 		end
 		local center = waveDefenseRiftsCenterFlat()
 		if not center then
 			center = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
 		end
 		local away = Vector3.new(hrp.Position.X - center.X, 0, hrp.Position.Z - center.Z)
-		local bob = findBobMob()
-		local bobP = bob and mobStrikePos(bob)
 		if bobP then
 			local fromBob = Vector3.new(center.X - bobP.X, 0, center.Z - bobP.Z)
 			if fromBob.Magnitude >= 4 then
@@ -2554,12 +3355,42 @@ return function(env)
 		else
 			away = away.Unit
 		end
+		-- The arena is walled in by huge invisible collidable blocks (workspace.Barriers). 280 out
+		-- at Y 360 put you INSIDE them, and the physics kept ejecting you at 500-20,000 studs/s
+		-- until your root part was deleted. Pull the perch in until it is clear of every wall
+		-- (the Roof block covers the whole arena from ~Y 170 up, so it is ignored like before).
+		local offset = BOB_SIDE_OFFSET
+		local barriers = workspace:FindFirstChild('Barriers')
+		if barriers then
+			local walls = {}
+			for _, part in ipairs(barriers:GetDescendants()) do
+				if part:IsA('BasePart') and part.CanCollide and part.Name ~= 'Roof' then
+					walls[#walls + 1] = part
+				end
+			end
+			if #walls > 0 then
+				local params = OverlapParams.new()
+				params.FilterType = Enum.RaycastFilterType.Include
+				params.FilterDescendantsInstances = walls
+				while offset > 60 do
+					local probe = Vector3.new(center.X + away.X * offset, holdY, center.Z + away.Z * offset)
+					-- 30-stud box: room for the character plus a margin from the wall face.
+					local ok, hits = pcall(function()
+						return workspace:GetPartBoundsInBox(CFrame.new(probe), Vector3.new(30, 30, 30), params)
+					end)
+					if ok and type(hits) == 'table' and #hits == 0 then
+						break
+					end
+					offset -= 20
+				end
+			end
+		end
 		bobEscapeFlat = Vector3.new(
-			center.X + away.X * BOB_SIDE_OFFSET,
+			center.X + away.X * offset,
 			0,
-			center.Z + away.Z * BOB_SIDE_OFFSET
+			center.Z + away.Z * offset
 		)
-		return Vector3.new(bobEscapeFlat.X, holdY, bobEscapeFlat.Z)
+		return getgenv().SB2AFD_roofClamp(Vector3.new(bobEscapeFlat.X, holdY, bobEscapeFlat.Z))
 	end
 
 	local function bobLiftWarp(hrp, holdY, fresh)
@@ -2765,6 +3596,13 @@ return function(env)
 		if typeof(hrpPos) ~= 'Vector3' then
 			return nil
 		end
+		-- Replaced by SB2DodgeModes.vaelithEscape (times the dodge to the orb's lock-on).
+		-- The orbs are tweened, so their velocity always reads 0 and this pushed you at random.
+		if getgenv().SB2DodgeOldVaelith ~= true then
+			getgenv().SB2VaelithMissileGoal = nil
+			getgenv().SB2VaelithMissileThreat = false
+			return nil
+		end
 		if not vaelithMissileContext() then
 			getgenv().SB2VaelithMissileGoal = nil
 			getgenv().SB2VaelithMissileThreat = false
@@ -2876,6 +3714,25 @@ return function(env)
 				r = span * 0.5,
 			}
 		end
+		-- The game's own strike effect (TempestStrike.VFX) is placed where the bolt will land
+		-- the moment the strike starts, so it is the earliest warning we get.
+		for _, ch in ipairs(workspace:GetChildren()) do
+			if ch.Name == 'VFX' and ch:IsA('BasePart') then
+				local top = ch:FindFirstChild('Top')
+				if top and top:FindFirstChild('LightningStrike') then
+					local bottom = ch:FindFirstChild('Bottom')
+					local p = (bottom and bottom:IsA('Attachment')) and bottom.WorldPosition or ch.Position
+					circles[#circles + 1] = { x = p.X, z = p.Z, r = 27 }
+				end
+			end
+		end
+		-- Shared with the walk back to the middle so it never steps into a bolt circle.
+		if #circles > 0 then
+			getgenv().SB2TempestCircles = circles
+			getgenv().SB2TempestCirclesAt = now
+		end
+		-- Prefer safe spots near the arena middle so killaura still reaches every rift.
+		local mid = waveDefenseRiftsCenterFlat()
 		local function covered(x, z, pad)
 			pad = pad or 26
 			for i = 1, #circles do
@@ -2935,8 +3792,14 @@ return function(env)
 			if travel < 400 then
 				return
 			end
-			if clear > bestClear + 2 or (math.abs(clear - bestClear) <= 2 and travel < bestTravel) then
-				bestClear = clear
+			-- Max-clearance alone always picked the far edge and walked you away from mobs.
+			local score = math.min(clear, 45)
+			if mid then
+				local mx, mz = x - mid.X, z - mid.Z
+				score -= 0.6 * math.max(0, math.sqrt(mx * mx + mz * mz) - 20)
+			end
+			if score > bestClear + 2 or (math.abs(score - bestClear) <= 2 and travel < bestTravel) then
+				bestClear = score
 				bestTravel = travel
 				best = Vector3.new(x, hrpPos.Y, z)
 			end
@@ -3106,7 +3969,15 @@ return function(env)
 		if (dx * dx + dz * dz) < (minMove * minMove) then
 			return false
 		end
-		return writeHeldCF(hrp, dest, lookAt, minMove, true, false)
+		local moved = writeHeldCF(hrp, dest, lookAt, minMove, true, false)
+		-- A one-shot CFrame gets snapped back into the circle. Hold the exit until the spike lands.
+		if moved and type(getgenv().SB2PinTeleportCFrame) == 'function' then
+			local lv = hrp.CFrame.LookVector
+			local flat = Vector3.new(lv.X, 0, lv.Z)
+			local cf = flat.Magnitude >= 0.08 and CFrame.lookAt(dest, dest + flat.Unit) or CFrame.new(dest)
+			getgenv().SB2PinTeleportCFrame(cf, 0.9)
+		end
+		return moved
 	end
 
 	local function dropHoverToGround(hrp)
@@ -3134,28 +4005,1696 @@ return function(env)
 		if getgenv().SB2DiveFarmOn == true and type(isToggleOn) == 'function' and isToggleOn('DiveFarm') then
 			return lastStepAt
 		end
-		if now - lastStepAt < 0.12 then
+		local modesEarly = getgenv().SB2DodgeModes
+		-- Default for every wave without its own dodge: hover 160 above the floor over the middle.
+		if modesEarly and modesEarly.wantsHover160 and modesEarly.wantsHover160() then
+			modesEarly.hover160(hrp, now)
+			return now
+		end
+		getgenv().SB2Hover160Pos = nil
+		if modesEarly and modesEarly.projectileEscape then
+			local orbOut = modesEarly.projectileEscape(hrp, now)
+			if orbOut and (Vector3.new(orbOut.X - hrp.Position.X, 0, orbOut.Z - hrp.Position.Z)).Magnitude > 1.5 then
+				writeHeldCF(hrp, Vector3.new(orbOut.X, hrp.Position.Y, orbOut.Z), nil, 0, true, false)
+				return now
+			end
+		end
+		if modesEarly and modesEarly.releaseHover then
+			modesEarly.releaseHover(hrp)
+			if modesEarly.hurtEscape(hrp, now) then
+				return now
+			end
+		end
+		local heldGoal = getgenv().SB2FloorDodgeGoal
+		local offGoal = false
+		if typeof(heldGoal) == 'Vector3' then
+			local gx = heldGoal.X - hrp.Position.X
+			local gz = heldGoal.Z - hrp.Position.Z
+			offGoal = (gx * gx + gz * gz) > (4 * 4)
+		end
+		if not offGoal and now - lastStepAt < 0.12 then
 			return lastStepAt
 		end
 		local y = hrp.Position.Y
+		getgenv().SB2DodgeWhy = 'vaelith'
+		getgenv().SB2DodgeWhyDetail = nil
 		local goal = vaelithMissileDodgeGoal(hrp.Position)
 		if not goal then
+			getgenv().SB2DodgeWhy = 'tempest'
 			goal = tempestLightningDodgeGoal(hrp.Position)
 		end
 		if not goal then
 			goal = resolveFloorDodgeGoal(hrp, y)
 		end
+		-- Step out of the attack. Do not blink across the arena.
+		-- Storm bolts are ~50 wide: 12-stud steps took ~0.5s to get clear and the bolt
+		-- landed on you mid-escape, so storm dodges jump straight to the safe spot.
+		if typeof(goal) == 'Vector3' then
+			local sx = goal.X - hrp.Position.X
+			local sz = goal.Z - hrp.Position.Z
+			local sm = math.sqrt(sx * sx + sz * sz)
+			local cap = getgenv().SB2DodgeWhy == 'tempest' and 110 or 12
+			if sm > cap then
+				goal = Vector3.new(hrp.Position.X + sx / sm * cap, hrp.Position.Y, hrp.Position.Z + sz / sm * cap)
+			else
+				goal = Vector3.new(goal.X, hrp.Position.Y, goal.Z)
+			end
+		end
 		if goal and sidestepOnGround(hrp, goal, nil, 1.6) then
+			local logFn = getgenv().SB2DodgeLog
+			if type(logFn) == 'function' then
+				logFn('ground:' .. tostring(getgenv().SB2DodgeWhy), getgenv().SB2DodgeWhyDetail, hrp.Position)
+			end
+			getgenv().SB2LastDodgeMoveAt = now
+			-- Dodged right after walking back to the middle: the middle is the danger, so wait longer.
+			if now - (tonumber(getgenv().SB2LastRecenterAt) or -1e9) < 0.6 then
+				getgenv().SB2RecenterBackoffUntil = now + 3
+			end
 			return now
 		end
 		if dropHoverToGround(hrp) then
+			return now
+		end
+		local modes = getgenv().SB2DodgeModes
+		-- Rift special wave: cycle the four portal-leaning spots instead of sitting in the middle.
+		if modes and modes.riftCycle and modes.riftCycle(hrp, now) then
+			return now
+		end
+		if modes and modes.recenter and modes.recenter(hrp, now) then
 			return now
 		end
 		unstickIdleFreefall(hrp)
 		return lastStepAt
 	end
 
+	-- Air modes (Bob lift, Darkner orb hold, drop back to the floor) + a decision log.
+	-- Own function + getgenv(): the enclosing function sits at Luau's 200-local cap
+	-- (a plain do-block still spends its registers).
+	;(function()
+		local M = {}
+		getgenv().SB2DodgeModes = M
+
+		-- Ring buffer of every move the dodge makes, flushed to a file every couple of seconds.
+		local LOG_PATH = getgenv().SB2AcctPath('PlayerTools/_dodge_log.txt')
+		local lines, dirty, lastFlush, t0 = {}, false, 0, os.clock()
+		-- Keep the last 300 lines from before a reload so a problem isn't wiped by reloading.
+		pcall(function()
+			if type(readfile) == 'function' and type(isfile) == 'function' and isfile(LOG_PATH) then
+				local old = {}
+				for line in string.gmatch(readfile(LOG_PATH), '[^\n]+') do
+					old[#old + 1] = line
+				end
+				for i = math.max(1, #old - 299), #old do
+					lines[#lines + 1] = old[i]
+				end
+				if #lines > 0 then
+					lines[#lines + 1] = '---- reloaded ' .. os.date('%H:%M:%S') .. ' (times restart at 0) ----'
+				end
+			end
+		end)
+		local lastKey, lastKeyAt = nil, 0
+		local function flush()
+			dirty = false
+			lastFlush = os.clock()
+			if type(writefile) == 'function' then
+				pcall(writefile, LOG_PATH, table.concat(lines, '\n'))
+			end
+		end
+		getgenv().SB2DodgeLog = function(why, detail, pos)
+			local now = os.clock()
+			local key = tostring(why) .. '|' .. tostring(detail)
+			if key == lastKey and now - lastKeyAt < 0.5 then
+				return
+			end
+			lastKey, lastKeyAt = key, now
+			lines[#lines + 1] = string.format(
+				'%8.2f %-18s at=(%.0f,%.0f,%.0f) %s',
+				now - t0,
+				tostring(why),
+				typeof(pos) == 'Vector3' and pos.X or 0,
+				typeof(pos) == 'Vector3' and pos.Y or 0,
+				typeof(pos) == 'Vector3' and pos.Z or 0,
+				detail and ('<- ' .. tostring(detail)) or ''
+			)
+			if #lines > 600 then
+				table.remove(lines, 1)
+			end
+			dirty = true
+			if now - lastFlush > 2 then
+				flush()
+			end
+		end
+		task.spawn(function()
+			while getgenv().SB2DodgeModes == M do
+				task.wait(3)
+				if dirty then
+					flush()
+				end
+			end
+		end)
+
+		local function resetHold(dest)
+			local lineOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.escape(dest, nil)
+			if lineOut then
+				dest = Vector3.new(lineOut.X, dest.Y, lineOut.Z)
+			end
+			local boOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.blackoutClamp
+				and getgenv().SB2RedLaser.blackoutClamp(dest)
+			if boOut then
+				dest = boOut
+			end
+			getgenv().SB2DivePinPos = dest
+			local reset = getgenv().SB2DiveResetHold
+			if type(reset) == 'function' then
+				pcall(reset, dest)
+			end
+		end
+
+		-- The lava / Bob lifts use the main script's blink teleport, which parents a zero-velocity
+		-- LinearVelocity (SB2DiveLinVel) to your root and never removes it unless dive farm
+		-- toggles. Left on, it cancels gravity: you float in Freefall and the walk back to the
+		-- middle refuses to run (it skips while airborne). Take it off whenever we are on foot.
+		function M.releaseHover(hrp)
+			if getgenv().SB2DiveFarmOn == true or getgenv().SB2DiveUnderMap == true then
+				return false
+			end
+			local lv = getgenv().SB2DiveLinVel
+			if lv and hrp and lv.Parent == hrp then
+				pcall(function()
+					lv.Parent = nil
+					lv.Attachment0 = nil
+					lv.VectorVelocity = Vector3.zero
+				end)
+				getgenv().SB2DivePinPos = nil
+				getgenv().SB2DodgeLog('release-hover', nil, hrp.Position)
+				return true
+			end
+			return false
+		end
+
+		-- Safety net for attacks no detector knows (the storm wave's ground beam hit you 1% every
+		-- 0.05s for 6s while you stood still): 3+ hits inside 0.8s = move 32 studs, preferring
+		-- the middle but never back onto a spot that just hurt you.
+		-- SB2's real HP lives in Character.Entity.Health (value + MaxValue, ~1.3M). The
+		-- Humanoid always reads 100/100, which is why v17-v20 never saw you getting hurt.
+		function M.healthValue(hrp)
+			local char = hrp and hrp.Parent
+			local ent = char and char:FindFirstChild('Entity')
+			local h = ent and ent:FindFirstChild('Health')
+			if h and h:IsA('ValueBase') then
+				return h
+			end
+			return nil
+		end
+
+		function M.hpPct(hrp)
+			local h = M.healthValue(hrp)
+			if h then
+				local maxV = tonumber(h.MaxValue) or 0
+				local v = tonumber(h.Value) or 0
+				if maxV > 0 then
+					return v / maxV, v
+				end
+			end
+			local hum = hrp and hrp.Parent and hrp.Parent:FindFirstChildOfClass('Humanoid')
+			if hum and hum.MaxHealth > 0 then
+				return hum.Health / hum.MaxHealth, hum.Health
+			end
+			return nil, nil
+		end
+
+		function M.watchHurt(hrp)
+			local h = M.healthValue(hrp)
+			if not h then
+				return nil
+			end
+			local st = getgenv().SB2HurtState
+			if st and st.hum == h then
+				return st
+			end
+			if st and st.conn then
+				pcall(function()
+					st.conn:Disconnect()
+				end)
+			end
+			st = { hum = h, last = tonumber(h.Value) or 0, hits = {}, spots = {}, escAt = 0, spin = 0 }
+			st.conn = h.Changed:Connect(function(v)
+				local hp = tonumber(v)
+				if not hp then
+					return
+				end
+				-- Ignore tiny ticks (the arena's slow 2.5s chip still counts; regen never does).
+				if hp < st.last - 0.5 then
+					st.hits[#st.hits + 1] = os.clock()
+					if #st.hits > 24 then
+						table.remove(st.hits, 1)
+					end
+				end
+				st.last = hp
+			end)
+			getgenv().SB2HurtState = st
+			return st
+		end
+
+		function M.hurtEscape(hrp, now)
+			local st = M.watchHurt(hrp)
+			if not st or now - st.escAt < 1 then
+				return false
+			end
+			local n = 0
+			for i = #st.hits, 1, -1 do
+				if now - st.hits[i] > 0.8 then
+					break
+				end
+				n += 1
+			end
+			if n < 3 then
+				return false
+			end
+			local here = hrp.Position
+			st.spots[#st.spots + 1] = here
+			if #st.spots > 4 then
+				table.remove(st.spots, 1)
+			end
+			local mid = waveDefenseRiftsCenterFlat()
+			local best, bestScore = nil, nil
+			st.spin = (st.spin + 3) % 8
+			for i = 0, 7 do
+				local a = (i + st.spin) / 8 * math.pi * 2
+				local x, z = here.X + math.cos(a) * 32, here.Z + math.sin(a) * 32
+				local stand = M.floorStandY(hrp, x, z)
+				if stand then
+					local score = 0
+					if mid then
+						local dx, dz = x - mid.X, z - mid.Z
+						score -= math.sqrt(dx * dx + dz * dz)
+					end
+					for _, s in ipairs(st.spots) do
+						local sx, sz = x - s.X, z - s.Z
+						if sx * sx + sz * sz < 24 * 24 then
+							score -= 1000
+						end
+					end
+					if not bestScore or score > bestScore then
+						best, bestScore = Vector3.new(x, stand, z), score
+					end
+				end
+			end
+			if not best then
+				return false
+			end
+			M.releaseHover(hrp)
+			writeHeldCF(hrp, best, nil, 0, true, true)
+			st.escAt = now
+			table.clear(st.hits)
+			getgenv().SB2LastDodgeMoveAt = now
+			getgenv().SB2DodgeLog('hurt-escape', n .. ' hits in 0.8s', best)
+			return true
+		end
+
+		-- Standing height on the floor under (x, z), or nil off the map.
+		function M.floorStandY(hrp, x, z)
+			local gy = groundYAtPos(x, hrp.Position.Y, z, hrp)
+			if not gy then
+				return nil
+			end
+			return gy + humanoidHip(hrp) + hrp.Size.Y * 0.5
+		end
+
+		-- After lava / Bob / orb: get back on the floor. True while it is moving you down.
+		function M.descend(hrp, why)
+			-- Only right after an air mode; normal jumps / dive-farm flight are not ours to touch.
+			if os.clock() - (tonumber(getgenv().SB2DodgeAirAt) or -1e9) > 8 then
+				return false
+			end
+			-- Normal waves hover at 160 now; don't drop to the floor just to be lifted again.
+			if M.wantsHover160 and M.wantsHover160() then
+				return false
+			end
+			M.releaseHover(hrp)
+			local x, z = hrp.Position.X, hrp.Position.Z
+			-- Land in the middle of the arena, not wherever the lift left you (Bob's perch is far out).
+			local mid = waveDefenseRiftsCenterFlat()
+			if mid and M.floorStandY(hrp, mid.X, mid.Z) then
+				x, z = mid.X, mid.Z
+			end
+			local stand = M.floorStandY(hrp, x, z)
+			if stand and (hrp.Position.Y > stand + 6 or math.abs(hrp.Position.X - x) + math.abs(hrp.Position.Z - z) > 4) then
+				-- falls through to the move below
+			elseif not stand then
+				-- Parked off the map (Bob perch): come back over the arena first.
+				if getgenv().SB2BobEscapeActive ~= true and typeof(bobEscapeFlat) ~= 'Vector3'
+					and hrp.Position.Y < WD_LAVA_FLOOR_Y + 60
+				then
+					return false
+				end
+				local center = waveDefenseRiftsCenterFlat()
+				if not center then
+					return false
+				end
+				x, z = center.X, center.Z
+				stand = M.floorStandY(hrp, x, z) or (WD_LAVA_FLOOR_Y + humanoidHip(hrp) + hrp.Size.Y * 0.5)
+			elseif hrp.Position.Y <= stand + 6 then
+				return false
+			end
+			local dest = Vector3.new(x, stand, z)
+			getgenv().SB2LavaEscapeActive = false
+			getgenv().SB2LavaFightY = nil
+			getgenv().SB2LavaHoverY = nil
+			getgenv().SB2BobEscapeActive = false
+			getgenv().SB2BobHoldY = nil
+			bobEscapeFlat = nil
+			writeHeldCF(hrp, dest, nil, 0, true, true)
+			resetHold(dest)
+			getgenv().SB2DodgeLog(why or 'descend', nil, dest)
+			-- Landed: stop treating this as a fresh air exit.
+			if math.abs(hrp.Position.Y - stand) < 3 then
+				getgenv().SB2DodgeAirAt = nil
+			end
+			return true
+		end
+
+		-- Bob: park high and well outside the arena until he is gone.
+		function M.bob(hrp, fresh)
+			getgenv().SB2DodgeAirAt = os.clock()
+			getgenv().SB2BobEscapeActive = true
+			getgenv().SB2BobHoldY = BOB_HOLD_Y
+			bobHoldY = BOB_HOLD_Y
+			bobLiftWarp(hrp, BOB_HOLD_Y, fresh)
+			local pin = getgenv().SB2DivePinPos
+			if typeof(pin) == 'Vector3' then
+				resetHold(pin)
+			end
+			if fresh then
+				getgenv().SB2DodgeLog('bob-lift', nil, pin)
+			end
+		end
+
+		function M.orbPart()
+			local orb = workspace:FindFirstChild('DarknerOrb')
+			if not orb then
+				return nil
+			end
+			if orb:IsA('BasePart') then
+				return orb
+			end
+			return orb:FindFirstChildWhichIsA('BasePart', true)
+		end
+
+		-- Aeganatos: his attacks cover huge areas, so hover high above him (lava height,
+		-- Y~173) and follow him around. getgenv().SB2DodgeAeganatosY overrides the height.
+		function M.aeganatosMob()
+			local mob = findAeganatosMob()
+			if mob then
+				getgenv().SB2AegSeenUntil = os.clock() + 1.5
+				getgenv().SB2AegLastPos = mobStrikePos(mob) or getgenv().SB2AegLastPos
+			end
+			return mob
+		end
+
+		function M.aeganatos(hrp, mob, fresh)
+			getgenv().SB2DodgeAirAt = os.clock()
+			local p = (mob and mobStrikePos(mob)) or getgenv().SB2AegLastPos
+			if typeof(p) ~= 'Vector3' then
+				p = hrp.Position
+			end
+			-- 160 studs above him by default (his body or the floor under him, whichever is higher).
+			local floorY = groundYAtPos(p.X, p.Y + 20, p.Z, hrp)
+			local holdY = tonumber(getgenv().SB2DodgeAeganatosY)
+				or (math.max(p.Y, floorY or p.Y) + 160)
+			local head = mob and aeganatosHeadTopY(mob)
+			if head and head + 20 > holdY then
+				holdY = head + 20
+			end
+			-- Stay inside your 200-stud attack reach.
+			if floorY and not getgenv().SB2DodgeAeganatosY then
+				holdY = math.min(holdY, floorY + (tonumber(getgenv().SB2DodgeLowHpMaxAbove) or 160))
+			end
+			-- Follow him, but don't re-teleport for tiny shuffles.
+			local held = getgenv().SB2AegHoldPos
+			local dest = Vector3.new(p.X, holdY, p.Z)
+			if typeof(held) == 'Vector3' and Vector3.new(held.X - dest.X, 0, held.Z - dest.Z).Magnitude < 6
+				and math.abs(held.Y - dest.Y) < 3
+			then
+				dest = held
+			end
+			getgenv().SB2AegHoldPos = dest
+			if fresh and dest.Y - hrp.Position.Y > 48 then
+				local blinkFn = getgenv().SB2DiveBlinkTeleport
+				if type(blinkFn) == 'function' then
+					pcall(blinkFn, hrp, dest, nil)
+				end
+				getgenv().SB2DodgeLog('aeganatos-lift', mob and mob.Name or 'boss bar', dest)
+			end
+			writeHeldCF(hrp, dest, p, 0, true, true)
+			getgenv().SB2DivePinPos = dest
+			resetHold(dest)
+		end
+
+		-- Nythrane's PurpleFireyOrb (game code: EnemySkills...Nythrane...PurpleFireyOrb): a 15-stud
+		-- "Part" with a "Burning" sound tweens in a straight line for 2s to where you stood when
+		-- he fired, then explodes at 1.5s and swells to 2.5x (about a 19-stud blast). Track each
+		-- orb from first sight, predict its landing point, and step 40 studs sideways if that is
+		-- near you. Works on the floor and while hovering.
+		local ORB_LIFE, ORB_DANGER, ORB_STEP = 2, 30, 40
+		local orbSeen = setmetatable({}, { __mode = 'k' })
+		local function isNythraneOrb(ch)
+			if not ch:IsA('BasePart') or ch.Name ~= 'Part' then
+				return false
+			end
+			local sz = ch.Size
+			if sz.X < 12 or sz.X > 40 or math.abs(sz.X - sz.Y) > 1 or math.abs(sz.X - sz.Z) > 1 then
+				return false
+			end
+			return ch:FindFirstChild('Burning') ~= nil
+		end
+
+		-- Vaelith's RiftDetonation orbs (game code): a ~2-stud "Part" with a Trail rises 45 studs
+		-- over 2s, then curves into you over 1.5s, re-aiming at you until the last 0.5s, and hits
+		-- on touch (checked on your client). Moving early does nothing; moving once it locks
+		-- (about 3.0s after it appears) makes it miss. So: track each orb from first sight and
+		-- jump 30 studs sideways when any orb within range reaches its lock window.
+		local V_LOCK_FROM, V_LOCK_TO, V_STEP, V_RANGE = 2.85, 3.45, 30, 260
+		local vOrbSeen = setmetatable({}, { __mode = 'k' })
+		local function isVaelithOrb(ch)
+			if not ch:IsA('BasePart') or ch.Name ~= 'Part' or not ch.Anchored then
+				return false
+			end
+			local sz = ch.Size
+			if sz.X < 1.6 or sz.X > 2.6 or math.abs(sz.X - sz.Y) > 0.2 or math.abs(sz.X - sz.Z) > 0.2 then
+				return false
+			end
+			return ch:FindFirstChildOfClass('Trail') ~= nil
+		end
+
+		-- v55 timing (from the game's RiftDetonation code): each orb rises straight up for 2s,
+		-- then curves at you for 1.5s. It keeps re-aiming at your live position (smoothed,
+		-- ~15/s) for the first 1.0s of the curve, then flies to that locked point. Moving
+		-- before the lock just drags the aim along with you, so: detect when each orb starts
+		-- curving (its X/Z starts to change), wait for its lock, then step away right after.
+		-- A volley's orbs lock 0.1s apart, so step again for each one, always the same way
+		-- (never back onto a spot an earlier orb locked onto).
+		local V_CURVE_LOCK, V_CURVE_END = 1.0, 1.5
+		local V_SIDESTEP = 22
+
+		function M.vaelithEscape(hrp, now)
+			local here = hrp.Position
+			local held = getgenv().SB2VaelEscapePos
+			if typeof(held) == 'Vector3' and now >= (tonumber(getgenv().SB2VaelEscapeUntil) or 0) then
+				held = nil
+				getgenv().SB2VaelEscapePos = nil
+			end
+			local base = held or here
+			local trigger = nil
+			for _, ch in ipairs(workspace:GetChildren()) do
+				if isVaelithOrb(ch) then
+					local rec = vOrbSeen[ch]
+					local pos = ch.Position
+					if type(rec) ~= 'table' then
+						rec = { x = pos.X, z = pos.Z, t0 = now }
+						vOrbSeen[ch] = rec
+					end
+					if not rec.curve then
+						local moved = Vector3.new(pos.X - rec.x, 0, pos.Z - rec.z).Magnitude
+						if moved > 0.15 then
+							rec.curve = now
+						elseif now - rec.t0 > 2.4 then
+							rec.curve = now -- missed the rise: treat as curving from now
+						end
+					end
+					if rec.curve and not rec.done then
+						local t = now - rec.curve
+						if t >= V_CURVE_LOCK + 0.02 and t < V_CURVE_END
+							and Vector3.new(pos.X - base.X, 0, pos.Z - base.Z).Magnitude < V_RANGE
+						then
+							rec.done = true
+							trigger = trigger or ch
+						elseif t >= V_CURVE_END then
+							rec.done = true
+						end
+					end
+				end
+			end
+			if trigger then
+				local dir = getgenv().SB2VaelEscapeDir
+				if typeof(dir) ~= 'Vector3' or now >= (tonumber(getgenv().SB2VaelEscapeDirUntil) or 0) then
+					local o = trigger.Position
+					local toMe = Vector3.new(base.X - o.X, 0, base.Z - o.Z)
+					local side = toMe.Magnitude > 0.5 and Vector3.new(-toMe.Z, 0, toMe.X).Unit or Vector3.new(1, 0, 0)
+					local mid = waveDefenseRiftsCenterFlat()
+					dir = side
+					if mid then
+						local a = Vector3.new(base.X + side.X * 40, 0, base.Z + side.Z * 40)
+						local b = Vector3.new(base.X - side.X * 40, 0, base.Z - side.Z * 40)
+						if (b - mid).Magnitude < (a - mid).Magnitude then
+							dir = -side
+						end
+					end
+				end
+				getgenv().SB2VaelEscapeDir = dir
+				getgenv().SB2VaelEscapeDirUntil = now + 0.7
+				local dest = Vector3.new(base.X + dir.X * V_SIDESTEP, base.Y, base.Z + dir.Z * V_SIDESTEP)
+				-- Hold it until this orb has landed (0.5s after its lock).
+				getgenv().SB2VaelEscapePos = dest
+				getgenv().SB2VaelEscapeUntil = now + 0.55
+				getgenv().SB2LastDodgeMoveAt = now
+				getgenv().SB2DodgeLog('vaelith-orb', 'orb locked, step ' .. V_SIDESTEP, dest)
+				return dest
+			end
+			return held
+		end
+
+		-- All projectile dodges in one place. Nythrane's orb dodge is off unless
+		-- getgenv().SB2DodgeNythraneOrbs = true (it was dodging him too often).
+		-- Rubricatus RedLightningDiscs (game code): 3 discs per throw, 25% each, no range or
+		-- height limit. Each disc re-aims at you until it is released, then flies to that locked
+		-- spot (written on the disc as attribute "LockedTarget") and hits anything within ~6 studs
+		-- of its path. Once a disc's LockedTarget is near you, step 24 studs sideways to its path.
+		local discHandled = setmetatable({}, { __mode = 'k' })
+		-- Rubricatus discs (RedLightningDiscs): each disc reads your live HumanoidRootPart position
+		-- at its own release (0.1s apart), then flies there; it only hurts within ~6 studs of its
+		-- path. So: sidestep for EVERY new disc that locks onto you, not once per volley, and match
+		-- on flat distance (up at the Rubricatus final-phase height the position the game read can
+		-- differ in Y from what this loop sees). Also counts a lock on the spot we are holding.
+		function M.discEscape(hrp, now)
+			local here = hrp.Position
+			local held = getgenv().SB2DiscEscapePos
+			if typeof(held) == 'Vector3' and now >= (tonumber(getgenv().SB2DiscEscapeUntil) or 0) then
+				held = nil
+				getgenv().SB2DiscEscapePos = nil
+			end
+			local function flat(a, b)
+				return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+			end
+			local spots = { here }
+			if typeof(held) == 'Vector3' then
+				spots[#spots + 1] = held
+			end
+			local pin = getgenv().SB2DivePinPos
+			if typeof(pin) == 'Vector3' then
+				spots[#spots + 1] = pin
+			end
+			for _, folder in ipairs(workspace:GetChildren()) do
+				if folder.Name == 'RedLightningDiscEffects' then
+					for _, m in ipairs(folder:GetDescendants()) do
+						local tgt = m:GetAttribute('LockedTarget')
+						if typeof(tgt) == 'Vector3' and not discHandled[m] then
+							local hit = false
+							for _, sp in ipairs(spots) do
+								if flat(tgt, sp) < 16 then
+									hit = true
+									break
+								end
+							end
+							if hit then
+								discHandled[m] = true
+								local base = held or here
+								local from = m:IsA('Model') and m:GetPivot().Position or (m:IsA('BasePart') and m.Position) or base
+								local path = Vector3.new(tgt.X - from.X, 0, tgt.Z - from.Z)
+								local side = path.Magnitude > 0.5 and Vector3.new(-path.Z, 0, path.X).Unit or Vector3.new(1, 0, 0)
+								local mid = waveDefenseRiftsCenterFlat()
+								-- Every disc still flying in this volley: don't step onto another one's target.
+								local targets = {}
+								for _, f2 in ipairs(workspace:GetChildren()) do
+									if f2.Name == 'RedLightningDiscEffects' then
+										for _, m2 in ipairs(f2:GetDescendants()) do
+											local t2 = m2:GetAttribute('LockedTarget')
+											if typeof(t2) == 'Vector3' then
+												targets[#targets + 1] = t2
+											end
+										end
+									end
+								end
+								local best, bestScore = nil, nil
+								for _, r in ipairs({ 24, 40 }) do
+									for _, dir in ipairs({ side, -side }) do
+										local cand = Vector3.new(tgt.X + dir.X * r, base.Y, tgt.Z + dir.Z * r)
+										local clear = math.huge
+										for _, t2 in ipairs(targets) do
+											clear = math.min(clear, flat(cand, t2))
+										end
+										local d = mid and (Vector3.new(cand.X, 0, cand.Z) - mid).Magnitude or 0
+										-- Clear of every target first, then closest to the middle.
+										local score = (clear >= 18 and 0 or 1e6) + d
+										if not bestScore or score < bestScore then
+											best, bestScore = cand, score
+										end
+									end
+								end
+								held = best
+								getgenv().SB2DiscEscapePos = best
+								getgenv().SB2DiscEscapeUntil = now + 1.2
+								getgenv().SB2LastDodgeMoveAt = now
+								getgenv().SB2DodgeLog('rub-disc', ('disc locked %.0f studs from you (flat)'):format(flat(tgt, here)), best)
+								-- Later discs in this volley lock onto the new spot; keep scanning.
+								spots[#spots + 1] = best
+							end
+						end
+					end
+				end
+			end
+			return held
+		end
+
+		-- Several Atheons can nuke a few seconds apart, and the hook only keeps the latest one,
+		-- so remember every cast here. Each stays dangerous until its own estimated landing.
+		-- Per-frame fling guard. The main loop only runs a few times a second, so a knockback
+		-- at Bob's perch (Y 360) could throw you into the void between ticks (speeds of 500-3600
+		-- were logged right after every Bob lift). While an air hold is pinned, snap back to the
+		-- pin every physics frame if you get shoved off it or pick up absurd speed.
+		do
+			local RunServiceG = game:GetService('RunService')
+			for _, k in ipairs({ 'SB2AfdFlingGuardStep', 'SB2AfdFlingGuardBeat' }) do
+				local old = getgenv()[k]
+				if old then
+					pcall(function()
+						old:Disconnect()
+					end)
+					getgenv()[k] = nil
+				end
+			end
+			local lastLog = 0
+			local function guard()
+				if getgenv().SB2AutoFloorDodgeOn ~= true or not workspace:FindFirstChild('WaveDefenseStuff') then
+					return
+				end
+				local char = LocalPlayer.Character
+				local hrp = char and char:FindFirstChild('HumanoidRootPart')
+				if not hrp or (type(isLocalAlive) == 'function' and not isLocalAlive()) then
+					return
+				end
+				-- Void, every frame: below -500 Roblox deletes your HumanoidRootPart (that is a death).
+				if hrp.Position.Y < WD_LAVA_FLOOR_Y - 60 then
+					local mid = waveDefenseRiftsCenterFlat()
+					if mid then
+						local safe = Vector3.new(mid.X, WD_LAVA_FLOOR_Y + 4, mid.Z)
+						local fellY = hrp.Position.Y
+						pcall(function()
+							hrp.AssemblyLinearVelocity = Vector3.zero
+							hrp.AssemblyAngularVelocity = Vector3.zero
+							hrp.CFrame = CFrame.new(safe)
+						end)
+						pcall(getgenv().SB2DiveResetHold or function() end, safe)
+						local now = os.clock()
+						if now - lastLog > 1 then
+							lastLog = now
+							getgenv().SB2DodgeLog('void-rescue', ('frame guard, was at Y %.0f'):format(fellY), safe)
+						end
+					end
+					return
+				end
+				local airHold = getgenv().SB2BobEscapeActive == true
+					or getgenv().SB2LavaEscapeActive == true
+					or typeof(getgenv().SB2RubFinalPos) == 'Vector3'
+				local pin = getgenv().SB2DivePinPos
+				if not airHold or typeof(pin) ~= 'Vector3' then
+					return
+				end
+				pin = getgenv().SB2AFD_roofClamp(pin)
+				local v = hrp.AssemblyLinearVelocity
+				local off = (hrp.Position - pin).Magnitude
+				if v.Magnitude > 150 or off > 30 then
+					pcall(function()
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						hrp.AssemblyAngularVelocity = Vector3.zero
+						hrp.CFrame = CFrame.new(pin) * (hrp.CFrame - hrp.CFrame.Position)
+					end)
+					local now = os.clock()
+					if now - lastLog > 2 then
+						lastLog = now
+						getgenv().SB2DodgeLog('fling-guard', ('speed %.0f, %.0f off pin'):format(v.Magnitude, off), pin)
+					end
+				end
+			end
+			getgenv().SB2AfdFlingGuardStep = RunServiceG.Stepped:Connect(guard)
+			getgenv().SB2AfdFlingGuardBeat = RunServiceG.Heartbeat:Connect(guard)
+		end
+
+		M.atheonNukes = M.atheonNukes or {}
+		function M.atheonTrackNukes(now)
+			local at = tonumber(getgenv().SB2AtheonNukeAt) or 0
+			local center = getgenv().SB2AtheonNukeGoal
+			local list = M.atheonNukes
+			if at > 0 and typeof(center) == 'Vector3' and now - at <= 7 then
+				local known = false
+				for _, n in ipairs(list) do
+					if n.at == at then
+						known = true
+						break
+					end
+				end
+				if not known then
+					local life = tonumber(getgenv().SB2AtheonNukeLife) or 3
+					list[#list + 1] = { at = at, center = center, impact = at + math.max(3.7, life + 0.7) }
+				end
+			end
+			-- The hook's real landing time belongs to whichever nuke landed last: the oldest one
+			-- still waiting that is due by now.
+			local landed = tonumber(getgenv().SB2AtheonNukeImpactAt) or 0
+			for i = #list, 1, -1 do
+				local n = list[i]
+				if landed >= n.at and landed <= n.impact + 1 and not n.landed then
+					local older = false
+					for _, o in ipairs(list) do
+						if o ~= n and not o.landed and o.at < n.at then
+							older = true
+							break
+						end
+					end
+					if not older then
+						n.landed = true
+						n.impact = landed
+					end
+				end
+				if now > n.impact + 0.8 or now - n.at > 7 then
+					table.remove(list, i)
+				end
+			end
+			return list
+		end
+
+		-- Corrupted Atheon's nuke: a ground-up slam column, 100% damage inside ~150 studs of its
+		-- centre (height doesn't help). The Atheon Shadow Step script hooks his skill and records
+		-- SB2AtheonNukeAt (cast) / SB2AtheonNukeGoal (centre) / SB2AtheonNukeImpactAt. Stand
+		-- 165+ studs from EVERY nuke still to land, not just the newest (wave 96 has three Atheons).
+		function M.atheonNuke(hrp, now)
+			-- Wave defense only; manual grinding is the Atheon Shadow Step script's job.
+			if not workspace:FindFirstChild('WaveDefenseStuff') then
+				getgenv().SB2AtheonEscapePos = nil
+				M.atheonNukes = {}
+				return nil
+			end
+			local list = M.atheonTrackNukes(now)
+			if #list == 0 then
+				getgenv().SB2AtheonEscapePos = nil
+				return nil
+			end
+			local want = tonumber(getgenv().SB2DodgeAtheonOut) or 165
+			local function minDist(pos)
+				local m = math.huge
+				for _, n in ipairs(list) do
+					local d = Vector3.new(pos.X - n.center.X, 0, pos.Z - n.center.Z).Magnitude
+					if d < m then
+						m = d
+					end
+				end
+				return m
+			end
+			local here = hrp.Position
+			local key = ''
+			for _, n in ipairs(list) do
+				key = key .. tostring(n.at) .. ';'
+			end
+			local held = getgenv().SB2AtheonEscapePos
+			if typeof(held) == 'Vector3' and getgenv().SB2AtheonEscapeFor == key then
+				return held
+			end
+			-- Already clear of all of them: stay put.
+			if minDist(here) >= want then
+				getgenv().SB2AtheonEscapePos = here
+				getgenv().SB2AtheonEscapeFor = key
+				return here
+			end
+			-- Candidates: rings around every centre, plus a grid over the arena.
+			local cands = {}
+			for _, n in ipairs(list) do
+				for i = 0, 23 do
+					local a = i * math.pi / 12
+					for _, r in ipairs({ want, want + 25 }) do
+						cands[#cands + 1] = Vector3.new(n.center.X + math.cos(a) * r, 0, n.center.Z + math.sin(a) * r)
+					end
+				end
+			end
+			local mid = waveDefenseRiftsCenterFlat and waveDefenseRiftsCenterFlat() or nil
+			local cx, cz = mid and mid.X or here.X, mid and mid.Z or here.Z
+			for gx = -200, 200, 25 do
+				for gz = -200, 200, 25 do
+					cands[#cands + 1] = Vector3.new(cx + gx, 0, cz + gz)
+				end
+			end
+			local bestSafe, bestSafeTravel = nil, math.huge
+			local bestAny, bestAnyMin = nil, -1
+			for _, c in ipairs(cands) do
+				local md = minDist(c)
+				if md >= want or md > bestAnyMin then
+					if M.floorStandY(hrp, c.X, c.Z) then
+						local pos = Vector3.new(c.X, here.Y, c.Z)
+						if md >= want then
+							local travel = (Vector3.new(here.X, 0, here.Z) - c).Magnitude
+							if travel < bestSafeTravel then
+								bestSafe, bestSafeTravel = pos, travel
+							end
+						end
+						if md > bestAnyMin then
+							bestAny, bestAnyMin = pos, md
+						end
+					end
+				end
+			end
+			local dest = bestSafe or bestAny
+			if not dest then
+				return nil
+			end
+			getgenv().SB2AtheonEscapePos = dest
+			getgenv().SB2AtheonEscapeFor = key
+			getgenv().SB2LastDodgeMoveAt = now
+			getgenv().SB2DodgeLog('atheon-nuke', ('%d nuke(s) live, was %.0f from nearest -> %.0f%s'):format(
+				#list, minDist(here), minDist(dest), bestSafe and '' or ' (best possible)'), dest)
+			return dest
+		end
+
+		function M.projectileEscape(hrp, now)
+			local dsc = M.discEscape(hrp, now)
+			if dsc then
+				return dsc
+			end
+			local v = M.vaelithEscape(hrp, now)
+			if v then
+				return v
+			end
+			if getgenv().SB2DodgeNythraneOrbs == true then
+				return M.orbEscape(hrp, now)
+			end
+			return nil
+		end
+
+		function M.orbEscape(hrp, now)
+			local held = getgenv().SB2OrbEscapePos
+			local here = hrp.Position
+			local threat = nil
+			for _, ch in ipairs(workspace:GetChildren()) do
+				if isNythraneOrb(ch) then
+					local rec = orbSeen[ch]
+					if not rec then
+						rec = { p0 = ch.Position, t0 = now }
+						orbSeen[ch] = rec
+					end
+					local age = now - rec.t0
+					if age < ORB_LIFE + 0.5 then
+						-- Straight line, constant speed: landing = start + velocity * remaining flight.
+						local target
+						if age > 0.08 then
+							local v = (ch.Position - rec.p0) / age
+							target = ch.Position + v * math.max(0, ORB_LIFE - age)
+						else
+							target = here -- just fired: assume it's aimed at you
+						end
+						local spot = typeof(held) == 'Vector3' and now < (tonumber(getgenv().SB2OrbEscapeUntil) or 0) and held or here
+						if (target - spot).Magnitude < ORB_DANGER then
+							threat = { target = target, from = rec.p0 }
+							break
+						end
+					end
+				end
+			end
+			if not threat then
+				if typeof(held) == 'Vector3' and now < (tonumber(getgenv().SB2OrbEscapeUntil) or 0) then
+					return held
+				end
+				getgenv().SB2OrbEscapePos = nil
+				return nil
+			end
+			-- Step sideways to the orb's path (flat), toward the middle when there's a choice.
+			local path = Vector3.new(threat.target.X - threat.from.X, 0, threat.target.Z - threat.from.Z)
+			local side = path.Magnitude > 0.5 and Vector3.new(-path.Z, 0, path.X).Unit or Vector3.new(1, 0, 0)
+			local mid = waveDefenseRiftsCenterFlat()
+			local best, bestScore = nil, nil
+			for _, dir in ipairs({ side, -side }) do
+				local cand = Vector3.new(here.X + dir.X * ORB_STEP, here.Y, here.Z + dir.Z * ORB_STEP)
+				local score = (cand - threat.target).Magnitude
+				if mid then
+					score -= 0.3 * (Vector3.new(cand.X, 0, cand.Z) - mid).Magnitude
+				end
+				if not bestScore or score > bestScore then
+					best, bestScore = cand, score
+				end
+			end
+			getgenv().SB2OrbEscapePos = best
+			getgenv().SB2OrbEscapeUntil = now + 1.6
+			getgenv().SB2LastDodgeMoveAt = now
+			getgenv().SB2DodgeLog('nythrane-orb', ('landing %.0f studs from you'):format((threat.target - here).Magnitude), best)
+			return best
+		end
+
+		-- Default for every wave in the arena: hover 160 studs above the floor over the middle.
+		-- Waves with their own dodge (lava, Bob, orb, Aeganatos, Wendigo, Rubricatus) are handled
+		-- before this in the loop; the storm and rift waves stay on the ground for their own
+		-- dodges. getgenv().SB2DodgeHover160 = false turns the default hover off (ground dodging).
+		-- getgenv().SB2DodgeHoverAbove changes the height.
+		-- Blackout: the light is on the floor in the middle; Rubricatus: pillars/nuke need the ground.
+		local GROUND_ENVS = { Tempest = true, Rift = true, Blackout = true, Rubricatus = true }
+		-- Lag guard: when the connection stalls, the server keeps hitting you while your game
+		-- shows nothing (then it all lands at once). On a ping spike / incoming-data stall, go up
+		-- to the Bob height and stay there 4s after it clears.
+		local LAG_PING_MS = 600
+		local LAG_HOLD = 4
+		function M.lagSpike()
+			if getgenv().SB2DodgeLagGuard == false then
+				return false
+			end
+			local now = os.clock()
+			local bad, why = false, nil
+			local okS, Stats = pcall(game.GetService, game, 'Stats')
+			if okS and Stats then
+				pcall(function()
+					local item = Stats.Network.ServerStatsItem['Data Ping']
+					local ms = tonumber(item:GetValue())
+					if ms and ms > LAG_PING_MS then
+						bad, why = true, ('ping %dms'):format(ms)
+					end
+				end)
+			end
+			if not bad then
+				pcall(function()
+					local rt = LocalPlayer:GetNetworkPing() * 1000
+					if rt > LAG_PING_MS then
+						bad, why = true, ('net ping %dms'):format(rt)
+					end
+				end)
+			end
+			if bad then
+				if now - (tonumber(getgenv().SB2LagGuardUntil) or 0) > 0 then
+					pcall(getgenv().SB2DodgeLog, 'lag-hover', tostring(why))
+				end
+				getgenv().SB2LagGuardUntil = now + LAG_HOLD
+				return true
+			end
+			return now < (tonumber(getgenv().SB2LagGuardUntil) or 0)
+		end
+
+		-- Huge ground telegraphs (Enraged Wendigo slam: 170-stud circle + 50-wide strip, damage
+		-- column ~150 tall). Walking back to the middle put you inside one. While any big
+		-- EffectHitbox is on the ground, go up to the Bob height (above the column) and stay 2s
+		-- after the last one is gone, whatever the wave.
+		local BIG_TELEGRAPH = 60
+		local bigHitboxes = setmetatable({}, { __mode = 'k' })
+		if getgenv().SB2BigTelegraphConn then
+			pcall(function()
+				getgenv().SB2BigTelegraphConn:Disconnect()
+			end)
+		end
+		getgenv().SB2BigTelegraphConn = workspace.DescendantAdded:Connect(function(d)
+			if d.Name == 'EffectHitbox' and d:IsA('BasePart') then
+				local z = d.Size
+				if math.max(z.X, z.Z) >= BIG_TELEGRAPH then
+					bigHitboxes[d] = true
+				end
+			end
+		end)
+		function M.bigTelegraph()
+			local now = os.clock()
+			local any = false
+			for part in pairs(bigHitboxes) do
+				if part.Parent then
+					any = true
+				else
+					bigHitboxes[part] = nil
+				end
+			end
+			if any then
+				if now - (tonumber(getgenv().SB2BigTelegraphUntil) or 0) > 0 then
+					pcall(getgenv().SB2DodgeLog, 'big-telegraph', 'hover up')
+				end
+				getgenv().SB2BigTelegraphUntil = now + 2
+				return true
+			end
+			return now < (tonumber(getgenv().SB2BigTelegraphUntil) or 0)
+		end
+
+		function M.wendigoHover()
+			if getgenv().SB2DodgeWendigoHover == false then
+				return false
+			end
+			if tostring(workspace:GetAttribute('WaveDefenseEnvironment')) == 'Rubricatus' then
+				return false
+			end
+			local ch = game:GetService('Players').LocalPlayer.Character
+			local hrp = ch and ch:FindFirstChild('HumanoidRootPart')
+			if not hrp or type(M.wendigoMob) ~= 'function' then
+				return false
+			end
+			local mob = M.wendigoMob(hrp)
+			if not mob or (type(M.wendigoSpecialWave) == 'function' and M.wendigoSpecialWave(mob)) then
+				return false
+			end
+			local now = os.clock()
+			if now - (tonumber(getgenv().SB2WendigoHoverLogAt) or 0) > 5 then
+				getgenv().SB2WendigoHoverLogAt = now
+				pcall(getgenv().SB2DodgeLog, 'wendigo-hover', tostring(mob.Name), hrp.Position)
+			end
+			return true
+		end
+
+		-- Enraged Wendigo slam = a 170-wide, 150-tall cylinder centred on him (reaches Bob
+		-- height) plus a 50-wide strip. Keep 135+ studs sideways from him, on the far side of
+		-- the arena middle, and step out of any live strip.
+		function M.wendigoSafePos(hrp, dest)
+			if not M.wendigoHover or not M.wendigoHover() then
+				return nil
+			end
+			local mob = M.wendigoMob(hrp)
+			if not mob then
+				return nil
+			end
+			local ok, piv = pcall(function() return mob:GetPivot().Position end)
+			if not ok or typeof(piv) ~= 'Vector3' then
+				return nil
+			end
+			local want = tonumber(getgenv().SB2DodgeWendigoDist) or 135
+			local mid = waveDefenseRiftsCenterFlat() or dest
+			local w = Vector3.new(piv.X, 0, piv.Z)
+			local c = Vector3.new(mid.X, 0, mid.Z)
+			local away = c - w
+			if away.Magnitude < 5 then
+				away = Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - w
+			end
+			if away.Magnitude < 1 then
+				away = Vector3.new(1, 0, 0)
+			end
+			local p = c
+			if (c - w).Magnitude < want then
+				p = w + away.Unit * want
+			end
+			for part in pairs(bigHitboxes) do
+				if part.Parent and part:IsA('BasePart') then
+					local z = part.Size
+					if math.abs(z.X - z.Z) > 20 then
+						local width = math.min(z.X, z.Z)
+						local cf = part.CFrame
+						local axis = (z.X < z.Z) and cf.RightVector or cf.LookVector
+						axis = Vector3.new(axis.X, 0, axis.Z)
+						if axis.Magnitude > 0.1 then
+							axis = axis.Unit
+							local rel = (p - Vector3.new(cf.Position.X, 0, cf.Position.Z)):Dot(axis)
+							local need = width / 2 + 25
+							if math.abs(rel) < need then
+								local sgn = rel >= 0 and 1 or -1
+								p = p + axis * sgn * (need - math.abs(rel))
+							end
+						end
+					end
+				end
+			end
+			local now = os.clock()
+			if now - (tonumber(getgenv().SB2WendigoSafeLogAt) or 0) > 3 then
+				getgenv().SB2WendigoSafeLogAt = now
+				pcall(getgenv().SB2DodgeLog, 'wendigo-distance', ('%.0f studs from it'):format((p - w).Magnitude), Vector3.new(p.X, dest.Y, p.Z))
+			end
+			return Vector3.new(p.X, dest.Y, p.Z)
+		end
+
+		function M.wantsHover160()
+			if getgenv().SB2DodgeHover160 == false then
+				return false
+			end
+			if getgenv().SB2DiveFarmOn == true or getgenv().SB2DiveUnderMap == true then
+				return false
+			end
+			if not workspace:FindFirstChild('WaveDefenseStuff') or not waveDefenseRiftsCenterFlat() then
+				return false
+			end
+			if tostring(workspace:GetAttribute('WaveDefenseEnvironment')) ~= 'Rubricatus' and M.bigTelegraph() then
+				return true
+			end
+			-- Vaelith can show up in any arena; her orbs lock on to you up there. Ground for her.
+			if findVaelithMob() then
+				return false
+			end
+			-- Enraged Wendigo: its attacks reach the ground behind it with no telegraph, so go up
+			-- to Bob height while one is alive (not in the lit-mob special waves, not Rubricatus).
+			if M.wendigoHover() then
+				return true
+			end
+			-- A Blackout wave can happen in any arena: the orb itself is the signal.
+			local RLb = getgenv().SB2RedLaser
+			if RLb and type(RLb.findBlackoutOrb) == 'function' and RLb.findBlackoutOrb() then
+				return false
+			end
+			-- Only a Reward Chest left (end of run): come down so killaura can reach it. Waits 12s
+			-- after the last real mob so a post-death Rubricatus nuke can't catch you on the ground.
+			do
+				local mobs = workspace:FindFirstChild('Mobs')
+				local chest, other = false, false
+				if mobs then
+					for _, m in ipairs(mobs:GetChildren()) do
+						local n = string.lower(m.Name)
+						if string.find(n, 'chest', 1, true) or string.find(n, 'reward', 1, true) then
+							chest = true
+						else
+							other = true
+						end
+					end
+				end
+				local now = os.clock()
+				if other or not chest then
+					getgenv().SB2DodgeLastRealMobAt = now
+				elseif now - (tonumber(getgenv().SB2DodgeLastRealMobAt) or 0) > 12 then
+					if not getgenv().SB2DodgeChestGroundLogged then
+						getgenv().SB2DodgeChestGroundLogged = true
+						pcall(getgenv().SB2DodgeLog, 'chest-ground', 'only reward chest left')
+					end
+					return false
+				end
+				if other then
+					getgenv().SB2DodgeChestGroundLogged = nil
+				end
+			end
+			if M.lagSpike() then
+				return true
+			end
+			local env = workspace:GetAttribute('WaveDefenseEnvironment')
+			return not GROUND_ENVS[tostring(env)]
+		end
+
+		function M.hover160(hrp, now)
+			local mid = waveDefenseRiftsCenterFlat()
+			if not mid then
+				return false
+			end
+			local dest = getgenv().SB2Hover160Pos
+			if typeof(dest) ~= 'Vector3' or now - (tonumber(getgenv().SB2Hover160At) or 0) > 1 then
+				-- Floor under the middle (looked up from just above it, not from up here).
+				local floorY = groundYAtPos(mid.X, WD_LAVA_FLOOR_Y + 40, mid.Z, hrp) or WD_LAVA_FLOOR_Y
+				local y = floorY + (tonumber(getgenv().SB2DodgeHoverAbove) or 160)
+				local fresh = typeof(dest) ~= 'Vector3'
+				dest = Vector3.new(mid.X, y, mid.Z)
+				getgenv().SB2Hover160Pos = dest
+				getgenv().SB2Hover160At = now
+				if fresh then
+					local blinkFn = getgenv().SB2DiveBlinkTeleport
+					if type(blinkFn) == 'function' and dest.Y - hrp.Position.Y > 48 then
+						pcall(blinkFn, hrp, dest, nil)
+					end
+					getgenv().SB2DodgeLog('hover-160', tostring(workspace:GetAttribute('WaveDefenseEnvironment')), dest)
+				end
+			end
+			getgenv().SB2DodgeAirAt = now
+			local orbOut = M.projectileEscape(hrp, now)
+			if orbOut then
+				dest = Vector3.new(orbOut.X, dest.Y, orbOut.Z)
+			else
+				local wsafe = M.wendigoSafePos(hrp, dest)
+				if wsafe then
+					dest = wsafe
+				end
+			end
+			-- Rubricatus red laser: aimed at this spot, so hold a point off its line until it ends.
+			local laserOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.escape(dest, dest)
+			if laserOut then
+				dest = Vector3.new(laserOut.X, dest.Y, laserOut.Z)
+				getgenv().SB2LastDodgeMoveAt = now
+			end
+			writeHeldCF(hrp, dest, nil, 0, true, true)
+			getgenv().SB2DivePinPos = dest
+			resetHold(dest)
+			return true
+		end
+
+		-- Rift special wave: from the middle only 3 of the 4 portals are in reach, so cycle four
+		-- spots (same height) that each lean toward one portal. Dodges still win; the cycle
+		-- resumes 1s after one. getgenv().SB2DodgeRiftLean (studs toward the portal, default 20)
+		-- and SB2DodgeRiftInterval (seconds per spot, default 0.35) tune it.
+		function M.riftCycle(hrp, now)
+			local env = workspace:GetAttribute('WaveDefenseEnvironment')
+			if env ~= 'Rift' and getgenv().SB2DodgeRiftForce ~= true then
+				getgenv().SB2RiftCycleIdx = nil
+				return false
+			end
+			if now - (tonumber(getgenv().SB2LastDodgeMoveAt) or -1e9) < 1 then
+				return false
+			end
+			local center = waveDefenseRiftsCenterFlat()
+			local dirs = center and waveDefenseRiftSpawnDirs(center)
+			if not dirs then
+				return false
+			end
+			local interval = math.max(0.15, tonumber(getgenv().SB2DodgeRiftInterval) or 0.35)
+			local lean = tonumber(getgenv().SB2DodgeRiftLean) or 20
+			local idx = (math.floor(now / interval) % #dirs) + 1
+			local stand = M.floorStandY(hrp, center.X, center.Z) or hrp.Position.Y
+			local d = dirs[idx]
+			local dest = Vector3.new(center.X + d.X * lean, stand, center.Z + d.Z * lean)
+			local first = getgenv().SB2RiftCycleIdx == nil
+			if idx ~= getgenv().SB2RiftCycleIdx or (hrp.Position - dest).Magnitude > 2 then
+				local portal = Vector3.new(center.X + d.X * 137, stand, center.Z + d.Z * 137)
+				M.releaseHover(hrp)
+				writeHeldCF(hrp, dest, portal, 0, true, true)
+				getgenv().SB2RiftCycleIdx = idx
+				if first then
+					getgenv().SB2DodgeLog('rift-cycle', ('%d portals, %.0f studs lean, %.2fs each'):format(#dirs, lean, interval), dest)
+				end
+			end
+			return true
+		end
+
+		-- Rubricatus final phase: once he summons the old bosses (Aegor / Nythrane / Vaelith), or
+		-- sits at 0% for the survive timer, hover ~340 studs above the arena until it's over.
+		-- (World Y400 made the map stream out during Bob, so it stays a bit under that.)
+		-- getgenv().SB2DodgeRubFinalAbove changes the height above the floor.
+		function M.rubFinal(now)
+			local folder = workspace:FindFirstChild('Mobs')
+			if folder then
+				local rub, rubDown, summoned = false, false, false
+				for _, mob in ipairs(folder:GetChildren()) do
+					local key = string.gsub(string.lower(tostring(mob.Name)), '[%p%s]+', '')
+					if string.find(key, 'rubricatus', 1, true) then
+						rub = true
+						if getgenv().SB2AFD_mobIsDead(mob) then
+							rubDown = true
+						end
+					elseif (string.find(key, 'aegor', 1, true) or string.find(key, 'nythrane', 1, true)
+						or string.find(key, 'vaelith', 1, true)) and not getgenv().SB2AFD_mobIsDead(mob)
+					then
+						summoned = true
+					end
+				end
+				if rub and (summoned or rubDown) then
+					getgenv().SB2RubFinalUntil = now + 3
+				end
+			end
+			return now < (tonumber(getgenv().SB2RubFinalUntil) or 0)
+		end
+
+		function M.rubFinalHover(hrp, now)
+			getgenv().SB2DodgeAirAt = now
+			local mid = waveDefenseRiftsCenterFlat()
+			local x, z = mid and mid.X or hrp.Position.X, mid and mid.Z or hrp.Position.Z
+			local floorY = groundYAtPos(x, math.min(hrp.Position.Y, WD_LAVA_FLOOR_Y + 40) + 20, z, hrp) or WD_LAVA_FLOOR_Y
+			local dest = getgenv().SB2AFD_roofClamp(Vector3.new(x, floorY + (tonumber(getgenv().SB2DodgeRubFinalAbove) or 340), z))
+			local fresh = typeof(getgenv().SB2RubFinalPos) ~= 'Vector3'
+			getgenv().SB2RubFinalPos = dest
+			if fresh then
+				local blinkFn = getgenv().SB2DiveBlinkTeleport
+				if type(blinkFn) == 'function' then
+					pcall(blinkFn, hrp, dest, nil)
+				end
+				getgenv().SB2DodgeLog('rub-final-lift', 'summoned bosses / survive timer', dest)
+			end
+			local out = M.projectileEscape(hrp, now)
+			if out then
+				dest = getgenv().SB2AFD_roofClamp(Vector3.new(out.X, dest.Y, out.Z))
+			end
+			writeHeldCF(hrp, dest, nil, 0, true, true)
+			getgenv().SB2DivePinPos = dest
+			resetHold(dest)
+		end
+
+		-- Low HP: under 60% health, go 160+ studs above the floor and every mob and stay there
+		-- until you are back to 85%. getgenv().SB2DodgeLowHpPct / SB2DodgeLowHpExitPct change
+		-- the thresholds (0-1).
+		function M.lowHp(hrp, now)
+			local pct, hpNow = M.hpPct(hrp)
+			if not pct or (hpNow or 0) <= 0 then
+				getgenv().SB2LowHpActive = false
+				return false
+			end
+			-- Lift below 80%, come back down at 95%.
+			local enter = tonumber(getgenv().SB2DodgeLowHpPct) or 0.80
+			local exit = math.max(enter + 0.05, tonumber(getgenv().SB2DodgeLowHpExitPct) or 0.95)
+			local active = getgenv().SB2LowHpActive == true
+			if not active and pct < enter then
+				active = true
+				getgenv().SB2LowHpPos = nil
+			elseif active and pct >= exit then
+				active = false
+			end
+			getgenv().SB2LowHpActive = active
+			if not active then
+				getgenv().SB2LowHpPos = nil
+				return false
+			end
+			getgenv().SB2DodgeAirAt = now
+			-- Re-measure "everything" twice a second: floor under the spot and the top of every live mob.
+			local dest = getgenv().SB2LowHpPos
+			if typeof(dest) ~= 'Vector3' or now - (tonumber(getgenv().SB2LowHpAt) or 0) > 0.5 then
+				local mid = waveDefenseRiftsCenterFlat()
+				local x, z = mid and mid.X or hrp.Position.X, mid and mid.Z or hrp.Position.Z
+				-- Measure the floor from just above it, not from wherever you are hovering.
+				local floorY = groundYAtPos(x, math.min(hrp.Position.Y, WD_LAVA_FLOOR_Y + 40) + 20, z, hrp) or (hrp.Position.Y - 3)
+				local top = floorY
+				local folder = workspace:FindFirstChild('Mobs')
+				if folder then
+					for _, mob in ipairs(folder:GetChildren()) do
+						if not mobIsDead(mob) and mob:IsA('Model') then
+							local ok, cf, size = pcall(mob.GetBoundingBox, mob)
+							if ok and typeof(cf) == 'CFrame' and size.Y < 600 then
+								top = math.max(top, cf.Position.Y + size.Y * 0.5)
+							end
+						end
+					end
+				end
+				-- 160 over the tallest thing, but never 195+ over the floor: your attack reach is
+				-- 200 studs, and a tall boss pushed the lift to 194 up (Y224) out of range.
+				local cap = tonumber(getgenv().SB2DodgeLowHpMaxAbove) or 160
+				local y = math.min(top + 160, floorY + cap)
+				local fresh = typeof(dest) ~= 'Vector3'
+				if fresh or math.abs(dest.Y - y) > 4 or Vector3.new(dest.X - x, 0, dest.Z - z).Magnitude > 4 then
+					dest = Vector3.new(x, y, z)
+				end
+				getgenv().SB2LowHpPos = dest
+				getgenv().SB2LowHpAt = now
+				if fresh then
+					local blinkFn = getgenv().SB2DiveBlinkTeleport
+					if type(blinkFn) == 'function' then
+						pcall(blinkFn, hrp, dest, nil)
+					end
+					getgenv().SB2DodgeLog('low-hp-lift', ('%d%% hp'):format(math.floor(pct * 100)), dest)
+				end
+			end
+			local orbOut = M.projectileEscape(hrp, now)
+			if orbOut then
+				dest = Vector3.new(orbOut.X, dest.Y, orbOut.Z)
+			end
+			-- Rubricatus red laser: aimed at this spot, so hold a point off its line until it ends.
+			local laserOut = getgenv().SB2RedLaser and getgenv().SB2RedLaser.escape(dest, dest)
+			if laserOut then
+				dest = Vector3.new(laserOut.X, dest.Y, laserOut.Z)
+				getgenv().SB2LastDodgeMoveAt = now
+			end
+			writeHeldCF(hrp, dest, nil, 0, true, true)
+			getgenv().SB2DivePinPos = dest
+			resetHold(dest)
+			return true
+		end
+
+		-- Wendigo: stand at least 120 studs behind the nearest one (opposite the way it faces).
+		-- getgenv().SB2DodgeWendigoBehind overrides the distance.
+		local function isWendigoMob(mob)
+			if mobIsDead(mob) then
+				return false
+			end
+			if string.find(string.lower(tostring(mob.Name)), 'wendigo', 1, true) then
+				return true
+			end
+			local plate = mob:FindFirstChild('Nameplate')
+			local label = plate and plate:FindFirstChildWhichIsA('TextLabel', true)
+			return label ~= nil and string.find(string.lower(tostring(label.Text)), 'wendigo', 1, true) ~= nil
+		end
+
+		function M.wendigoMob(hrp)
+			local folder = workspace:FindFirstChild('Mobs')
+			if not folder then
+				return nil
+			end
+			local best, bestD = nil, nil
+			for _, mob in ipairs(folder:GetChildren()) do
+				if isWendigoMob(mob) then
+					local p = mobStrikePos(mob)
+					if p then
+						local d = (Vector3.new(p.X, 0, p.Z) - Vector3.new(hrp.Position.X, 0, hrp.Position.Z)).Magnitude
+						if not bestD or d < bestD then
+							best, bestD = mob, d
+						end
+					end
+				end
+			end
+			if best then
+				getgenv().SB2WendigoSeenUntil = os.clock() + 1.5
+			end
+			return best
+		end
+
+		-- Wendigo inside a special wave (Wisp / Blackout): the
+		-- behind dodge would pull you off the mob you need to hit (and out of the light).
+		local WENDIGO_SKIP_ENVS = { Wisp = true, Blackout = true }
+		function M.wendigoSpecialWave(mob)
+			if getgenv().SB2DodgeWendigoSpecialSkip == false then
+				return false
+			end
+			local env = workspace:GetAttribute('WaveDefenseEnvironment')
+			if env and WENDIGO_SKIP_ENVS[env] then
+				return true
+			end
+			return false
+		end
+
+		function M.wendigo(hrp, mob, fresh)
+			local pos, look = mobFlatLook(mob)
+			if not pos then
+				return false
+			end
+			local want = math.max(120, tonumber(getgenv().SB2DodgeWendigoBehind) or 130)
+			-- Behind it; if that's off the floor, try a bit closer (never under 120), then its sides.
+			local dest
+			for _, dir in ipairs({ -look, Vector3.new(-look.X + look.Z, 0, -look.Z - look.X).Unit, Vector3.new(-look.X - look.Z, 0, -look.Z + look.X).Unit }) do
+				for _, dist in ipairs({ want, 120 }) do
+					local x, z = pos.X + dir.X * dist, pos.Z + dir.Z * dist
+					local stand = M.floorStandY(hrp, x, z)
+					if stand then
+						dest = Vector3.new(x, stand, z)
+						break
+					end
+				end
+				if dest then
+					break
+				end
+			end
+			if not dest then
+				return false
+			end
+			-- It turns to face you, which swings "behind" around; only move when it shifts 8+ studs.
+			local held = getgenv().SB2WendigoHold
+			if typeof(held) == 'Vector3' and (held - dest).Magnitude < 8 then
+				dest = held
+			end
+			getgenv().SB2WendigoHold = dest
+			M.releaseHover(hrp)
+			if (hrp.Position - dest).Magnitude > 2 then
+				writeHeldCF(hrp, dest, pos, 0, true, true)
+				if fresh then
+					getgenv().SB2DodgeLog('wendigo-behind', mob.Name, dest)
+				end
+			end
+			return true
+		end
+
+		-- Darkner orb: stay at its center a couple of studs under it, or on top of it
+		-- when under would be inside the floor.
+		function M.orb(hrp, orbPos, fresh)
+			getgenv().SB2DodgeAirAt = os.clock()
+			local part = M.orbPart()
+			local half = part and part.Size.Y * 0.5 or 2
+			local body = humanoidHip(hrp) + hrp.Size.Y * 0.5
+			-- Floor under the orb, looked up from above the arena (from your own height it found
+			-- nothing once you were already under the map, and left you there).
+			local gy = groundYAtPos(orbPos.X, math.max(orbPos.Y + half + 20, WD_LAVA_FLOOR_Y + 40), orbPos.Z, hrp)
+			local floor = (gy or WD_LAVA_FLOOR_Y) + body
+			local y = orbPos.Y - half - 2 - body
+			-- The orb's light sphere is ~50 studs tall: "just under it" is inside the floor.
+			-- Stand on the floor inside the light instead (never on top of it, never below).
+			if y < floor then
+				y = floor
+			end
+			local dest = Vector3.new(orbPos.X, y, orbPos.Z)
+			getgenv().SB2DarknerOrbXZ = Vector3.new(orbPos.X, 0, orbPos.Z)
+			getgenv().SB2DarknerOrbStandY = y
+			if (hrp.Position - dest).Magnitude > 1.5 then
+				writeHeldCF(hrp, dest, nil, 0, true, true)
+				resetHold(dest)
+				if fresh then
+					getgenv().SB2DodgeLog('orb-hold', part and part:GetFullName() or nil, dest)
+				end
+			end
+		end
+
+		-- Stick to the middle: rifts sit ~137 studs out, right at killaura's reach, so drifting
+		-- off-center left a far rift's mobs unhit. Walk back once nothing needs dodging.
+		-- getgenv().SB2DodgeStickMiddle = false turns it off.
+		local LEASH_RADIUS = 8
+		local LEASH_STEP = 30
+		local LEASH_PAUSE = 1.2
+		local UIS = game:GetService('UserInputService')
+		-- When you sit 20+ studs off the middle, write down which rule is holding you there
+		-- (once every 2s per reason) so a stuck walk-back can be traced in _dodge_log.txt.
+		local waitKey, waitAt = nil, 0
+		local function waitWhy(d, reason, hrp, now)
+			if d and d > 20 and (reason ~= waitKey or now - waitAt > 2) then
+				waitKey, waitAt = reason, now
+				getgenv().SB2DodgeLog('recenter-wait', string.format('%.0f off: %s', d, reason), hrp.Position)
+			end
+			return false
+		end
+
+		-- End of run (only the reward chest left, set by wantsHover160's chest-ground rule):
+		-- killaura can't reach it from the middle (~114+ studs), so the walk-back goes to a
+		-- spot 8 studs from the chest instead.
+		local function chestStandFlat(center)
+			if getgenv().SB2DodgeChestGroundLogged ~= true then
+				return nil
+			end
+			local mobs = workspace:FindFirstChild('Mobs')
+			if not mobs then
+				return nil
+			end
+			for _, m in ipairs(mobs:GetChildren()) do
+				local n = string.lower(m.Name)
+				if string.find(n, 'reward', 1, true) and string.find(n, 'chest', 1, true) and m:GetAttribute('Died') ~= true then
+					local ok, piv = pcall(function() return m:GetPivot().Position end)
+					if ok and typeof(piv) == 'Vector3' then
+						local to = Vector3.new(center.X - piv.X, 0, center.Z - piv.Z)
+						local off = to.Magnitude > 1 and to.Unit * 8 or Vector3.new(8, 0, 0)
+						return Vector3.new(piv.X + off.X, center.Y, piv.Z + off.Z)
+					end
+				end
+			end
+			return nil
+		end
+		M.chestStandFlat = chestStandFlat
+
+		function M.recenter(hrp, now)
+			if getgenv().SB2DodgeStickMiddle == false then
+				return false
+			end
+			local center = waveDefenseRiftsCenterFlat()
+			if not center then
+				return false
+			end
+			local chestSpot = chestStandFlat(center)
+			if chestSpot then
+				center = chestSpot
+			end
+			local dx, dz = center.X - hrp.Position.X, center.Z - hrp.Position.Z
+			local d = math.sqrt(dx * dx + dz * dz)
+			if d <= LEASH_RADIUS then
+				return false
+			end
+			if now - (tonumber(getgenv().SB2LastDodgeMoveAt) or -1e9) < LEASH_PAUSE then
+				return false
+			end
+			if now < (tonumber(getgenv().SB2RecenterBackoffUntil) or 0) then
+				return waitWhy(d, 'backoff (a dodge fired right after the last walk-back)', hrp, now)
+			end
+			-- Storm dodge still holding its safe spot.
+			if now < (tonumber(getgenv().SB2LightningHoldUntil) or 0) then
+				return waitWhy(d, 'storm safe-spot hold', hrp, now)
+			end
+			-- You are steering yourself.
+			if UIS:GetFocusedTextBox() == nil then
+				for _, k in ipairs({ Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D }) do
+					if UIS:IsKeyDown(k) then
+						return false
+					end
+				end
+			end
+			-- Only hold off when you are really in the air. The Humanoid flips to "Freefall"
+			-- about half the time while standing on the arena floor, which blocked the walk back.
+			local standHere = M.floorStandY(hrp, hrp.Position.X, hrp.Position.Z)
+			if standHere and hrp.Position.Y - standHere > 8 then
+				return waitWhy(d, ('in the air (%.0f up)'):format(hrp.Position.Y - standHere), hrp, now)
+			end
+			-- Storm wave: the walk back kept teleporting you into the next bolt's circle right
+			-- after the dodge got you out. Only step to a spot clear of every live bolt
+			-- (shorter steps if the full one isn't), else wait where you are.
+			local circ = getgenv().SB2TempestCircles
+			local live = type(circ) == 'table' and now - (tonumber(getgenv().SB2TempestCirclesAt) or -1e9) < 0.6
+			local dest
+			for _, try in ipairs({ LEASH_STEP, 20, 10 }) do
+				local step = math.min(try, d)
+				local cand = Vector3.new(hrp.Position.X + dx / d * step, hrp.Position.Y, hrp.Position.Z + dz / d * step)
+				local clear = true
+				if live then
+					for _, c in ipairs(circ) do
+						local cx, cz = cand.X - c.x, cand.Z - c.z
+						local need = c.r + 28
+						if cx * cx + cz * cz < need * need then
+							clear = false
+							break
+						end
+					end
+				end
+				if clear then
+					dest = cand
+					break
+				end
+			end
+			if not dest then
+				return waitWhy(d, 'storm bolts between you and the middle', hrp, now)
+			end
+			if not M.floorStandY(hrp, dest.X, dest.Z) then
+				return waitWhy(d, 'no floor at the next step', hrp, now)
+			end
+			if not writeHeldCF(hrp, dest, nil, 1.6, true, false) then
+				return waitWhy(d, 'move refused', hrp, now)
+			end
+			getgenv().SB2LastRecenterAt = now
+			getgenv().SB2DodgeLog('recenter', string.format('%.0f studs off', d), dest)
+			return true
+		end
+	end)()
+
 	local function startAutoFloorDodgeLoop()
+		local function bobThreatsAround(origin)
+			local threats = {}
+			local function addPart(part)
+				if not part or not part:IsA('BasePart') or part.Transparency >= 0.995 then
+					return
+				end
+				local n = string.lower(part.Name)
+				local dx = part.Position.X - origin.X
+				local dz = part.Position.Z - origin.Z
+				if (dx * dx + dz * dz) > (220 * 220) then
+					return
+				end
+				if string.find(n, 'circle', 1, true) or string.find(n, 'puddle', 1, true) or string.find(n, 'ring', 1, true) then
+					threats[#threats + 1] = {
+						c = true,
+						x = part.Position.X,
+						z = part.Position.Z,
+						r = math.max(part.Size.X, part.Size.Z) * 0.5 + 8,
+					}
+				elseif n == 'box' or string.find(n, 'hitbox', 1, true) then
+					local cf = part.CFrame
+					local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+					local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+					if right.Magnitude < 0.05 then
+						right = Vector3.new(1, 0, 0)
+					else
+						right = right.Unit
+					end
+					if look.Magnitude < 0.05 then
+						look = Vector3.new(0, 0, 1)
+					else
+						look = look.Unit
+					end
+					threats[#threats + 1] = {
+						c = false,
+						x = part.Position.X,
+						z = part.Position.Z,
+						rx = right.X,
+						rz = right.Z,
+						lx = look.X,
+						lz = look.Z,
+						hx = part.Size.X * 0.5 + 8,
+						hz = part.Size.Z * 0.5 + 8,
+					}
+				end
+			end
+			for _, ch in ipairs(workspace:GetChildren()) do
+				if ch:IsA('BasePart') then
+					addPart(ch)
+				end
+			end
+			return threats
+		end
+
+		local function bobSpotInside(threats, x, z)
+			for i = 1, #threats do
+				local t = threats[i]
+				local dx, dz = x - t.x, z - t.z
+				if t.c then
+					if dx * dx + dz * dz < t.r * t.r then
+						return true
+					end
+				else
+					local alongR = math.abs(dx * t.rx + dz * t.rz)
+					local alongL = math.abs(dx * t.lx + dz * t.lz)
+					if alongR < t.hx and alongL < t.hz then
+						return true
+					end
+				end
+			end
+			return false
+		end
 		if not isToggleOn('AutoFloorDodge') then
 			stopAutoFloorDodgeLoop()
 			return
@@ -3182,6 +5721,7 @@ return function(env)
 			return now < blackoutSeenUntil
 		end
 		getgenv().SB2AutoFloorDodgeConn = RunService.Heartbeat:Connect(function()
+			local okTick, errTick = pcall(function()
 			if not inWdDodgeContext()
 				and (
 					typeof(getgenv().SB2LavaFightY) == 'number'
@@ -3233,6 +5773,24 @@ return function(env)
 			local orbEarly = darknerOrbCenter()
 			local wendigoNow = refreshWendigo(nowPre)
 			local bobNow = findBobMob()
+			if bobNow then
+				bobSeenUntil = nowPre + 1.5
+				getgenv().SB2BobLastSeenAt = nowPre
+			elseif nowPre - (tonumber(getgenv().SB2BobLastSeenAt) or -1e9) < 30
+				and nowPre - (tonumber(getgenv().SB2BobLeftoverScanAt) or 0) >= 0.25
+			then
+				-- Bob's attack grid keeps dropping rows of circles for seconds after he dies;
+				-- leaving his perch 1.5s after him put you under a row (100%). Stay up while
+				-- any of his attack parts are still in the arena.
+				getgenv().SB2BobLeftoverScanAt = nowPre
+				for _, ch in ipairs(workspace:GetChildren()) do
+					local n = ch.Name
+					if n == 'Circle' or n == 'EffectHitbox' or n == 'ImpactProjectile' or n == 'Gas' then
+						bobSeenUntil = math.max(bobSeenUntil, nowPre + 1.5)
+						break
+					end
+				end
+			end
 			if not isLocalAlive() then
 				return
 			end
@@ -3241,7 +5799,355 @@ return function(env)
 			if not hrp or not hrp:IsA('BasePart') then
 				return
 			end
+			-- Physics glitch guard: teleporting between holds once spiked you to -111,000 studs/s
+			-- and threw you below the map (counted as a death). Cancel any absurd speed, and if you
+			-- are ever far below the arena floor, put you back over the middle.
+			do
+				local v = hrp.AssemblyLinearVelocity
+				if v.Magnitude > 250 then
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+					if nowPre - (tonumber(getgenv().SB2FlingLogAt) or 0) > 2 then
+						getgenv().SB2FlingLogAt = nowPre
+						getgenv().SB2DodgeLog('fling-stop', ('speed %.0f'):format(v.Magnitude), hrp.Position)
+					end
+				end
+				if workspace:FindFirstChild('WaveDefenseStuff') and hrp.Position.Y < WD_LAVA_FLOOR_Y - 60 then
+					local mid = waveDefenseRiftsCenterFlat()
+					if mid then
+						local safe = Vector3.new(mid.X, WD_LAVA_FLOOR_Y + 4, mid.Z)
+						local fellY = hrp.Position.Y
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						writeHeldCF(hrp, safe, nil, 0, true, true)
+						pcall(getgenv().SB2DiveResetHold or function() end, safe)
+						getgenv().SB2DodgeLog('void-rescue', ('was at Y %.0f'):format(fellY), safe)
+						lastStep = nowPre
+						return
+					end
+				end
+			end
+			-- Atheon nuke: get 165 studs out sideways, ahead of every other mode.
+			do
+				local out = getgenv().SB2DodgeModes.atheonNuke(hrp, nowPre)
+				if out then
+					getgenv().SB2DodgeModes.releaseHover(hrp)
+					writeHeldCF(hrp, out, nil, 0, true, true)
+					getgenv().SB2DivePinPos = out
+					pcall(getgenv().SB2DiveResetHold or function() end, out)
+					lastStep = nowPre
+					return
+				end
+			end
+			-- Rubricatus final phase: high above the map, ahead of everything else (low HP included).
+			-- Except while a nuke he cast is still pending: it goes off ~10s after the cast even
+			-- if he is already dead, and lifting into the open sky killed you (100%) a second
+			-- before it landed. Stay in pillar cover until it has gone off, then lift.
+			local rubNukePending = false
+			do
+				local t0 = tonumber(getgenv().SB2RubNukeT0) or -1e9
+				local boom = tonumber(getgenv().SB2RubNukeBoomAt) or -1e9
+				if (nowPre - t0 < 13 and boom < t0)
+					or nowPre < (tonumber(getgenv().SB2RubricatusNukeUntil) or 0)
+					or typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3'
+				then
+					rubNukePending = true
+				end
+			end
+			if rubNukePending and not findRubricatusMob() and typeof(lastRubricatusFlat) == 'Vector3' then
+				local fy = rubricatusFightY(hrp)
+				rubricatusInCoverWindow(nowPre, hrp.Position)
+				local cover = rubricatusPillarCoverGoal(hrp.Position, fy, nil)
+				if typeof(cover) ~= 'Vector3' and typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3' then
+					local held = getgenv().SB2RubricatusCoverPos
+					cover = Vector3.new(held.X, fy, held.Z)
+				end
+				if typeof(cover) == 'Vector3' then
+					getgenv().SB2DodgeModes.releaseHover(hrp)
+					rubricatusSnapToCover(hrp, cover, nil)
+					if getgenv().SB2RubDeadCoverLogged ~= getgenv().SB2RubNukeT0 then
+						getgenv().SB2RubDeadCoverLogged = getgenv().SB2RubNukeT0
+						getgenv().SB2DodgeLog('rub-dead-nuke-cover', 'he died mid-nuke', cover)
+					end
+					lastStep = nowPre
+					return
+				end
+			end
+			if not rubNukePending and getgenv().SB2DodgeModes.rubFinal(nowPre) then
+				getgenv().SB2DodgeModes.rubFinalHover(hrp, nowPre)
+				lastStep = nowPre
+				return
+			end
+			getgenv().SB2RubFinalPos = nil
+			-- Under 40% HP: lift 160+ studs above everything. Beats every other mode except
+			-- hiding in a Rubricatus pillar while his nuke is coming (going up there is death).
+			do
+				local nukeCover = nowPre < (tonumber(getgenv().SB2RubricatusNukeUntil) or 0)
+					and typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3'
+				if not nukeCover and getgenv().SB2DodgeModes.lowHp(hrp, nowPre) then
+					lastStep = nowPre
+					return
+				end
+			end
+			-- Wendigo (incl. Enraged Wendigo): stay 120+ studs behind the nearest one. Checked
+			-- right after low HP so no other mode can keep you next to it.
+			do
+				local wm = getgenv().SB2DodgeModes
+				local wenMob = wm.wendigoMob(hrp)
+				-- Special waves where you have to hit the lit-up mob (Wisp / Blackout): no behind dodge.
+				if wenMob and wm.wendigoSpecialWave(wenMob) then
+					if nowPre - (tonumber(getgenv().SB2WendigoSkipLogAt) or 0) > 5 then
+						getgenv().SB2WendigoSkipLogAt = nowPre
+						getgenv().SB2DodgeLog('wendigo-skip-special', tostring(workspace:GetAttribute('WaveDefenseEnvironment')), hrp.Position)
+					end
+					wenMob = nil
+				end
+				if wenMob and wm.wendigoHover and wm.wantsHover160() then
+					getgenv().SB2WendigoHold = nil
+					wm.hover160(hrp, nowPre)
+					lastStep = nowPre
+					return
+				end
+				if wenMob then
+					local moved = wm.wendigo(hrp, wenMob, getgenv().SB2WendigoHold == nil)
+					if nowPre - (tonumber(getgenv().SB2WendigoSeenLogAt) or 0) > 3 then
+						getgenv().SB2WendigoSeenLogAt = nowPre
+						local wp = mobStrikePos(wenMob)
+						getgenv().SB2DodgeLog('wendigo-seen', ('%s %.0f studs away, holding=%s'):format(
+							wenMob.Name, wp and (wp - hrp.Position).Magnitude or -1, tostring(moved)), hrp.Position)
+					end
+					if moved then
+						lastStep = nowPre
+						return
+					end
+				else
+					getgenv().SB2WendigoHold = nil
+				end
+			end
+			-- Floor dodge only. Lava is the one fight that stays in the air.
+			-- Rubricatus stays on the floor (dodge + pillar cover). His red parts are
+			-- not the lava wave. Elite flies only for the 90s after he dies.
+			local bobAir = nowPre < bobSeenUntil
+			if not bobAir then
+				getgenv().SB2BobEscapeActive = false
+				getgenv().SB2BobHoldY = nil
+				bobHoldY = nil
+				bobEscapeFlat = nil
+			end
+			local rubMob = findRubricatusMob()
+			if rubMob then
+				rubricatusSeenUntil = nowPre + RUBRICATUS_LEFTOVER_GRACE
+				local bossFlat = rubricatusBossFlat(rubMob)
+				if bossFlat then
+					lastRubricatusFlat = bossFlat
+				end
+			end
+			local rubGrace = nowPre < rubricatusSeenUntil
+			local modeName = workspace:GetAttribute('WaveDefenseMode')
+			local rubEliteDead = rubGrace and not rubMob
+				and type(modeName) == 'string' and string.lower(modeName) == 'elite'
+			if rubMob or rubGrace then
+				getgenv().SB2LavaEscapeActive = false
+				getgenv().SB2LavaFightY = nil
+				getgenv().SB2LavaHoverY = nil
+			end
+			if rubEliteDead then
+				local center = waveDefenseRiftsCenterFlat()
+				local holdY = WD_LAVA_FLOOR_Y + (tonumber(getgenv().SB2DodgeRubFinalAbove) or 340)
+				local x = center and center.X or hrp.Position.X
+				local z = center and center.Z or hrp.Position.Z
+				getgenv().SB2RubricatusSurviveActive = true
+				getgenv().SB2RubricatusSurviveY = holdY
+				writeHeldCF(hrp, Vector3.new(x, holdY, z), nil, 0, true, true)
+				return
+			end
+			if rubMob then
+				getgenv().SB2RubricatusSurviveActive = false
+				getgenv().SB2RubricatusSurviveY = nil
+				local fightY = rubricatusFightY(hrp)
+				local coverWindow = rubricatusInCoverWindow(nowPre, hrp.Position)
+				-- Nuke over: step out the side of the pillar onto the floor instead of being
+				-- pushed up onto its top.
+				if not coverWindow and typeof(getgenv().SB2RubCoverExit) == 'Vector3' then
+					local from = getgenv().SB2RubCoverExit
+					getgenv().SB2RubCoverExit = nil
+					local c = waveDefenseRiftsCenterFlat() or flatXZ(hrp.Position)
+					local dir = Vector3.new(c.X - from.X, 0, c.Z - from.Z)
+					dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(1, 0, 0)
+					local ex, ez = from.X + dir.X * 14, from.Z + dir.Z * 14
+					local stand = getgenv().SB2DodgeModes.floorStandY(hrp, ex, ez) or (WD_LAVA_FLOOR_Y + 3)
+					writeHeldCF(hrp, Vector3.new(ex, stand, ez), nil, 0, true, true)
+					getgenv().SB2DodgeLog('rub-cover-exit', nil, Vector3.new(ex, stand, ez))
+					lastStep = nowPre
+					return
+				end
+				-- Swings first: they land in under a second, the cover window lasts ~11s.
+				local heldCover = getgenv().SB2RubricatusCoverPos
+				-- Discs (25% each) - except in the last seconds before a nuke, when the pillar matters more.
+				if not (coverWindow and nowPre - (tonumber(getgenv().SB2RubNukeT0) or -1e9) >= 6) then
+					local dOut = getgenv().SB2DodgeModes.discEscape(hrp, nowPre)
+					if dOut and Vector3.new(dOut.X - hrp.Position.X, 0, dOut.Z - hrp.Position.Z).Magnitude > 1.5 then
+						writeHeldCF(hrp, Vector3.new(dOut.X, hrp.Position.Y, dOut.Z), nil, 0, true, false)
+						lastStep = nowPre
+						return
+					end
+				end
+				local swingOut = getgenv().SB2RubSwing.escape(
+					hrp.Position,
+					fightY,
+					nowPre,
+					(coverWindow and typeof(heldCover) == 'Vector3') and heldCover or nil
+				)
+				if swingOut then
+					sidestepOnGround(hrp, swingOut, nil, 0.5)
+					getgenv().SB2DodgeLog('rub-swing', nil, swingOut)
+					lastStep = nowPre
+					getgenv().SB2RubricatusLastSwingDodge = nowPre
+					getgenv().SB2LastDodgeMoveAt = nowPre
+					unstickIdleFreefall(hrp)
+					return
+				end
+				-- First 6s after the nuke is cast it has not gone off yet (it lands ~10s in):
+				-- dodge his other attacks first and only head back into cover when clear.
+				if coverWindow and nowPre - (tonumber(getgenv().SB2RubNukeT0) or -1e9) < 6 then
+					local early = rubricatusGeneralDodgeGoal(hrp.Position, fightY, rubMob, nowPre)
+					-- Short sidesteps only while the nuke charges: full 56-stud pushes every tick
+					-- flung you 100+ studs a second across (and off) the arena, far from any pillar.
+					if early then
+						local ex, ez = early.X - hrp.Position.X, early.Z - hrp.Position.Z
+						local em = math.sqrt(ex * ex + ez * ez)
+						if em > 24 then
+							early = Vector3.new(hrp.Position.X + ex / em * 24, early.Y, hrp.Position.Z + ez / em * 24)
+						end
+						local mid = waveDefenseRiftsCenterFlat()
+						if mid then
+							local off = Vector3.new(early.X - mid.X, 0, early.Z - mid.Z)
+							if off.Magnitude > 130 then
+								off = off.Unit * 130
+								early = Vector3.new(mid.X + off.X, early.Y, mid.Z + off.Z)
+							end
+						end
+					end
+					if early and sidestepOnGround(hrp, early, nil, 1.6) then
+						lastStep = nowPre
+						getgenv().SB2DodgeLog('rub-threat-early', nil, early)
+						getgenv().SB2LastDodgeMoveAt = nowPre
+						unstickIdleFreefall(hrp)
+						return
+					end
+				end
+				if coverWindow then
+					local cover = rubricatusPillarCoverGoal(hrp.Position, fightY, rubMob)
+					if typeof(cover) ~= 'Vector3' then
+						local held = getgenv().SB2RubricatusCoverPos
+						if typeof(held) == 'Vector3' then
+							cover = Vector3.new(held.X, fightY, held.Z)
+						end
+					end
+					if typeof(cover) == 'Vector3' then
+						-- Don't walk back into a swing that hasn't landed yet; wait it out here.
+						if getgenv().SB2RubSwing.blocks(cover, nowPre) then
+							unstickIdleFreefall(hrp)
+							return
+						end
+						rubricatusSnapToCover(hrp, cover, nil)
+						return
+					end
+				end
+				getgenv().SB2DodgeModes.releaseHover(hrp)
+				if getgenv().SB2DodgeModes.hurtEscape(hrp, nowPre) then
+					lastStep = nowPre
+					return
+				end
+				local rubGoal = rubricatusGeneralDodgeGoal(hrp.Position, fightY, rubMob, nowPre)
+				if rubGoal and sidestepOnGround(hrp, rubGoal, nil, 1.6) then
+					lastStep = nowPre
+					getgenv().SB2LastDodgeMoveAt = nowPre
+					getgenv().SB2DodgeLog('rub-threat', nil, rubGoal)
+				elseif not rubGoal and not coverWindow and #(getgenv().SB2RedLaser and getgenv().SB2RedLaser.active() or {}) == 0 then
+					-- Nothing to dodge and no nuke: walk back toward the middle like normal waves
+					-- (this fight never did, so his dodges left you stranded at the edge).
+					getgenv().SB2DodgeModes.recenter(hrp, nowPre)
+				end
+				unstickIdleFreefall(hrp)
+				return
+			end
+			getgenv().SB2RubricatusSurviveActive = false
+			getgenv().SB2RubricatusSurviveY = nil
+			getgenv().SB2RubCoverExit = nil
+			if rubGrace then
+				lastStep = tickGroundDodge(hrp, nowPre, lastStep)
+				unstickIdleFreefall(hrp)
+				return
+			end
+			-- Bob beats lava: his perch is far above the lava anyway, and flip-flopping between
+			-- the two holds (Y360 <-> Y173 every second) flung you into the void.
+			if bobAir then
+				-- Drop the lava hold so nothing (incl. the main script's hold loop) pins you to Y173.
+				getgenv().SB2LavaEscapeActive = false
+				getgenv().SB2LavaFightY = nil
+				getgenv().SB2LavaHoverY = nil
+				getgenv().SB2DodgeModes.bob(hrp, getgenv().SB2BobEscapeActive ~= true)
+				return
+			end
+			if lavaNow then
+				getgenv().SB2DodgeAirAt = nowPre
+				local hold = resolveLavaFightY(hrp, groundYAt(hrp))
+				lavaFightY = hold
+				getgenv().SB2LavaEscapeActive = true
+				getgenv().SB2LavaFightY = hold
+				getgenv().SB2LavaHoverY = hold
+				local goal = lavaCircleSidestep(hrp, hold)
+				local x, z = hrp.Position.X, hrp.Position.Z
+				if typeof(goal) == 'Vector3' then
+					x, z = goal.X, goal.Z
+				end
+				writeHeldCF(hrp, Vector3.new(x, hold, z), nil, 0, true, true)
+				return
+			end
+			local modes = getgenv().SB2DodgeModes
+			-- Darkner orb wave: stay at the orb.
+			if orbEarly then
+				modes.orb(hrp, orbEarly, getgenv().SB2DarknerOrbXZ == nil)
+				return
+			end
+			if typeof(getgenv().SB2DarknerOrbXZ) == 'Vector3' then
+				getgenv().SB2DarknerOrbXZ = nil
+				getgenv().SB2DarknerOrbStandY = nil
+			end
+			-- Bob: lift far off the map until he is gone (1.5s grace after he despawns).
+			if bobAir then
+				modes.bob(hrp, getgenv().SB2BobEscapeActive ~= true)
+				return
+			end
+			-- Aeganatos: hover high above him (1.5s grace after he's gone or the bar hides).
+			local aegMob = modes.aeganatosMob()
+			if aegMob or nowPre < (tonumber(getgenv().SB2AegSeenUntil) or 0) then
+				modes.aeganatos(hrp, aegMob, getgenv().SB2AegHoldPos == nil)
+				return
+			end
+			getgenv().SB2AegHoldPos = nil
+			-- Coming out of lava / Bob / orb / Aeganatos: drop to the floor before any ground dodging.
+			if modes.descend(hrp, 'descend') then
+				lastStep = nowPre
+				return
+			end
 			lastStep = tickGroundDodge(hrp, nowPre, lastStep)
+			unstickIdleFreefall(hrp)
+			end)
+			-- A crash here used to stop every dodge silently for as long as it kept happening.
+			if not okTick then
+				local now = os.clock()
+				local msg = tostring(errTick)
+				if msg ~= getgenv().SB2DodgeLastErr or now - (tonumber(getgenv().SB2DodgeLastErrAt) or 0) > 3 then
+					getgenv().SB2DodgeLastErr = msg
+					getgenv().SB2DodgeLastErrAt = now
+					warn('[AutoFloorDodge] tick error: ' .. msg)
+					local logFn = getgenv().SB2DodgeLog
+					if type(logFn) == 'function' then
+						pcall(logFn, 'ERROR', msg, nil)
+					end
+				end
+			end
 		end)
 		pcall(function()
 			RunService:UnbindFromRenderStep('SB2PackHop')
@@ -3253,13 +6159,39 @@ return function(env)
 		end)
 	end
 
+	-- Own function so this chunk stays under Luau's 200-local register cap.
+	;(function()
+	-- Auto-on: the dodge turns itself on whenever only whitelisted players are in the server
+	-- (the whitelist rule still switches it off when someone else joins). Turning it off
+	-- yourself is remembered in PlayerTools/autododge and stops the auto-on.
+	local AUTO_DODGE_PATH = getgenv().SB2AcctPath('PlayerTools/autododge')
+	local function autoDodgeWanted()
+		local ok, body = pcall(function()
+			return isfile(AUTO_DODGE_PATH) and readfile(AUTO_DODGE_PATH) or nil
+		end)
+		if ok and type(body) == 'string' then
+			return (body:lower():gsub('%s+', '')) ~= 'false'
+		end
+		return getgenv().SB2FriendDefaultsOff ~= true
+	end
+	local function userChangedDodge(value)
+		-- Ignore automatic flips: whitelist lock, profile/config load, our own auto-on.
+		if getgenv().SB2StrangerCombatLock == true and value ~= true then
+			return
+		end
+		if getgenv().SB2ConfigLoading == true or getgenv().SB2DodgeAutoSetting == true then
+			return
+		end
+		pcall(writefile, AUTO_DODGE_PATH, value and 'true' or 'false')
+	end
 	local existing = type(Toggles) == 'table' and Toggles.AutoFloorDodge
 	if not existing then
 		CombatBox:AddToggle('AutoFloorDodge', {
 			Text = 'Auto dodge floor circles',
 			Default = false,
-			Tooltip = 'Sidestep beams, floor circles, and other attacks on the ground. No air hover or 4-spot hop.',
+			Tooltip = 'Sidestep beams, floor circles, and other attacks on the ground. Turns itself on when only whitelisted players are in the server; switch it off to stop that (saved in PlayerTools/autododge).',
 		}):OnChanged(function(value)
+			userChangedDodge(value == true)
 			getgenv().SB2AutoFloorDodgeOn = value == true
 			local prev = getgenv().SB2AutoFloorDodgeConn
 			if prev then
@@ -3278,7 +6210,40 @@ return function(env)
 	if getgenv()._SB2ReloadStartDodge == true or (existing and existing.Value == true) or isToggleOn('AutoFloorDodge') then
 		startAutoFloorDodgeLoop()
 	end
+	-- Auto-on watcher (one per load; a reload replaces it).
+	do
+		local token = {}
+		getgenv().SB2DodgeAutoToken = token
+		task.spawn(function()
+			task.wait(3)
+			while getgenv().SB2DodgeAutoToken == token do
+				pcall(function()
+					local t = type(Toggles) == 'table' and Toggles.AutoFloorDodge
+					if type(t) ~= 'table' or t.Value == true or type(t.SetValue) ~= 'function' then
+						return
+					end
+					if not autoDodgeWanted() then
+						return
+					end
+					if getgenv().SB2DodgeStrangerOffThisServer == true then
+						return -- switched off because of a stranger: don't turn it back on here
+					end
+					local strangersFn = getgenv().SB2OtherPlayersPresent
+					if type(strangersFn) ~= 'function' or strangersFn() then
+						return -- whitelist rule: only when no non-whitelisted players are here
+					end
+					getgenv().SB2DodgeAutoSetting = true
+					pcall(function()
+						t:SetValue(true)
+					end)
+					getgenv().SB2DodgeAutoSetting = false
+				end)
+				task.wait(2)
+			end
+		end)
+	end
 	getgenv().SB2StopAutoFloorDodgeLoop = stopAutoFloorDodgeLoop
+	getgenv().SB2StartAutoFloorDodgeLoop = startAutoFloorDodgeLoop
 	getgenv().SB2RubricatusPillarCoverGoal = rubricatusPillarCoverGoal
 	getgenv().SB2RubricatusNukeTelegraph = rubricatusSpawnedPillarsNear
 	getgenv().SB2RubricatusSnapToCover = rubricatusSnapToCover
@@ -3288,7 +6253,7 @@ return function(env)
 	-- Rubricatus fight recorder: survives server hops (module reloads each server) so a nuke
 	-- death can be read back from PlayerTools/_rub_fight_log.txt afterwards.
 	do
-		local RUB_LOG_PATH = 'PlayerTools/_rub_fight_log.txt'
+		local RUB_LOG_PATH = getgenv().SB2AcctPath('PlayerTools/_rub_fight_log.txt')
 		local token = {}
 		getgenv().SB2RubLogToken = token
 		task.spawn(function()
@@ -3399,7 +6364,7 @@ return function(env)
 
 	-- Own function scope — death-log locals were tipping the 200-register factory cap.
 	local function startDeathLog()
-		local DEATH_LOG_PATH = 'PlayerTools/_death_log.txt'
+		local DEATH_LOG_PATH = getgenv().SB2AcctPath('PlayerTools/_death_log.txt')
 		local DEATH_LOG_WINDOW = 15
 		local DEATH_LOG_NOISE = {
 			DamageText = true,
@@ -3422,6 +6387,7 @@ return function(env)
 			local function push(line)
 				ring[#ring + 1] = { t = os.clock(), line = line }
 			end
+			getgenv().SB2DeathLogNote = push
 			local function prune(now)
 				local keep = 1
 				while keep <= #ring and now - ring[keep].t > DEATH_LOG_WINDOW do
@@ -3487,8 +6453,17 @@ return function(env)
 				end
 				lines[#lines + 1] = '=== END pos=' .. fv(hrp and hrp.Position) .. ' char=' .. tostring(char and char.Parent ~= nil)
 				pcall(function()
-					if not isfile(DEATH_LOG_PATH) or #readfile(DEATH_LOG_PATH) > 500000 then
+					-- Over the cap: keep the newest ~250KB (whole entries) instead of wiping it all,
+					-- which used to erase the deaths right before this one.
+					if not isfile(DEATH_LOG_PATH) then
 						writefile(DEATH_LOG_PATH, '')
+					else
+						local old = readfile(DEATH_LOG_PATH)
+						if #old > 500000 then
+							local tail = old:sub(-250000)
+							local cut = tail:find('=== DEATH', 1, true)
+							writefile(DEATH_LOG_PATH, cut and tail:sub(cut) or '')
+						end
 					end
 				end)
 				pcall(appendfile, DEATH_LOG_PATH, table.concat(lines, '\n') .. '\n\n')
@@ -3535,7 +6510,7 @@ return function(env)
 			end
 
 			-- Weapon watcher: equip/unequip and sheathe changes go to their own file with the wave.
-			local EQUIP_LOG_PATH = 'PlayerTools/_equip_log.txt'
+			local EQUIP_LOG_PATH = getgenv().SB2AcctPath('PlayerTools/_equip_log.txt')
 			local function equipNote(line)
 				push('EQUIP ' .. line)
 				local full = ('%s wave=%s %s\n'):format(os.date('%Y-%m-%d %H:%M:%S'), tostring(workspace:GetAttribute('Wave')), line)
@@ -3689,4 +6664,5 @@ return function(env)
 			stopAutoFloorDodgeLoop()
 		end
 	end)
+	end)()
 end

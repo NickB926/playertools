@@ -79,6 +79,9 @@ if not appPath then
 	error('[PlayerTools] PlayerTools_Obsidian.lua missing')
 end
 
+if exists('PlayerTools/_friend_build') then
+	getgenv().SB2FriendDefaultsOff = true -- friend install: toggles start off
+end
 getgenv().SB2UseAtaraxiaLib = true
 getgenv().SB2PlayerToolsBackend = 'ataraxia'
 getgenv().SB2PlayerToolsBackendError = nil

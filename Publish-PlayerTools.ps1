@@ -1,4 +1,4 @@
-# Publish PlayerTools to NickB926/playertools (same idea as discord-lite npm run publish:updates)
+﻿# Publish PlayerTools to NickB926/playertools (same idea as discord-lite npm run publish:updates)
 # Usage:
 #   npm run publish:updates
 #   npm run publish:updates -- -Message "fixed tribute ping"
@@ -12,7 +12,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$srcRoot = 'C:\Users\Revi\AppData\Local\Potassium\scripts'
+# Live files are in the Potassium *workspace* folder (scripts\ held stale copies).
+$srcRoot = 'C:\Users\Revi\AppData\Local\Potassium\workspace'
 $repoRoot = 'C:\Users\Revi\Documents\playertools'
 $ptSrc = Join-Path $srcRoot 'PlayerTools'
 $ptDst = Join-Path $repoRoot 'PlayerTools'
@@ -33,6 +34,13 @@ function Bump-PatchVersion([string]$v) {
 }
 
 if (-not (Test-Path $ptSrc)) { throw "Missing source $ptSrc" }
+
+# Keep the repo's copy of this script current (so the old shortcut uses the fixed one).
+$repoScript = Join-Path $repoRoot 'Publish-PlayerTools.ps1'
+if ($PSCommandPath -and ((Resolve-Path $PSCommandPath).Path -ne $repoScript) -and (Test-Path $repoRoot)) {
+  Copy-Item -Force $PSCommandPath $repoScript
+  Write-Host '==> Updated Publish-PlayerTools.ps1 in the repo'
+}
 if (-not (Test-Path $repoRoot)) { New-Item -ItemType Directory -Force -Path $repoRoot | Out-Null }
 
 $verPath = Join-Path $ptSrc 'version.json'
@@ -60,21 +68,37 @@ Write-Host "==> Publishing PlayerTools $($ver.version): $($ver.message)"
 if (Test-Path $ptDst) { Remove-Item -Recurse -Force $ptDst }
 New-Item -ItemType Directory -Force -Path $ptDst | Out-Null
 
+# Build the file list from what is actually on this PC (so friends get exactly your version).
+# Only code + whitelist ship. Saved settings/toggles (flag files, *.json prefs, profiles,
+# hive webhooks, logs) never leave this PC.
+$excludeName = '^(_|ForgeTools\.lua$|EggCodeDoorProbe\.lua$|slow_corr_probe\.lua$)'
+$excludeLike = @('*.backup.*', '*.bak', '*.pending.*', '*.before-*', '*backup*', '*.v[0-9]*.*')
+$shipExtra = @('whitelist.txt', 'whitelist.example.txt')
+$names = New-Object System.Collections.Generic.List[string]
+Get-ChildItem -LiteralPath $ptSrc -File | ForEach-Object {
+  $n = $_.Name
+  $isCode = $n -like '*.lua' -or $n -like '*.iy'
+  if (-not $isCode -and ($shipExtra -notcontains $n)) { return }
+  if ($n -match $excludeName) { return }
+  foreach ($pat in $excludeLike) { if ($n -like $pat) { return } }
+  $names.Add($n)
+}
+$names = $names | Sort-Object
+$fileList = @()
+foreach ($n in $names) { $fileList += "PlayerTools/$n" }
+$fileList += 'PlayerTools/backend'
+$fileList += 'PlayerTools/version.json'
+$ver.files = $fileList
+
 $copied = 0
-foreach ($rel in $ver.files) {
-  if ($rel -eq 'PlayerTools/version.json' -or $rel -eq 'version.json') { continue }
-  $name = $rel -replace '^PlayerTools/', ''
-  $from = Join-Path $ptSrc $name
-  if (-not (Test-Path $from)) { Write-Warning "skip missing $from"; continue }
-  $to = Join-Path $ptDst $name
-  $toDir = Split-Path $to -Parent
-  if (-not (Test-Path $toDir)) { New-Item -ItemType Directory -Force -Path $toDir | Out-Null }
-  Copy-Item -Force $from $to
+foreach ($n in $names) {
+  Copy-Item -Force (Join-Path $ptSrc $n) (Join-Path $ptDst $n)
   $copied++
 }
-Write-Host "==> Copied $copied files from Potassium scripts"
+Write-Host "==> Copied $copied files from Potassium workspace (settings excluded)"
 
-Copy-Item -Force (Join-Path $srcRoot 'bootstrap.lua') (Join-Path $repoRoot 'bootstrap.lua')
+$bootSrc = Join-Path $srcRoot 'bootstrap.lua'
+if (Test-Path $bootSrc) { Copy-Item -Force $bootSrc (Join-Path $repoRoot 'bootstrap.lua') } else { Write-Host '==> bootstrap.lua kept from repo' }
 $ataraxiaEntry = Join-Path $srcRoot 'Ataraxia.lua'
 if (Test-Path $ataraxiaEntry) {
   Copy-Item -Force $ataraxiaEntry (Join-Path $repoRoot 'Ataraxia.lua')
@@ -84,7 +108,7 @@ if (Test-Path $ataraxiaEntry) {
 # Friends get Ataraxia chrome by default. Never publish local-only markers.
 Write-Utf8NoBom (Join-Path $ptDst 'backend') "ataraxia`n"
 Write-Host '==> Wrote PlayerTools/backend = ataraxia (publish tree only)'
-foreach ($junk in @('_dev_copy', '_hide_menu', '_tile_now', '_tile_alts_only')) {
+foreach ($junk in @('_dev_copy', '_hide_menu', '_tile_now', '_tile_alts_only', '_no_github_update', '_friend_build')) {
   $junkPath = Join-Path $ptDst $junk
   if (Test-Path $junkPath) { Remove-Item -Force $junkPath }
 }

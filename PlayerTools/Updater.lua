@@ -33,7 +33,7 @@ local function httpGet(url)
 		local ok, body = pcall(function()
 			return game:HttpGet(url)
 		end)
-		if ok and type(body) == 'string' and body ~= '' then
+		if ok and type(body) == 'string' and body ~= '' and not body:match('^%s*404: Not Found') then
 			return body
 		end
 	end
@@ -112,6 +112,76 @@ end
 
 local Updater = {}
 
+-- The author's own machine keeps a PlayerTools/_no_github_update marker so a GitHub
+-- update never overwrites newer local work.
+function Updater.isDevCopy()
+	if type(isfile) ~= 'function' then
+		return false
+	end
+	local ok, is = pcall(isfile, 'PlayerTools/_no_github_update')
+	return ok and is == true
+end
+
+local function localMissing(files)
+	local out = {}
+	if type(isfile) ~= 'function' then
+		return out
+	end
+	for _, rel in ipairs(files) do
+		rel = tostring(rel):gsub('^/+', '')
+		if rel ~= '' and rel ~= VERSION_PATH then
+			local ok, is = pcall(isfile, rel)
+			if not (ok and is == true) then
+				out[#out + 1] = rel
+			end
+		end
+	end
+	return out
+end
+Updater.localMissing = localMissing
+
+-- Files merged with the friend's own copy instead of replaced.
+local MERGE_LINES = {
+	['PlayerTools/whitelist.txt'] = true,
+}
+local function mergeLines(rel, remoteBody)
+	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+		return remoteBody
+	end
+	local okIs, is = pcall(isfile, rel)
+	if not (okIs and is) then
+		return remoteBody
+	end
+	local okRead, localBody = pcall(readfile, rel)
+	if not okRead or type(localBody) ~= 'string' or localBody == '' then
+		return remoteBody
+	end
+	local seen, out = {}, {}
+	local function add(body)
+		for line in string.gmatch(body, '[^\r\n]+') do
+			local key = line:gsub('^%s+', ''):gsub('%s+$', ''):lower()
+			if key ~= '' and not seen[key] then
+				seen[key] = true
+				out[#out + 1] = line
+			end
+		end
+	end
+	add(remoteBody)
+	add(localBody)
+	return table.concat(out, '\n') .. '\n'
+end
+
+-- Friend installs start with every toggle off (launch.lua reads this marker).
+function Updater.markFriendBuild()
+	if Updater.isDevCopy() or type(writefile) ~= 'function' then
+		return
+	end
+	local okIs, is = pcall(isfile, 'PlayerTools/_friend_build')
+	if not (okIs and is) then
+		pcall(writefile, 'PlayerTools/_friend_build', 'toggles start off on this install\n')
+	end
+end
+
 function Updater.getBase()
 	return updateBaseUrl()
 end
@@ -182,6 +252,7 @@ function Updater.check()
 		needsUpdate = needsUpdate,
 		localNewer = cmp == -1,
 		files = type(remote.files) == 'table' and remote.files or {},
+		missing = localMissing(type(remote.files) == 'table' and remote.files or {}),
 		message = remote.message,
 	}
 end
@@ -201,12 +272,18 @@ function Updater.apply(opts)
 		warn('[PlayerTools Update] ' .. msg)
 	end
 
+	if Updater.isDevCopy() and not opts.forceDev then
+		say('PlayerTools/_no_github_update present - skipping GitHub update (dev machine).')
+		return true, 'dev copy'
+	end
+	Updater.markFriendBuild()
 	local info = Updater.check()
 	if not info.ok then
 		say('Update check failed: ' .. tostring(info.error))
 		return false, info.error
 	end
-	if not info.needsUpdate and not opts.force then
+	local repairOnly = not info.needsUpdate and not opts.force and #info.missing > 0
+	if not info.needsUpdate and not opts.force and not repairOnly then
 		if info.localNewer then
 			say(
 				('Local %s is newer than remote %s — keeping local files (no downgrade).'):format(
@@ -221,11 +298,15 @@ function Updater.apply(opts)
 	end
 
 	local base = updateBaseUrl()
-	local files = info.files
+	local files = repairOnly and info.missing or info.files
 	if #files == 0 then
 		return false, 'no files listed'
 	end
-	say(('Updating %s -> %s (%d files)...'):format(tostring(info.localVersion), tostring(info.remoteVersion), #files))
+	if repairOnly then
+		say(('Restoring %d missing file(s)...'):format(#files))
+	else
+		say(('Updating %s -> %s (%d files)...'):format(tostring(info.localVersion), tostring(info.remoteVersion), #files))
+	end
 	local okCount, failCount = 0, 0
 	for _, rel in ipairs(files) do
 		rel = tostring(rel):gsub('^/+', '')
@@ -234,6 +315,17 @@ function Updater.apply(opts)
 		end
 		local url = base .. '/' .. rel
 		local body = httpGet(url)
+		-- Never replace a working local file with one that will not compile.
+		if type(body) == 'string' and body ~= '' and rel:match('%.lua$') then
+			local compiler = loadstring or load
+			if type(compiler) == 'function' and not compiler(body, rel) then
+				say('skipped (does not compile): ' .. rel)
+				body = nil
+			end
+		end
+		if type(body) == 'string' and body ~= '' and MERGE_LINES[rel] then
+			body = mergeLines(rel, body)
+		end
 		if type(body) == 'string' and body ~= '' then
 			if writeFile(rel, body) then
 				okCount += 1

@@ -1,0 +1,8 @@
+# Copy this file to PlayerTools/whitelist.txt (same folder as PlayerTools.lua).
+# Do NOT leave it named whitelist.example.txt — that file is ignored.
+# One Roblox USERNAME or UserId per line (not display name if you can avoid it).
+# You do not need to add yourself. Lines starting with # are ignored.
+
+# Example:
+# NickB926
+# 105008790

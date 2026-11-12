@@ -1,0 +1,4 @@
+# Extra whitelisted players (Roblox username or UserId, one per line).
+# GreyGhosta
+9551801
+paul6791

@@ -5,6 +5,7 @@
     Items / Wiki tab: snapshot Database.Items, wiki dumps (stats/buffs/icon/flags), aura chests, titling.
     HiveMind — pick a commanding client; others TP / follow / stack via Hive tab.
     Combat tab: auto skill + auto attack (same stack as AutoFarm).
+    Self tab: walkspeed, character size, and fly (noclip stays on with fly).
     Also launches Infinite Yield on start.
 
     Farm / vacuum / skills live in AutoFarm/AutoFarm.lua now
@@ -29,6 +30,12 @@
     Inventory / Items / HiveMind already use own function scopes; new tabs too.
 ]]
 
+-- Friend installs (GitHub updater writes PlayerTools/_friend_build): every toggle starts off.
+pcall(function()
+	if isfile('PlayerTools/_friend_build') then
+		getgenv().SB2FriendDefaultsOff = true
+	end
+end)
 -- Ataraxia-only chrome. Direct runs still force AtaraxiaLibrary.
 do
 	local g = getgenv()
@@ -225,7 +232,9 @@ do
 	-- unanchor into the void during teardown + holdCombatAnchor(4) boot.
 	if softReload then
 		g.SB2SoftReloadPreserveFlight = true
-		g.SB2SoftReloadHadAnchor = g.SB2CombatAnchorOn == true
+		-- Combat Anchor is retired. Never carry the lock across a reload.
+		g.SB2CombatAnchorOn = false
+		g.SB2SoftReloadHadAnchor = false
 		g.SB2SoftReloadHadBoss = g.SB2BossRouteWanted == true
 		g.SB2SoftReloadHadAutoAttack = g.SB2AutoAttackOn == true
 		-- AutoSkill has no durable genv bool; connection presence is the live signal.
@@ -466,6 +475,27 @@ do
 	g.SB2PlayerToolsInstanceAt = os.clock()
 end
 
+-- Join logs before IY HttpGet (that yield is why JL used to miss the load screen).
+pcall(function()
+	if getgenv().SB2JoinLogsGui and getgenv().SB2JoinLogsGui.Parent then
+		getgenv().SB2JoinLogsReady = true
+		return
+	end
+	if getgenv().SB2JoinLogsReady == true then
+		return
+	end
+	local path = (type(isfile) == 'function' and isfile('PlayerTools/JoinLogsEarly.lua') and 'PlayerTools/JoinLogsEarly.lua')
+		or (type(isfile) == 'function' and isfile('PlayerTools/JoinLogs.iy') and 'PlayerTools/JoinLogs.iy')
+		or (type(isfile) == 'function' and isfile('JoinLogs.iy') and 'JoinLogs.iy')
+	if not path or type(readfile) ~= 'function' then
+		return
+	end
+	local fn = (loadstring or load)(readfile(path), path)
+	if fn then
+		fn()
+	end
+end)
+
 -- Infinite Yield — load before PlayerTools UI (skip if already running).
 pcall(function()
 	if getgenv().IY_LOADED or getgenv().IYLoaded or getgenv().loadedIY or IY_LOADED then
@@ -523,7 +553,7 @@ local CONFIG = {
 }
 
 -- Shown in console on full load (confirms workspace read the synced file, not stale copy).
-getgenv().SB2PlayerToolsLocalBuild = 'self-tab-fly-v2'
+getgenv().SB2PlayerToolsLocalBuild = 'tempest-lightning-v1'
 getgenv().SB2WaveKillTargetUILoaded = false
 getgenv().SB2BetweenPartyUILoaded = false
 pcall(function()
@@ -607,6 +637,7 @@ local OWN_ALT_USERIDS = {
 	[11025682106] = true, -- SB2ButOnlyTrading
 	[285463210] = true, -- 62qx
 	[1099119770] = true, -- aormai
+	[9551801] = true, -- GreyGhosta
 }
 local function normalizeAltKey(raw)
 	-- Only for per-account profile filenames — whitelist itself is UserId-based.
@@ -939,11 +970,6 @@ local unloadExisting = function()
 			getgenv().SB2SetAnchorPlayerNoclip(false)
 		end
 	end)
-	pcall(function()
-		if type(getgenv().SB2SelfFlyStop) == 'function' then
-			getgenv().SB2SelfFlyStop()
-		end
-	end)
 	-- Soft-reload path: kill anim ghosts again after GUI teardown (boot kill may race).
 	pcall(function()
 		if type(getgenv().SB2AnimSwapStop) == 'function' then
@@ -992,9 +1018,7 @@ local unloadExisting = function()
 					hrp.AssemblyAngularVelocity = Vector3.zero
 				end
 			end)
-			if getgenv().SB2SoftReloadHadAnchor == true then
-				getgenv().SB2CombatAnchorOn = true
-			end
+			getgenv().SB2CombatAnchorOn = false
 		else
 			getgenv().SB2AutoAttackOn = false
 			getgenv().SB2CombatAnchorOn = false
@@ -1010,6 +1034,7 @@ local unloadExisting = function()
 		end
 		for _, key in ipairs({
 			'SB2AutoAttackConn',
+			'SB2AutoWalkConn',
 			'SB2AutoFloorDodgeConn',
 			'SB2WaveKillTargetConn',
 			'SB2CombatAnchorConn',
@@ -1110,9 +1135,7 @@ local unloadExisting = function()
 			if getgenv().SB2SoftReloadPreserveFlight == true then
 				-- false = stop loops but keep HRP anchored (no void drop).
 				pcall(getgenv().SB2StopCombatRuntime, false)
-				if getgenv().SB2SoftReloadHadAnchor == true then
-					getgenv().SB2CombatAnchorOn = true
-				end
+				getgenv().SB2CombatAnchorOn = false
 			else
 				getgenv().SB2StopCombatRuntime()
 			end
@@ -1194,7 +1217,7 @@ local unloadExisting = function()
 				end
 				for _, p in ipairs(char:GetDescendants()) do
 					if p:IsA('BasePart') then
-						if p.CollisionGroup == 'SB2DiveNoclip' then
+						if p.CollisionGroup == 'SB2DiveNoclip' or p.CollisionGroup == 'SB2SelfNoclip' then
 							p.CollisionGroup = 'Players'
 						end
 						if p.Name == 'HumanoidRootPart'
@@ -1587,7 +1610,8 @@ local ok, err = pcall(function()
 	-- retries, and never while another stub/load is already rebuilding (avoids
 	-- load→unload flash from stacked KeepPlayerTools + armTeleport stubs).
 	local TELEPORT_STUB =
-		"if isfile and isfile('PlayerTools/manual_unload') then local ok,b=pcall(readfile,'PlayerTools/manual_unload'); if ok and tostring(b)=='true' then return end end;"
+		"pcall(function() local p=(isfile and isfile('PlayerTools/JoinLogsEarly.lua') and 'PlayerTools/JoinLogsEarly.lua') or (isfile and isfile('PlayerTools/JoinLogs.iy') and 'PlayerTools/JoinLogs.iy') or (isfile and isfile('JoinLogs.iy') and 'JoinLogs.iy'); if p then local fn=(loadstring or load)(readfile(p),p); if fn then fn() end end end);"
+		.. "if isfile and isfile('PlayerTools/manual_unload') then local ok,b=pcall(readfile,'PlayerTools/manual_unload'); if ok and tostring(b)=='true' then return end end;"
 		.. "if getgenv().SB2PlayerToolsManualUnload then return end;"
 		.. "getgenv().SB2MenuHopGraceUntil=os.clock()+25;"
 		.. "getgenv().SB2UiKeeperQuietUntil=os.clock()+25;"
@@ -2010,22 +2034,20 @@ local ok, err = pcall(function()
 		if titleMenuVisible() then
 			return false
 		end
-		local model = LocalPlayer.Character
-		if not model or not model.Parent then
-			return false
-		end
-		local hrp = model:FindFirstChild('HumanoidRootPart')
-		local hum = model:FindFirstChildOfClass('Humanoid')
-		if not hrp or not hum or hum.Health <= 0 then
-			return false
-		end
-		local cam = workspace.CurrentCamera
-		if cam and (cam.CameraType == Enum.CameraType.Scriptable or cam.CameraType == Enum.CameraType.Fixed) then
-			if cam.CameraSubject ~= hum then
+		-- After reset, workspace.Characters can still hold the corpse while
+		-- LocalPlayer.Character is already the living spawn body. Either counts.
+		local chars = workspace:FindFirstChild('Characters')
+		local wsModel = chars and chars:FindFirstChild(LocalPlayer.Name)
+		local lpModel = LocalPlayer.Character
+		local function alive(m)
+			if not m or not m.Parent then
 				return false
 			end
+			local hrp = m:FindFirstChild('HumanoidRootPart')
+			local hum = m:FindFirstChildOfClass('Humanoid')
+			return hrp ~= nil and hum ~= nil and hum.Health > 0
 		end
-		return true
+		return alive(wsModel) or alive(lpModel)
 	end
 	getgenv().SB2InGameplayWorld = inGameplayWorld
 
@@ -2416,6 +2438,9 @@ local ok, err = pcall(function()
 		end
 
 		local function ensureDamageIndicatorsOn(reason)
+			if getgenv().SB2HitFxLiteOn == true then
+				return -- 'Hide hit effects' wants them off
+			end
 			local flag = getDamageIndicatorsSetting()
 			if flag and flag:IsA('BoolValue') and flag.Value ~= true then
 				flag.Value = true
@@ -2589,24 +2614,34 @@ local ok, err = pcall(function()
 	end
 
 	-- Must be Humanoid (not the Model) or SB2 camera goes void / underwater.
+	-- Never return a corpse: after Reset, Characters[Name] can linger at the death
+	-- spot while LocalPlayer.Character is already the living spawn model.
 	local cachedMyChar, cachedMyCharAt = nil, 0
+	local function characterModelAlive(model)
+		if not model or not model.Parent then
+			return false
+		end
+		local hrp = model:FindFirstChild('HumanoidRootPart')
+		local hum = model:FindFirstChildOfClass('Humanoid')
+		return hrp ~= nil and hum ~= nil and hum.Health > 0
+	end
 	local function getMyCharacterModel()
 		local now = os.clock()
-		if cachedMyChar and cachedMyChar.Parent and (now - cachedMyCharAt) < 0.12 then
+		if cachedMyChar and characterModelAlive(cachedMyChar) and (now - cachedMyCharAt) < 0.12 then
 			return cachedMyChar
 		end
 		local chars = workspace:FindFirstChild('Characters')
-		local model = chars and chars:FindFirstChild(LocalPlayer.Name)
-		if model and model.Parent then
-			cachedMyChar, cachedMyCharAt = model, now
-			return model
-		end
+		local wsModel = chars and chars:FindFirstChild(LocalPlayer.Name)
 		local lpChar = LocalPlayer.Character
-		if lpChar and lpChar.Parent then
+		if characterModelAlive(wsModel) then
+			cachedMyChar, cachedMyCharAt = wsModel, now
+			return wsModel
+		end
+		if characterModelAlive(lpChar) then
 			cachedMyChar, cachedMyCharAt = lpChar, now
 			return lpChar
 		end
-		if Character and Character.Parent then
+		if characterModelAlive(Character) then
 			cachedMyChar, cachedMyCharAt = Character, now
 			return Character
 		end
@@ -3594,29 +3629,35 @@ local ok, err = pcall(function()
 			getgenv().SB2ForceCamFix = nil
 		end
 		local ok = pcall(function()
+			local wasLocked = cam.CameraType == Enum.CameraType.Scriptable
+				or cam.CameraType == Enum.CameraType.Fixed
 			cam.CameraType = Enum.CameraType.Custom
 			cam.CameraSubject = subject
 			if diveCameraQuiet() then
 				return
 			end
 			local now = os.clock()
-			if not forceFix and (now - (tonumber(getgenv().SB2LastCamFixAt) or 0)) < 0.85 then
+			if not forceFix and not wasLocked and (now - (tonumber(getgenv().SB2LastCamFixAt) or 0)) < 0.85 then
 				return
 			end
 			getgenv().SB2LastCamFixAt = now
-			-- Repark void cam at origin only — never snap while the user is zoomed/panned out.
-			if hrp and (cam.CFrame.Position - hrp.Position).Magnitude > 60 then
-				if cam.CFrame.Position.Magnitude < 40 or cam.CameraSubject == nil then
-					local look = hrp.CFrame.LookVector
-					local flat = Vector3.new(look.X, 0, look.Z)
-					if flat.Magnitude < 0.05 then
-						flat = Vector3.new(0, 0, -1)
-					else
-						flat = flat.Unit
-					end
-					cam.CFrame = CFrame.new(hrp.Position + Vector3.new(0, 8, 0) - flat * 14, hrp.Position + Vector3.new(0, 2, 0))
-					cam.Focus = CFrame.new(hrp.Position)
+			if not hrp then
+				return
+			end
+			local dist = (cam.CFrame.Position - hrp.Position).Magnitude
+			-- Origin-only snap skipped death-reset: Scriptable death cam stays at the
+			-- corpse while the living body is already at spawn.
+			local atVoidOrigin = cam.CFrame.Position.Magnitude < 40
+			if dist > 40 and (forceFix or wasLocked or atVoidOrigin) then
+				local look = hrp.CFrame.LookVector
+				local flat = Vector3.new(look.X, 0, look.Z)
+				if flat.Magnitude < 0.05 then
+					flat = Vector3.new(0, 0, -1)
+				else
+					flat = flat.Unit
 				end
+				cam.CFrame = CFrame.new(hrp.Position + Vector3.new(0, 8, 0) - flat * 14, hrp.Position + Vector3.new(0, 2, 0))
+				cam.Focus = CFrame.new(hrp.Position)
 			end
 		end)
 		return ok
@@ -3686,6 +3727,9 @@ local ok, err = pcall(function()
 		if subject == nil or subject == char then
 			return true -- nil / Model subject = classic SB2 void cam
 		end
+		if typeof(subject) == 'Instance' and subject:IsA('Humanoid') and subject.Health <= 0 then
+			return true -- leftover death subject
+		end
 		if hum and subject ~= hum then
 			if subject:IsA('BasePart') and subject:IsDescendantOf(char) then
 				return false
@@ -3701,6 +3745,11 @@ local ok, err = pcall(function()
 				local dist = (cam.CFrame.Position - hrp.Position).Magnitude
 				-- Only treat as void when cam is stuck at world origin, not zoom/follow offset.
 				if dist > 60 and cp.Magnitude < 40 then
+					return true
+				end
+				-- After death, a camera left at the corpse is a legal 3000-zoom follow.
+				-- 28 studs is normal zoom — only treat a leftover death-spot as broken.
+				if (tonumber(getgenv().SB2DeathCamUntil) or 0) > os.clock() and dist > 120 then
 					return true
 				end
 			end
@@ -5361,8 +5410,6 @@ local ok, err = pcall(function()
 	local HomeBox = HomeTab:AddLeftGroupbox('Ataraxia')
 	assert(HomeBox, 'Home groupbox nil')
 
-	-- Reserve rail slot before Players (no extra outer local — 200-register cap).
-	Window:AddTab('Self', 'user')
 	local PlayersTab = Window:AddTab('Players', 'users')
 	local PlayersBox = PlayersTab:AddLeftGroupbox('Players')
 	assert(PlayersBox, 'AddLeftGroupbox returned nil')
@@ -5389,6 +5436,260 @@ local ok, err = pcall(function()
 		end
 		return folder
 	end
+
+	-- Session-only leftover Profiles. Live folder wins; leavers stay listed
+	-- with stats / kills. Inventory is not cloned on leave (10k+ items hitch).
+	-- Wiped when you leave or hop — never written to disk.
+	local profileMem = (function()
+		local function store()
+			local env = getgenv()
+			local job = tostring(game.JobId or '')
+			if env.SB2ProfileSnapsJob ~= job or type(env.SB2ProfileSnaps) ~= 'table' then
+				if type(env.SB2ProfileSnaps) == 'table' then
+					for _, inst in pairs(env.SB2ProfileSnaps) do
+						if typeof(inst) == 'Instance' then
+							pcall(inst.Destroy, inst)
+						end
+					end
+				end
+				env.SB2ProfileSnaps = {}
+				env.SB2ProfileSnapsJob = job
+			end
+			return env.SB2ProfileSnaps
+		end
+
+		local function isSnap(inst)
+			return typeof(inst) == 'Instance' and inst:GetAttribute('SB2Snap') == true
+		end
+
+		local function liveInFolder(name)
+			local folder = getProfilesFolder()
+			if not folder or type(name) ~= 'string' then
+				return nil
+			end
+			for _, child in ipairs(folder:GetChildren()) do
+				if child.Name == name and not isSnap(child) then
+					return child
+				end
+			end
+			return nil
+		end
+
+		local function snapsParent()
+			local rs = game:GetService('ReplicatedStorage')
+			local f = rs:FindFirstChild('SB2ProfileSnaps')
+			if f and f:IsA('Folder') then
+				return f
+			end
+			f = Instance.new('Folder')
+			f.Name = 'SB2ProfileSnaps'
+			f.Parent = rs
+			return f
+		end
+
+		local function snapshotOne(profile, allowOrphan)
+			if typeof(profile) ~= 'Instance' or isSnap(profile) then
+				return
+			end
+			if not allowOrphan and not profile.Parent then
+				return
+			end
+			if profile:IsA('LocalScript') or profile:IsA('ModuleScript') or profile:IsA('Script') then
+				return
+			end
+			local name = profile.Name
+			if type(name) ~= 'string' or name == '' then
+				return
+			end
+			if LocalPlayer and name == LocalPlayer.Name then
+				return
+			end
+			if liveInFolder(name) then
+				return
+			end
+			local snaps = store()
+			local prev = snaps[name]
+			if typeof(prev) == 'Instance' and prev:GetAttribute('SB2Snap') == true then
+				return
+			end
+			-- Copy each small child. Never Clone() the whole profile — Inventory
+			-- alone can be 10k+ instances and freezes the leave.
+			local clone = Instance.new('Folder')
+			clone.Name = name
+			pcall(function()
+				clone:SetAttribute('SB2Snap', true)
+			end)
+			for _, child in ipairs(profile:GetChildren()) do
+				if child.Name ~= 'Inventory'
+					and not child:IsA('LocalScript')
+					and not child:IsA('ModuleScript')
+					and not child:IsA('Script')
+				then
+					local ok, piece = pcall(child.Clone, child)
+					if ok and typeof(piece) == 'Instance' then
+						pcall(function()
+							piece.Parent = clone
+						end)
+					end
+				end
+			end
+			snaps[name] = clone
+			if prev and prev ~= clone and typeof(prev) == 'Instance' then
+				pcall(prev.Destroy, prev)
+			end
+		end
+
+		local function snapshotAll()
+			-- no-op: never mass-clone live profiles
+		end
+
+		local function park(name)
+			if type(name) ~= 'string' or name == '' then
+				return nil
+			end
+			local live = liveInFolder(name)
+			if live then
+				return live
+			end
+			local snap = store()[name]
+			if typeof(snap) == 'Instance' and snap:FindFirstChild('Inventory') then
+				local hold = snapsParent()
+				if snap.Parent ~= hold then
+					pcall(function()
+						snap:SetAttribute('SB2Snap', true)
+						snap.Parent = hold
+					end)
+				end
+				return snap
+			end
+			return nil
+		end
+
+		local function keepLeftover(profile)
+			if typeof(profile) ~= 'Instance' or isSnap(profile) then
+				return
+			end
+			snapshotOne(profile, true)
+		end
+
+		local function dropSnap(name)
+			if type(name) ~= 'string' or name == '' then
+				return
+			end
+			local snaps = store()
+			local snap = snaps[name]
+			snaps[name] = nil
+			if typeof(snap) == 'Instance' then
+				pcall(snap.Destroy, snap)
+			end
+			local folder = getProfilesFolder()
+			if folder then
+				for _, child in ipairs(folder:GetChildren()) do
+					if child.Name == name and isSnap(child) then
+						pcall(child.Destroy, child)
+					end
+				end
+			end
+		end
+
+		local function resolve(name)
+			if type(name) ~= 'string' or name == '' then
+				return nil
+			end
+			local live = liveInFolder(name)
+			if live then
+				return live
+			end
+			local snap = store()[name]
+			if typeof(snap) == 'Instance' then
+				return snap
+			end
+			local folder = getProfilesFolder()
+			if folder then
+				for _, child in ipairs(folder:GetChildren()) do
+					if child.Name == name and isSnap(child) then
+						return child
+					end
+				end
+			end
+			return nil
+		end
+
+		local function leftoverNames()
+			local names = {}
+			local seen = {}
+			for name, inst in pairs(store()) do
+				if type(name) == 'string' and name ~= '' and typeof(inst) == 'Instance' and not liveInFolder(name) then
+					seen[name] = true
+					names[#names + 1] = name
+				end
+			end
+			local folder = getProfilesFolder()
+			if folder then
+				for _, child in ipairs(folder:GetChildren()) do
+					if isSnap(child) and not seen[child.Name] and not liveInFolder(child.Name) then
+						seen[child.Name] = true
+						names[#names + 1] = child.Name
+					end
+				end
+			end
+			return names
+		end
+
+		local function isLive(name)
+			return liveInFolder(name) ~= nil
+		end
+
+		local function wipe()
+			local env = getgenv()
+			if type(env.SB2ProfileSnaps) == 'table' then
+				for _, inst in pairs(env.SB2ProfileSnaps) do
+					if typeof(inst) == 'Instance' then
+						pcall(inst.Destroy, inst)
+					end
+				end
+			end
+			env.SB2ProfileSnaps = {}
+			env.SB2ProfileSnapsJob = nil
+			local hold = game:GetService('ReplicatedStorage'):FindFirstChild('SB2ProfileSnaps')
+			if hold then
+				pcall(hold.Destroy, hold)
+			end
+		end
+
+		if not getgenv().SB2ProfileSnapLeaveHooked then
+			getgenv().SB2ProfileSnapLeaveHooked = true
+			local lp = Players.LocalPlayer
+			if lp then
+				pcall(function()
+					lp.OnTeleport:Connect(wipe)
+				end)
+				pcall(function()
+					Players.PlayerRemoving:Connect(function(plr)
+						if plr == lp then
+							wipe()
+						end
+					end)
+				end)
+			end
+			pcall(function()
+				game:BindToClose(wipe)
+			end)
+		end
+
+		return {
+			resolve = resolve,
+			snapshotAll = snapshotAll,
+			snapshotOne = snapshotOne,
+			leftoverNames = leftoverNames,
+			keepLeftover = keepLeftover,
+			dropSnap = dropSnap,
+			park = park,
+			isLive = isLive,
+			wipe = wipe,
+		}
+	end)()
+	getgenv().SB2KeepLeftover = profileMem.keepLeftover
 
 	local resolveProfileName = function(value)
 		if type(value) == 'string' and value ~= '' then
@@ -5435,10 +5736,62 @@ local ok, err = pcall(function()
 	end
 
 	local getSelectedProfile = function()
-		local name = getSelectedProfileName()
-		local folder = getProfilesFolder()
-		return name and folder and folder:FindFirstChild(name) or nil
+		return profileMem.resolve(getSelectedProfileName())
 	end
+
+	local liveOwnProfile = function()
+		local folder = getProfilesFolder()
+		local name = LocalPlayer and LocalPlayer.Name
+		if folder and name then
+			for _, child in ipairs(folder:GetChildren()) do
+				if child.Name == name and child:GetAttribute('SB2Snap') ~= true then
+					return child
+				end
+			end
+			local fallback = folder:FindFirstChild(name)
+			if fallback then
+				return fallback
+			end
+		end
+		if typeof(Profile) == 'Instance' then
+			return Profile
+		end
+		return nil
+	end
+
+	local pointInventoryAt = function(profile)
+		local invUI = RequiredServices and RequiredServices.InventoryUI
+		if not (invUI and type(invUI.GetInventoryData) == 'function') then
+			return false
+		end
+		if typeof(profile) ~= 'Instance' or not profile:FindFirstChild('Inventory') then
+			return false
+		end
+		pcall(debug.setupvalue, invUI.GetInventoryData, 2, profile)
+		local orig = getgenv().SB2OrigGetInventoryData
+		if type(orig) == 'function' then
+			pcall(debug.setupvalue, orig, 2, profile)
+		end
+		return true
+	end
+
+	local restoreOwnInventory = function()
+		getgenv().SB2InvViewName = nil
+		return pointInventoryAt(liveOwnProfile())
+	end
+
+	local applyInventoryView = function(profile)
+		if pointInventoryAt(profile) then
+			return true
+		end
+		restoreOwnInventory()
+		return false
+	end
+
+	if LocalPlayer then
+		pcall(profileMem.dropSnap, LocalPlayer.Name)
+	end
+	task.defer(restoreOwnInventory)
 
 	local getSelectedPlayer = function()
 		local name = getSelectedProfileName()
@@ -5566,8 +5919,7 @@ local ok, err = pcall(function()
 		if not name then
 			return nil
 		end
-		local folder = getProfilesFolder()
-		local profile = folder and folder:FindFirstChild(name)
+		local profile = profileMem.resolve(name)
 		if not profile then
 			return nil
 		end
@@ -5613,6 +5965,28 @@ local ok, err = pcall(function()
 			walkSpeed = hum and hum.WalkSpeed or nil
 		end
 
+		local skillNames = {}
+		local skillsFolder = profile:FindFirstChild('Skills')
+		if skillsFolder then
+			for _, child in ipairs(skillsFolder:GetChildren()) do
+				local skillName = child.Name
+				if child:IsA('ValueBase') and tostring(child.Value) ~= '' then
+					skillName = skillName .. ' (' .. tostring(child.Value) .. ')'
+				end
+				skillNames[#skillNames + 1] = skillName
+			end
+			table.sort(skillNames, function(a, b)
+				return a:lower() < b:lower()
+			end)
+		end
+		local function profileAttrNum(key)
+			local v = profile:GetAttribute(key)
+			if type(v) == 'number' then
+				return v
+			end
+			return tonumber(v) or 0
+		end
+
 		return {
 			profile = profile,
 			name = name,
@@ -5632,6 +6006,10 @@ local ok, err = pcall(function()
 			jumpHeight = hum and hum.JumpHeight or nil,
 			loaded = char ~= nil,
 			online = player ~= nil,
+			floorRemnants = profileAttrNum('Floor_Remnants'),
+			eliteKeys = profileAttrNum('Elite_Wave_Keys'),
+			runeCatalyst = profileAttrNum('Catalyst_Runes'),
+			skills = skillNames,
 		}
 	end
 
@@ -6503,8 +6881,7 @@ local ok, err = pcall(function()
 		if not name then
 			return nil
 		end
-		local folder = getProfilesFolder()
-		local profile = folder and folder:FindFirstChild(name)
+		local profile = profileMem.resolve(name)
 		local mobs = profile and profile:FindFirstChild('Mobs')
 		if not mobs then
 			return nil
@@ -6684,8 +7061,44 @@ local ok, err = pcall(function()
 		return bossTotal, bossRows, name
 	end
 
+	-- Egg Realm only. Exact names — "Killer Bunny" must not also count "Alpha Killer Bunny".
+	local EGG_REALM_KILL_NAMES = {
+		'Gemulite',
+		'Crystalite',
+		'Easterian Knight',
+		'Egg Mimic',
+		'Killer Bunny',
+		'Alpha Killer Bunny',
+	}
+	local EGG_REALM_KILL_KEYS = {}
+	for _, eggName in ipairs(EGG_REALM_KILL_NAMES) do
+		EGG_REALM_KILL_KEYS[normBossKillKey(eggName)] = eggName
+	end
+	local readPlayerEggRealmKills = function(playerOrName)
+		local total, rows, name = readPlayerMobKills(playerOrName)
+		if total == nil then
+			return nil
+		end
+		local byKey = {}
+		for _, row in ipairs(rows) do
+			local key = normBossKillKey(row.name)
+			if EGG_REALM_KILL_KEYS[key] then
+				byKey[key] = (byKey[key] or 0) + row.count
+			end
+		end
+		local eggRows = {}
+		local eggTotal = 0
+		for _, eggName in ipairs(EGG_REALM_KILL_NAMES) do
+			local count = byKey[normBossKillKey(eggName)] or 0
+			eggTotal += count
+			eggRows[#eggRows + 1] = { name = eggName, count = count }
+		end
+		return eggTotal, eggRows, name
+	end
+
 	local mobKillsBtn = nil
 	local bossKillsBtn = nil
+	local eggKillsBtn = nil
 	local refreshMobKillsButton = function()
 		if not (mobKillsBtn and mobKillsBtn.Parent) then
 			return
@@ -6720,6 +7133,24 @@ local ok, err = pcall(function()
 			return
 		end
 		bossKillsBtn.Text = 'Boss kills: ' .. formatNumber(total)
+	end
+
+	local refreshEggKillsButton = function()
+		if not (eggKillsBtn and eggKillsBtn.Parent) then
+			return
+		end
+		local name = getSelectedProfileName()
+			or resolveProfileName(Options.PlayerList and Options.PlayerList.Value)
+		if not name then
+			eggKillsBtn.Text = 'Egg realm kills'
+			return
+		end
+		local total = readPlayerEggRealmKills(name)
+		if type(total) ~= 'number' then
+			eggKillsBtn.Text = 'Egg realm kills'
+			return
+		end
+		eggKillsBtn.Text = 'Egg realm kills: ' .. formatNumber(total)
 	end
 
 	local showPlayerMobKills = function()
@@ -6785,13 +7216,23 @@ local ok, err = pcall(function()
 		Library:Notify('Scanning all profile kills…', 3)
 		task.spawn(function()
 			local rankings = {}
+			local seen = {}
 			for _, child in ipairs(folder:GetChildren()) do
 				if child:IsA('LocalScript') or child:IsA('ModuleScript') or child:IsA('Script') then
 					continue
 				end
+				seen[child.Name] = true
 				local total = readPlayerMobKills(child.Name)
 				if type(total) == 'number' then
 					rankings[#rankings + 1] = { name = child.Name, total = total }
+				end
+			end
+			for _, leftName in ipairs(profileMem.leftoverNames()) do
+				if not seen[leftName] then
+					local total = readPlayerMobKills(leftName)
+					if type(total) == 'number' then
+						rankings[#rankings + 1] = { name = leftName, total = total }
+					end
 				end
 			end
 			if #rankings == 0 then
@@ -6871,13 +7312,23 @@ local ok, err = pcall(function()
 		Library:Notify('Scanning all profile boss kills…', 3)
 		task.spawn(function()
 			local rankings = {}
+			local seen = {}
 			for _, child in ipairs(folder:GetChildren()) do
 				if child:IsA('LocalScript') or child:IsA('ModuleScript') or child:IsA('Script') then
 					continue
 				end
+				seen[child.Name] = true
 				local total = readPlayerBossKills(child.Name)
 				if type(total) == 'number' then
 					rankings[#rankings + 1] = { name = child.Name, total = total }
+				end
+			end
+			for _, leftName in ipairs(profileMem.leftoverNames()) do
+				if not seen[leftName] then
+					local total = readPlayerBossKills(leftName)
+					if type(total) == 'number' then
+						rankings[#rankings + 1] = { name = leftName, total = total }
+					end
 				end
 			end
 			if #rankings == 0 then
@@ -6974,7 +7425,39 @@ local ok, err = pcall(function()
 			'Accessory 1: ' .. info.accessory1,
 			'Accessory 2: ' .. info.accessory2,
 			'Companion: ' .. info.companion,
+			'',
+			'— currencies —',
+			'Floor Remnants: ' .. formatNumber(info.floorRemnants or 0),
+			'Elite Keys: ' .. formatNumber(info.eliteKeys or 0),
+			'Rune Catalyst: ' .. formatNumber(info.runeCatalyst or 0),
+			'',
+			'— skills —',
 		}
+		local function wrapSkillBlock(text, width)
+			width = width or 44
+			local out, line = {}, ''
+			for word in string.gmatch(text, '[^,]+') do
+				word = word:gsub('^%s+', ''):gsub('%s+$', '')
+				if word ~= '' then
+					local nextLine = line == '' and word or (line .. ', ' .. word)
+					if #nextLine > width and line ~= '' then
+						out[#out + 1] = line .. ','
+						line = word
+					else
+						line = nextLine
+					end
+				end
+			end
+			if line ~= '' then
+				out[#out + 1] = line
+			end
+			return table.concat(out, '\n')
+		end
+		if type(info.skills) == 'table' and #info.skills > 0 then
+			lines[#lines + 1] = wrapSkillBlock(table.concat(info.skills, ', '))
+		else
+			lines[#lines + 1] = '(none)'
+		end
 		if not info.loaded then
 			lines[#lines + 1] = '(character not loaded — regen/speed may be blank)'
 		end
@@ -6985,23 +7468,37 @@ local ok, err = pcall(function()
 		Text = 'Profiles',
 		Values = {},
 		AllowNull = true,
-		-- Names from ReplicatedStorage.Profiles (not live Players:GetPlayers).
+		-- Live Profiles first, then people who left this server session.
 	})
+	PlayersBox:AddLabel('Left players stay listed until you leave')
 	local function refreshPlayerListDropdown()
 		local ok, err = pcall(function()
 			local list = {}
 			local folder = getProfilesFolder()
-			if not folder then
-				return
-			end
-			for _, child in ipairs(folder:GetChildren()) do
-				if not child:IsA('LocalScript') and not child:IsA('ModuleScript') and not child:IsA('Script') then
-					list[#list + 1] = child.Name
+			if folder then
+				for _, child in ipairs(folder:GetChildren()) do
+					if not child:GetAttribute('SB2Snap')
+						and not child:IsA('LocalScript')
+						and not child:IsA('ModuleScript')
+						and not child:IsA('Script')
+					then
+						list[#list + 1] = child.Name
+					end
 				end
+				table.sort(list, function(a, b)
+					return a:lower() < b:lower()
+				end)
 			end
-			table.sort(list, function(a, b)
+			local left = profileMem.leftoverNames()
+			table.sort(left, function(a, b)
 				return a:lower() < b:lower()
 			end)
+			for _, name in ipairs(left) do
+				list[#list + 1] = name
+			end
+			if #list == 0 then
+				return
+			end
 			if not playerListDropdown or type(playerListDropdown.SetValues) ~= 'function' then
 				return
 			end
@@ -7061,10 +7558,28 @@ local ok, err = pcall(function()
 		end
 		Profiles = folder
 		refreshPlayerListDropdown()
-		folder.ChildAdded:Connect(function()
+		folder.ChildAdded:Connect(function(child)
+			if child:GetAttribute('SB2Snap') then
+				return
+			end
+			pcall(profileMem.dropSnap, child.Name)
+			if getgenv().SB2InvViewName == child.Name then
+				applyInventoryView(child)
+			end
 			task.defer(refreshPlayerListDropdown)
 		end)
-		folder.ChildRemoved:Connect(function()
+		folder.ChildRemoved:Connect(function(child)
+			if child:GetAttribute('SB2Snap') then
+				return
+			end
+			local keep = getgenv().SB2KeepLeftover or profileMem.keepLeftover
+			pcall(keep, child)
+			if isToggleOn('ViewPlayersInventory') and getSelectedProfileName() == child.Name then
+				local parked = profileMem.park(child.Name)
+				if not applyInventoryView(parked) then
+					restoreOwnInventory()
+				end
+			end
 			task.defer(refreshPlayerListDropdown)
 		end)
 	end)
@@ -7078,18 +7593,16 @@ local ok, err = pcall(function()
 			getgenv().SB2SpectateTargetName = name
 		end
 
-		local folder = getProfilesFolder()
-		local profile = name and folder and folder:FindFirstChild(name)
-		if RequiredServices
-			and isToggleOn('ViewPlayersInventory')
-			and RequiredServices.InventoryUI
-			and RequiredServices.InventoryUI.GetInventoryData
-			and profile
-		then
-			debug.setupvalue(RequiredServices.InventoryUI.GetInventoryData, 2, profile)
+		if isToggleOn('ViewPlayersInventory') then
+			getgenv().SB2InvViewName = name
+			local profile = name and profileMem.park(name) or profileMem.resolve(name)
+			if not applyInventoryView(profile) then
+				Library:Notify((name or 'That player') .. ' — no saved inventory')
+			end
 		end
 		refreshMobKillsButton()
 		refreshBossKillsButton()
+		refreshEggKillsButton()
 	end)
 
 	PlayersBox:AddButton('Refresh profiles', refreshPlayerListDropdown)
@@ -7242,6 +7755,52 @@ local ok, err = pcall(function()
 	end)
 	PlayersBox:AddButton('All boss kills', function()
 		showAllProfilesBossKills()
+	end)
+
+	local showPlayerEggRealmKills = function()
+		local name = getSelectedProfileName()
+		if not name then
+			Library:Notify('Select a player first', 8, true)
+			return
+		end
+		local total, rows = readPlayerEggRealmKills(name)
+		if total == nil then
+			Library:Notify(name .. ' — egg realm kills unavailable', 8, true)
+			return
+		end
+		local lines = {
+			('EGG REALM(%d)'):format(total),
+		}
+		for _, row in ipairs(rows) do
+			lines[#lines + 1] = ('%s(%d)'):format(row.name, row.count)
+		end
+		local text = table.concat(lines, '\n')
+		local copied = copyTextToClipboard(text)
+		Library:Notify(name .. ' — egg realm kills\n' .. text, 14, true)
+		refreshEggKillsButton()
+		if copied then
+			task.defer(function()
+				Library:Notify('Copied egg realm kills to clipboard', 4)
+			end)
+		else
+			task.defer(function()
+				Library:Notify('Clipboard unavailable', 4)
+			end)
+		end
+	end
+
+	eggKillsBtn = PlayersBox:AddButton('Egg realm kills', function()
+		showPlayerEggRealmKills()
+	end)
+	pcall(function()
+		eggKillsBtn.TextTruncate = Enum.TextTruncate.AtEnd
+	end)
+	task.defer(refreshEggKillsButton)
+	task.spawn(function()
+		while eggKillsBtn and eggKillsBtn.Parent do
+			refreshEggKillsButton()
+			task.wait(2)
+		end
 	end)
 
 	PlayersBox:AddLabel('Wiki hitbox')
@@ -7467,24 +8026,27 @@ local ok, err = pcall(function()
 	then
 		PlayersBox:AddToggle('ViewPlayersInventory', { Text = 'Inventory' }):OnChanged(function(value)
 			if not value then
-				debug.setupvalue(RequiredServices.InventoryUI.GetInventoryData, 2, Profile)
+				restoreOwnInventory()
 				return
 			end
 
 			local name = getSelectedProfileName()
 				or resolveProfileName(Options.PlayerList and Options.PlayerList.Value)
-			local folder = getProfilesFolder()
-			local profile = name and folder and folder:FindFirstChild(name)
-			if not profile then
-				Library:Notify('Select a profile first')
+			getgenv().SB2InvViewName = name
+			local profile = name and profileMem.park(name) or nil
+			if not applyInventoryView(profile) then
+				Library:Notify((name or 'That player') .. ' — no saved inventory')
+				restoreOwnInventory()
 				if Toggles.ViewPlayersInventory then
 					Toggles.ViewPlayersInventory:SetValue(false)
 				end
 				return
 			end
-
-			debug.setupvalue(RequiredServices.InventoryUI.GetInventoryData, 2, profile)
-			Library:Notify('Open your inventory in-game to view ' .. name .. "'s items")
+			if profileMem.isLive(name) then
+				Library:Notify('Open your inventory in-game to view ' .. name .. "'s items")
+			else
+				Library:Notify('Open your inventory in-game to view ' .. name .. "'s last items")
+			end
 		end)
 	else
 		PlayersBox:AddLabel('Inventory viewing unavailable')
@@ -8212,7 +8774,7 @@ local ok, err = pcall(function()
 		end)
 
 		-- Must match SERVER_HOP_UI_VER in ServerHop.iy (server list on floor click).
-		local SERVER_HOP_PT_VER = 9
+		local SERVER_HOP_PT_VER = 11
 		local SERVER_HOP_PATHS = {
 			'PlayerTools/ServerHop.iy',
 			'ServerHop.iy',
@@ -8238,7 +8800,7 @@ local ok, err = pcall(function()
 		end
 
 		local function ensureServerHopPlugin()
-			local expected = tonumber(getgenv().SB2ServerHopUiVerExpected) or SERVER_HOP_PT_VER
+			local expected = math.max(SERVER_HOP_PT_VER, tonumber(getgenv().SB2ServerHopUiVerExpected) or 0)
 			local ver = tonumber(getgenv().SB2ServerHopUiVer) or 0
 			local hasBrowse = type(getgenv().SB2ServerHopBrowseFloor) == 'function'
 			local hasOpen = type(getgenv().SB2ServerHopOpenGui) == 'function'
@@ -8251,8 +8813,8 @@ local ok, err = pcall(function()
 				if type(isfile) == 'function' and isfile(path) and type(readfile) == 'function' then
 					local okRead, src = pcall(readfile, path)
 					if okRead and type(src) == 'string' and #src > 200 then
-						if not string.find(src, 'SERVER_HOP_UI_VER = 9', 1, true) then
-							warn('[PlayerTools] ServerHop.iy outdated (need UI v9): ', path)
+						if not string.find(src, 'SERVER_HOP_UI_VER = 11', 1, true) then
+							warn('[PlayerTools] ServerHop.iy outdated (need UI v11): ', path)
 						end
 						local fn, err = (loadstring or load)(src, path)
 						if fn then
@@ -8289,6 +8851,46 @@ local ok, err = pcall(function()
 		getgenv().SB2EnsureServerHopPlugin = ensureServerHopPlugin
 		task.defer(function()
 			pcall(ensureServerHopPlugin)
+			pcall(function()
+				local paths = {
+					'PlayerTools/Tracers.iy',
+					'Tracers.iy',
+					'scripts/PlayerTools/Tracers.iy',
+					'PlayerTools/scripts/Tracers.iy',
+				}
+				for _, path in ipairs(paths) do
+					if type(isfile) == 'function' and isfile(path) and type(readfile) == 'function' then
+						local okRead, src = pcall(readfile, path)
+						if okRead and type(src) == 'string' and string.find(src, 'SB2TracersToggle', 1, true) then
+							local fn = (loadstring or load)(src, path)
+							if fn then
+								pcall(fn)
+							end
+							return
+						end
+					end
+				end
+			end)
+			pcall(function()
+				local paths = {
+					'PlayerTools/CheaterWatch.iy',
+					'CheaterWatch.iy',
+					'scripts/PlayerTools/CheaterWatch.iy',
+					'PlayerTools/scripts/CheaterWatch.iy',
+				}
+				for _, path in ipairs(paths) do
+					if type(isfile) == 'function' and isfile(path) and type(readfile) == 'function' then
+						local okRead, src = pcall(readfile, path)
+						if okRead and type(src) == 'string' and string.find(src, 'SB2CheaterWatchToggle', 1, true) then
+							local fn = (loadstring or load)(src, path)
+							if fn then
+								pcall(fn)
+							end
+							return
+						end
+					end
+				end
+			end)
 		end)
 
 		JoinBox:AddButton('Browse floor servers', function()
@@ -8317,47 +8919,763 @@ local ok, err = pcall(function()
 		end)
 	end
 
-	-- Self tab lives in PlayerTools/Self.lua (own register budget).
+	-- Self tab: your character. Own function so these locals stay off the outer 200-register budget.
 	;(function()
-		local compile = loadstring or load
-		if type(compile) ~= 'function' or type(readfile) ~= 'function' then
-			warn('[PlayerTools] Self tab skipped: compile/readfile missing')
-			return
+		local SelfTab = Window:AddTab('Self', 'user')
+		assert(SelfTab, 'Self tab nil')
+
+	-- Walkspeed (local character). Default comes from the same place View stats reads
+	-- (character Walkspeed attribute / Humanoid), not a hardcoded 16.
+	do
+		local FALLBACK_WALKSPEED = 16
+		local WalkBox = SelfTab:AddLeftGroupbox('Walkspeed')
+		assert(WalkBox, 'Walkspeed groupbox nil')
+
+		local function myCharacter()
+			local char = LocalPlayer.Character
+			if not char then
+				local folder = workspace:FindFirstChild('Characters')
+				char = folder and folder:FindFirstChild(LocalPlayer.Name)
+			end
+			return char
 		end
-		local loaded = false
-		for _, modPath in ipairs({ 'PlayerTools/Self.lua', 'Self.lua' }) do
-			local exists = type(isfile) ~= 'function' or isfile(modPath)
-			if exists then
-				local okRead, src = pcall(readfile, modPath)
-				if okRead and type(src) == 'string' and src ~= '' then
-					local fn, err = compile(src, modPath)
-					if not fn then
-						warn('[PlayerTools] Self.lua compile failed: ', err)
-					else
-						local ok, result = pcall(fn)
-						if ok and type(result) == 'function' then
-							ok, result = pcall(result, {
-								Window = Window,
-								Library = Library,
-								Options = Options,
-								LocalPlayer = LocalPlayer,
-								readPlayerStats = readPlayerStats,
-								getMyCharacterModel = getMyCharacterModel,
-								safeConnect = safeConnect,
-							})
+
+		local function myHumanoid()
+			local char = myCharacter()
+			return char and char:FindFirstChildOfClass('Humanoid')
+		end
+
+		-- Same source as readPlayerStats / View stats (attribute first = game default).
+		local function getDefaultWalkSpeed()
+			local char = myCharacter()
+			if char then
+				local attr = char:GetAttribute('Walkspeed') or char:GetAttribute('WalkSpeed')
+				if type(attr) == 'number' and attr > 0 then
+					return math.clamp(attr, 1, 500)
+				end
+			end
+			local info = readPlayerStats(LocalPlayer.Name)
+			if info and type(info.walkSpeed) == 'number' and info.walkSpeed > 0 then
+				return math.clamp(info.walkSpeed, 1, 500)
+			end
+			local hum = myHumanoid()
+			if hum and type(hum.WalkSpeed) == 'number' and hum.WalkSpeed > 0 and not getgenv().SB2WalkSpeedWant then
+				return math.clamp(hum.WalkSpeed, 1, 500)
+			end
+			return FALLBACK_WALKSPEED
+		end
+
+		local function applyWalkSpeed(spd, pin)
+			spd = math.clamp(tonumber(spd) or getDefaultWalkSpeed(), 1, 500)
+			local hum = myHumanoid()
+			if hum then
+				pcall(function()
+					hum.WalkSpeed = spd
+				end)
+			end
+			if pin then
+				getgenv().SB2WalkSpeedWant = spd
+			else
+				getgenv().SB2WalkSpeedWant = nil
+			end
+		end
+
+		local initialDefault = getDefaultWalkSpeed()
+
+		WalkBox:AddSlider('WalkSpeed', {
+			Text = 'Walkspeed',
+			Default = initialDefault,
+			Min = 1,
+			Max = 500,
+			Rounding = 0,
+			Tooltip = 'Your character walkspeed (1–500). Default uses the same Walkspeed value as View stats.',
+		}):OnChanged(function(value)
+			local base = getDefaultWalkSpeed()
+			local spd = math.clamp(tonumber(value) or base, 1, 500)
+			applyWalkSpeed(spd, math.abs(spd - base) > 0.05)
+		end)
+
+		WalkBox:AddButton('Default walkspeed', function()
+			local base = getDefaultWalkSpeed()
+			if Options.WalkSpeed and type(Options.WalkSpeed.SetValue) == 'function' then
+				pcall(function()
+					Options.WalkSpeed:SetValue(base)
+				end)
+			end
+			applyWalkSpeed(base, false)
+			Library:Notify('Walkspeed → ' .. tostring(base) .. ' (default)')
+		end)
+
+		getgenv().SB2WalkSpeedWant = nil
+		local walkGen = (tonumber(getgenv().SB2WalkSpeedGen) or 0) + 1
+		getgenv().SB2WalkSpeedGen = walkGen
+		task.spawn(function()
+			while getgenv().SB2WalkSpeedGen == walkGen do
+				if getgenv().SB2PlayerToolsManualUnload == true then
+					break
+				end
+				local want = tonumber(getgenv().SB2WalkSpeedWant)
+				if want then
+					local hum = myHumanoid()
+					if hum and math.abs((hum.WalkSpeed or 0) - want) > 0.05 then
+						pcall(function()
+							hum.WalkSpeed = want
+						end)
+					end
+				end
+				task.wait(0.12)
+			end
+		end)
+
+		pcall(function()
+			safeConnect(LocalPlayer.CharacterAdded, function()
+				task.defer(function()
+					local want = tonumber(getgenv().SB2WalkSpeedWant)
+					if want then
+						applyWalkSpeed(want, true)
+					end
+				end)
+			end)
+		end)
+	end
+
+	-- Local character scale (Model:ScaleTo + Humanoid body scales when available).
+	do
+		local MIN_CHAR_SCALE = 0.35
+		local MAX_CHAR_SCALE = 1.5
+		local ScaleBox = SelfTab:AddRightGroupbox('Character size')
+		assert(ScaleBox, 'Character size groupbox nil')
+
+		local function resolveCharForScale()
+			return getMyCharacterModel() or LocalPlayer.Character
+		end
+
+		local function clearScaleBaselines()
+			getgenv().SB2HumanoidScaleBase = nil
+			getgenv().SB2CharacterScaleModelId = nil
+		end
+
+		local function captureHumanoidBaselines(hum)
+			if not hum then
+				return
+			end
+			local model = hum.Parent
+			local modelId = model and model:GetFullName() or ''
+			if getgenv().SB2CharacterScaleModelId ~= modelId then
+				clearScaleBaselines()
+				getgenv().SB2CharacterScaleModelId = modelId
+			end
+			if type(getgenv().SB2HumanoidScaleBase) == 'table' then
+				return
+			end
+			local base = {}
+			for _, prop in ipairs({ 'BodyHeightScale', 'BodyWidthScale', 'BodyDepthScale', 'HeadScale' }) do
+				local v = hum[prop]
+				if type(v) == 'number' then
+					base[prop] = v
+				end
+			end
+			if type(hum.HipHeight) == 'number' then
+				base.HipHeight = hum.HipHeight
+			end
+			getgenv().SB2HumanoidScaleBase = base
+		end
+
+		local function applyHumanoidScale(hum, scale)
+			if not hum then
+				return
+			end
+			captureHumanoidBaselines(hum)
+			local base = getgenv().SB2HumanoidScaleBase
+			if type(base) ~= 'table' then
+				return
+			end
+			for _, prop in ipairs({ 'BodyHeightScale', 'BodyWidthScale', 'BodyDepthScale', 'HeadScale' }) do
+				local b = base[prop]
+				if type(b) == 'number' and type(hum[prop]) == 'number' then
+					pcall(function()
+						hum[prop] = b * scale
+					end)
+				end
+			end
+			if type(base.HipHeight) == 'number' then
+				pcall(function()
+					hum.HipHeight = base.HipHeight * scale
+				end)
+			end
+		end
+
+		local function resetCharacterScaleVisual()
+			local model = resolveCharForScale()
+			local hum = model and model:FindFirstChildOfClass('Humanoid')
+			local base = getgenv().SB2HumanoidScaleBase
+			pcall(function()
+				if model and typeof(model.ScaleTo) == 'function' then
+					model:ScaleTo(1)
+				end
+			end)
+			if hum and type(base) == 'table' then
+				for key, val in pairs(base) do
+					if type(val) == 'number' and type(hum[key]) == 'number' then
+						pcall(function()
+							hum[key] = val
+						end)
+					end
+				end
+			end
+			clearScaleBaselines()
+		end
+
+		local function applyCharacterScale(scale, pin)
+			scale = math.clamp(tonumber(scale) or 1, MIN_CHAR_SCALE, MAX_CHAR_SCALE)
+			if math.abs(scale - 1) <= 0.02 then
+				resetCharacterScaleVisual()
+				getgenv().SB2CharacterScaleWant = nil
+				return true
+			end
+
+			local model = resolveCharForScale()
+			if not model then
+				return false
+			end
+			local hum = model:FindFirstChildOfClass('Humanoid')
+
+			pcall(function()
+				if typeof(model.ScaleTo) == 'function' then
+					model:ScaleTo(scale)
+				end
+			end)
+			applyHumanoidScale(hum, scale)
+
+			if pin ~= false then
+				getgenv().SB2CharacterScaleWant = scale
+			else
+				getgenv().SB2CharacterScaleWant = nil
+			end
+			return true
+		end
+
+		ScaleBox:AddSlider('CharacterScale', {
+			Text = 'Scale',
+			Default = 1,
+			Min = MIN_CHAR_SCALE,
+			Max = MAX_CHAR_SCALE,
+			Rounding = 2,
+			Compact = true,
+			Tooltip = 'Shrink or grow your character (local). SB2 may snap back — this re-applies while pinned.',
+		}):OnChanged(function(value)
+			applyCharacterScale(value, true)
+		end)
+
+		ScaleBox:AddButton('Normal size (1.0)', function()
+			if Options.CharacterScale and type(Options.CharacterScale.SetValue) == 'function' then
+				pcall(function()
+					Options.CharacterScale:SetValue(1)
+				end)
+			end
+			resetCharacterScaleVisual()
+			getgenv().SB2CharacterScaleWant = nil
+			Library:Notify('Character scale reset')
+		end)
+
+		getgenv().SB2CharacterScaleWant = nil
+		local scaleGen = (tonumber(getgenv().SB2CharacterScaleGen) or 0) + 1
+		getgenv().SB2CharacterScaleGen = scaleGen
+		task.spawn(function()
+			while getgenv().SB2CharacterScaleGen == scaleGen do
+				if getgenv().SB2PlayerToolsManualUnload == true then
+					break
+				end
+				local want = tonumber(getgenv().SB2CharacterScaleWant)
+				if want then
+					local model = resolveCharForScale()
+					if model then
+						pcall(function()
+							if typeof(model.GetScale) == 'function' and typeof(model.ScaleTo) == 'function' then
+								local cur = model:GetScale()
+								if math.abs(cur - want) > 0.04 then
+									model:ScaleTo(want)
+								end
+							end
+						end)
+						local hum = model:FindFirstChildOfClass('Humanoid')
+						if hum then
+							applyHumanoidScale(hum, want)
 						end
-						if ok then
-							loaded = true
-							break
+					end
+				end
+				task.wait(0.2)
+			end
+		end)
+
+		pcall(function()
+			safeConnect(LocalPlayer.CharacterAdded, function()
+				clearScaleBaselines()
+				task.defer(function()
+					local want = tonumber(getgenv().SB2CharacterScaleWant)
+					if want then
+						applyCharacterScale(want, true)
+					end
+				end)
+			end)
+		end)
+
+		-- SB2 body lives under workspace.Characters — re-apply when that model respawns.
+		task.spawn(function()
+			local lastName = nil
+			while getgenv().SB2CharacterScaleGen == scaleGen do
+				if getgenv().SB2PlayerToolsManualUnload == true then
+					break
+				end
+				local model = resolveCharForScale()
+				local name = model and model.Name
+				if name and name ~= lastName then
+					lastName = name
+					clearScaleBaselines()
+					local want = tonumber(getgenv().SB2CharacterScaleWant)
+					if want then
+						task.defer(function()
+							applyCharacterScale(want, true)
+						end)
+					end
+				end
+				task.wait(0.35)
+			end
+		end)
+	end
+
+	-- Infinite Yield style fly. One toggle: fly on also keeps noclip on.
+	-- WASD relative to the camera, E/Space up, Q/Ctrl down. Speed 1 = 50 studs/s.
+	do
+		local UserInputService = game:GetService('UserInputService')
+		local RunService = game:GetService('RunService')
+		local PhysicsService = game:GetService('PhysicsService')
+		local FLY_GROUP = 'SB2SelfNoclip'
+		local SPEED_PER_UNIT = 50
+		local flyGroupReady = false
+		local flySaved = setmetatable({}, { __mode = 'k' })
+
+		local function prevStop()
+			local fn = getgenv().SB2SelfFlyStop
+			if type(fn) == 'function' then
+				getgenv().SB2SelfFlyStop = nil
+				pcall(fn)
+			end
+		end
+		prevStop()
+
+		local function flyModels()
+			local models = {}
+			local seen = {}
+			local function add(model)
+				if model and model.Parent and not seen[model] then
+					seen[model] = true
+					models[#models + 1] = model
+				end
+			end
+			add(getMyCharacterModel())
+			add(LocalPlayer.Character)
+			return models
+		end
+
+		local function flyRoot()
+			local model = getMyCharacterModel() or LocalPlayer.Character
+			if not model then
+				return nil, nil, nil
+			end
+			local hrp = model:FindFirstChild('HumanoidRootPart') or model.PrimaryPart
+			local hum = model:FindFirstChildOfClass('Humanoid')
+			return model, hrp, hum
+		end
+
+		local function isCorePart(part)
+			local name = part.Name
+			return name == 'HumanoidRootPart'
+				or name == 'UpperTorso'
+				or name == 'LowerTorso'
+				or name == 'Torso'
+				or name == 'Head'
+		end
+
+		local function ensureFlyGroup()
+			if flyGroupReady then
+				return
+			end
+			pcall(function()
+				PhysicsService:RegisterCollisionGroup(FLY_GROUP)
+			end)
+			pcall(function()
+				PhysicsService:CreateCollisionGroup(FLY_GROUP)
+			end)
+			for _, other in ipairs({
+				'Default',
+				'Players',
+				'Characters',
+				'Mobs',
+				'MobsNoCollision',
+				'Mob',
+				'Enemies',
+				'Map',
+				'World',
+				'Terrain',
+				'Water',
+				'Collision',
+			}) do
+				pcall(function()
+					PhysicsService:CollisionGroupSetCollidable(FLY_GROUP, other, false)
+				end)
+			end
+			pcall(function()
+				PhysicsService:CollisionGroupSetCollidable(FLY_GROUP, FLY_GROUP, false)
+			end)
+			flyGroupReady = true
+		end
+
+		local function applyFlyNoclip()
+			ensureFlyGroup()
+			for _, model in ipairs(flyModels()) do
+				for _, child in ipairs(model:GetDescendants()) do
+					if child:IsA('BasePart') then
+						if flySaved[child] == nil then
+							local group = 'Players'
+							pcall(function()
+								local current = child.CollisionGroup
+								if type(current) == 'string' and current ~= '' and current ~= FLY_GROUP then
+									group = current
+								end
+							end)
+							flySaved[child] = {
+								collide = child.CanCollide == true,
+								group = group,
+							}
 						end
-						warn('[PlayerTools] Self.lua init failed: ', result)
+						child.CanCollide = false
+						child.CanTouch = false
+						pcall(function()
+							child.CollisionGroup = FLY_GROUP
+						end)
 					end
 				end
 			end
 		end
-		if not loaded then
-			warn('[PlayerTools] Self.lua missing — put it next to PlayerTools_Obsidian.lua')
+
+		local function restoreFlyNoclip()
+			for part, info in pairs(flySaved) do
+				if part and part.Parent and part:IsA('BasePart') then
+					local group = info.group
+					if type(group) ~= 'string' or group == '' or group == FLY_GROUP or group == 'SB2DiveNoclip' then
+						group = 'Players'
+					end
+					pcall(function()
+						part.CollisionGroup = group
+					end)
+					if isCorePart(part) then
+						part.CanCollide = true
+					else
+						part.CanCollide = info.collide == true
+					end
+					part.CanTouch = true
+				end
+			end
+			table.clear(flySaved)
 		end
+
+		local function setFlyHumanoid(hum, on)
+			if not hum then
+				return
+			end
+			pcall(function()
+				if on then
+					hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+					hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+					hum.Sit = false
+					hum.PlatformStand = true
+					hum.AutoRotate = false
+				else
+					hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+					hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+					hum.PlatformStand = false
+					hum.AutoRotate = true
+					local state = hum:GetState()
+					if state == Enum.HumanoidStateType.PlatformStanding or state == Enum.HumanoidStateType.Physics then
+						if hum.FloorMaterial ~= Enum.Material.Air then
+							hum:ChangeState(Enum.HumanoidStateType.Running)
+						else
+							hum:ChangeState(Enum.HumanoidStateType.Freefall)
+						end
+					end
+				end
+			end)
+		end
+
+		local function flySpeedStuds()
+			local unit = tonumber(getgenv().SB2SelfFlySpeed) or 1
+			return math.clamp(unit, 1, 10) * SPEED_PER_UNIT
+		end
+
+		local function ensureFlyVelocity(hrp)
+			local att = hrp:FindFirstChild('SB2SelfFlyAtt')
+			if not att then
+				att = Instance.new('Attachment')
+				att.Name = 'SB2SelfFlyAtt'
+				att.Parent = hrp
+			end
+			local lv = getgenv().SB2SelfFlyVel
+			if not lv or lv.Parent == nil then
+				if lv then
+					pcall(function()
+						lv:Destroy()
+					end)
+				end
+				lv = Instance.new('LinearVelocity')
+				lv.Name = 'SB2SelfFlyVel'
+				lv.MaxForce = 1e6
+				lv.RelativeTo = Enum.ActuatorRelativeTo.World
+				lv.VectorVelocity = Vector3.zero
+				getgenv().SB2SelfFlyVel = lv
+			end
+			lv.Attachment0 = att
+			lv.Parent = hrp
+			return lv
+		end
+
+		local function clearFlyVelocity()
+			local lv = getgenv().SB2SelfFlyVel
+			getgenv().SB2SelfFlyVel = nil
+			if lv then
+				pcall(function()
+					lv.VectorVelocity = Vector3.zero
+					lv.Attachment0 = nil
+					lv.Parent = nil
+					lv:Destroy()
+				end)
+			end
+			for _, model in ipairs(flyModels()) do
+				local att = model:FindFirstChild('SB2SelfFlyAtt', true)
+				if att then
+					pcall(function()
+						att:Destroy()
+					end)
+				end
+			end
+		end
+
+		local function keyDown(code)
+			local ok, down = pcall(function()
+				return UserInputService:IsKeyDown(code)
+			end)
+			return ok and down == true
+		end
+
+		local function wishDirection()
+			if UserInputService:GetFocusedTextBox() then
+				return Vector3.zero
+			end
+			local cam = workspace.CurrentCamera
+			if not cam then
+				return Vector3.zero
+			end
+			local cf = cam.CFrame
+			local wish = Vector3.zero
+			if keyDown(Enum.KeyCode.W) then
+				wish += cf.LookVector
+			end
+			if keyDown(Enum.KeyCode.S) then
+				wish -= cf.LookVector
+			end
+			if keyDown(Enum.KeyCode.D) then
+				wish += cf.RightVector
+			end
+			if keyDown(Enum.KeyCode.A) then
+				wish -= cf.RightVector
+			end
+			if keyDown(Enum.KeyCode.E) or keyDown(Enum.KeyCode.Space) then
+				wish += Vector3.yAxis
+			end
+			if keyDown(Enum.KeyCode.Q) or keyDown(Enum.KeyCode.LeftControl) or keyDown(Enum.KeyCode.RightControl) then
+				wish -= Vector3.yAxis
+			end
+			if wish.Magnitude < 0.05 then
+				return Vector3.zero
+			end
+			return wish.Unit
+		end
+
+		local function flyStep()
+			if getgenv().SB2SelfFlyOn ~= true then
+				return
+			end
+			if getgenv().SB2PlayerToolsManualUnload == true then
+				local stop = getgenv().SB2SelfFlyStop
+				if type(stop) == 'function' then
+					pcall(stop)
+				end
+				return
+			end
+			if getgenv().SB2DiveFarmOn == true or getgenv().SB2DiveFlyOn == true then
+				local lv = getgenv().SB2SelfFlyVel
+				if lv then
+					lv.VectorVelocity = Vector3.zero
+					lv.Parent = nil
+				end
+				return
+			end
+			local _, hrp, hum = flyRoot()
+			if not hrp or not hum then
+				return
+			end
+			applyFlyNoclip()
+			setFlyHumanoid(hum, true)
+			local lv = ensureFlyVelocity(hrp)
+			local vel = wishDirection() * flySpeedStuds()
+			lv.VectorVelocity = vel
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end
+
+		local function stopSelfFly()
+			local lv = getgenv().SB2SelfFlyVel
+			local wasOn = getgenv().SB2SelfFlyOn == true
+				or getgenv().SB2SelfFlyConn ~= nil
+				or (lv and lv.Parent ~= nil)
+			getgenv().SB2SelfFlyOn = false
+			local conn = getgenv().SB2SelfFlyConn
+			getgenv().SB2SelfFlyConn = nil
+			if conn then
+				pcall(function()
+					conn:Disconnect()
+				end)
+			end
+			clearFlyVelocity()
+			if not wasOn then
+				return
+			end
+			local _, hrp, hum = flyRoot()
+			local air = humJumpOrFall(hum)
+			if hrp and not air then
+				pcall(function()
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+				end)
+			end
+			if air then
+				if hum then
+					hum.PlatformStand = false
+					hum.AutoRotate = true
+				end
+			else
+				setFlyHumanoid(hum, false)
+			end
+			restoreFlyNoclip()
+		end
+		getgenv().SB2SelfFlyStop = stopSelfFly
+
+		local function startSelfFly()
+			stopSelfFly()
+			getgenv().SB2SelfFlyStop = stopSelfFly
+			getgenv().SB2SelfFlyOn = true
+			getgenv().SB2SelfFlyConn = RunService.Stepped:Connect(flyStep)
+			flyStep()
+		end
+
+		local TitleBox = SelfTab:AddLeftGroupbox('Titles')
+		assert(TitleBox, 'Titles groupbox nil')
+		TitleBox:AddToggle('TitlingSwitcher', {
+			Text = 'Title switcher',
+			Default = false,
+			Tooltip = 'Cycle every title you own on a timer.',
+		}):OnChanged(function(on)
+			if on then
+				local start = getgenv().SB2TitleSwitcherStart
+				if type(start) == 'function' then
+					start()
+					return
+				end
+				task.spawn(function()
+					for _ = 1, 40 do
+						task.wait(0.25)
+						start = getgenv().SB2TitleSwitcherStart
+						if type(start) == 'function' then
+							if Options.TitlingSwitcher and Options.TitlingSwitcher.Value == true then
+								start()
+							end
+							return
+						end
+					end
+					Library:Notify('Titling not loaded yet — reload PlayerTools', 6, true)
+				end)
+			else
+				local stop = getgenv().SB2TitleSwitcherStop
+				if type(stop) == 'function' then
+					stop()
+				end
+			end
+		end)
+		TitleBox:AddSlider('TitlingSwitcherSeconds', {
+			Text = 'Switch interval (s)',
+			Default = 0.5,
+			Min = 0.2,
+			Max = 3,
+			Rounding = 1,
+			Tooltip = 'How long to keep each owned title before swapping to the next.',
+		})
+		TitleBox:AddButton('Next title now', function()
+			local nxt = getgenv().SB2TitleSwitcherNext
+			if type(nxt) == 'function' then
+				nxt()
+				return
+			end
+			Library:Notify('Titling not loaded yet — reload PlayerTools', 6, true)
+		end)
+
+		local FlyBox = SelfTab:AddLeftGroupbox('Fly')
+		assert(FlyBox, 'Fly groupbox nil')
+		FlyBox:AddToggle('SelfFly', {
+			Text = 'Fly',
+			Default = false,
+			Tooltip = 'Infinite Yield fly. Noclip stays on with it. WASD to move, E or Space up, Q or Ctrl down. Turns off if someone not on whitelist.txt is in the server.',
+		}):OnChanged(function(on)
+			if on and (getgenv().SB2DiveFarmOn == true or getgenv().SB2DiveFlyOn == true) then
+				Library:Notify('Turn off Event dive before flying', 4, true)
+				task.defer(function()
+					local toggle = Toggles.SelfFly
+					if toggle and toggle.Value then
+						toggle:SetValue(false)
+					end
+				end)
+				return
+			end
+			if on then
+				local strangers = type(getgenv().SB2OtherPlayersPresent) == 'function'
+						and getgenv().SB2OtherPlayersPresent()
+					or getgenv().SB2StrangerCombatLock == true
+				if strangers then
+					task.defer(function()
+						local toggle = Toggles.SelfFly
+						if toggle and toggle.Value and type(toggle.SetValue) == 'function' then
+							toggle:SetValue(false)
+						end
+					end)
+					Library:Notify('Fly blocked — non-whitelist player in server', 5)
+					return
+				end
+				startSelfFly()
+				Library:Notify('Fly on — WASD, E/Space up, Q/Ctrl down', 4)
+			else
+				stopSelfFly()
+			end
+		end)
+		FlyBox:AddSlider('SelfFlySpeed', {
+			Text = 'Fly speed',
+			Default = 1,
+			Min = 1,
+			Max = 10,
+			Rounding = 0,
+			Tooltip = 'Same scale as Infinite Yield fly speed. 1 is 50 studs/s.',
+		}):OnChanged(function(value)
+			getgenv().SB2SelfFlySpeed = math.clamp(tonumber(value) or 1, 1, 10)
+		end)
+		getgenv().SB2SelfFlySpeed = 1
+	end
 	end)()
 
 	-- OS mouse + hide Obsidian's custom + cursor (and SB2 MouseIcon disable).
@@ -8442,12 +9760,6 @@ local ok, err = pcall(function()
 		return clicked
 	end
 
-	local function getCombatChar()
-		local ws = workspace:FindFirstChild('Characters')
-		local wsChar = ws and ws:FindFirstChild(LocalPlayer.Name)
-		return wsChar or LocalPlayer.Character
-	end
-
 	local function isUsableChar(model)
 		if not model or not model.Parent then
 			return false
@@ -8466,6 +9778,19 @@ local ok, err = pcall(function()
 			return false
 		end
 		return true
+	end
+
+	local function getCombatChar()
+		local ws = workspace:FindFirstChild('Characters')
+		local wsChar = ws and ws:FindFirstChild(LocalPlayer.Name)
+		local lpChar = LocalPlayer.Character
+		if isUsableChar(wsChar) then
+			return wsChar
+		end
+		if isUsableChar(lpChar) then
+			return lpChar
+		end
+		return wsChar or lpChar
 	end
 
 	-- Dead / missing body (Reset usually useless).
@@ -8571,11 +9896,172 @@ local ok, err = pcall(function()
 	getgenv().SB2IsVoidStuck = isVoidStuck
 	getgenv().SB2TrySoftUnstuck = trySoftUnstuck
 
+	local function snapCamToLiving(model)
+		if type(isToggleOn) == 'function' and (isToggleOn('ViewPlayer') or isToggleOn('ViewPlayerStream')) then
+			return false
+		end
+		if getgenv().SB2CheaterScannerSpectating == true then
+			return false
+		end
+		if scriptableMenuCameraActive() then
+			return false
+		end
+		if titleMenuVisible() then
+			return false
+		end
+		local live = getMyCharacterModel() or model
+		if not characterModelAlive(live) then
+			return false
+		end
+		local hum = live:FindFirstChildOfClass('Humanoid')
+		local hrp = live:FindFirstChild('HumanoidRootPart')
+		local cam = getLiveCamera()
+		if not cam or not hum or not hrp then
+			return false
+		end
+		getgenv().SB2ForceCamFix = true
+		pcall(function()
+			cam.CameraType = Enum.CameraType.Custom
+			cam.CameraSubject = hum
+			local look = hrp.CFrame.LookVector
+			local flat = Vector3.new(look.X, 0, look.Z)
+			if flat.Magnitude < 0.05 then
+				flat = Vector3.new(0, 0, -1)
+			else
+				flat = flat.Unit
+			end
+			cam.CFrame = CFrame.new(hrp.Position + Vector3.new(0, 8, 0) - flat * 14, hrp.Position + Vector3.new(0, 2, 0))
+			cam.Focus = CFrame.new(hrp.Position)
+		end)
+		pcall(function()
+			fixCamera(live)
+		end)
+		return true
+	end
+
+	local function restoreCamAfterRevive(model)
+		if not getgenv()[CONFIG.GenvKey] then
+			return
+		end
+		if type(isToggleOn) == 'function' and (isToggleOn('ViewPlayer') or isToggleOn('ViewPlayerStream')) then
+			return
+		end
+		if getgenv().SB2CheaterScannerSpectating == true then
+			return
+		end
+		-- Snap only if the camera is still sitting at the corpse after spawn.
+		-- Do not yank CFrame on a timer — that fights look/zoom.
+		getgenv().SB2DeathCamUntil = os.clock() + 5
+		local gen = (tonumber(getgenv().SB2DeathCamGen) or 0) + 1
+		getgenv().SB2DeathCamGen = gen
+		task.spawn(function()
+			local deadline = os.clock() + 6
+			local lastHrpPos = nil
+			local snaps = 0
+			while os.clock() < deadline and getgenv()[CONFIG.GenvKey] and getgenv().SB2DeathCamGen == gen do
+				if type(isToggleOn) == 'function' and (isToggleOn('ViewPlayer') or isToggleOn('ViewPlayerStream')) then
+					getgenv().SB2ForceCamFix = nil
+					return
+				end
+				local live = getMyCharacterModel() or model
+				local hrp = live and live:FindFirstChild('HumanoidRootPart')
+				local hum = live and live:FindFirstChildOfClass('Humanoid')
+				if hrp and hum and hum.Health > 0 then
+					local cam = getLiveCamera()
+					local dist = cam and (cam.CFrame.Position - hrp.Position).Magnitude or 0
+					local jumped = lastHrpPos and (hrp.Position - lastHrpPos).Magnitude > 40
+					lastHrpPos = hrp.Position
+					local typeLocked = cam and (cam.CameraType == Enum.CameraType.Scriptable or cam.CameraType == Enum.CameraType.Fixed)
+					if dist > 100 or typeLocked or jumped then
+						if dist > 100 or typeLocked then
+							getgenv().SB2ForceCamFix = true
+							snapCamToLiving(live)
+							snaps += 1
+							if snaps >= 4 then
+								break
+							end
+						end
+					elseif dist <= 100 and not typeLocked and snaps > 0 then
+						break
+					end
+				end
+				task.wait(0.15)
+			end
+			getgenv().SB2ForceCamFix = nil
+			getgenv().SB2DeathCamUntil = 0
+		end)
+	end
+
+	local function hookCharacterDeathCam(model)
+		if not model then
+			return
+		end
+		task.spawn(function()
+			local hum = model:FindFirstChildOfClass('Humanoid')
+			if not hum then
+				hum = model:WaitForChild('Humanoid', 8)
+			end
+			if not hum then
+				return
+			end
+			local prev = getgenv().SB2DeathCamHealthConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+			end
+			local wasDead = hum.Health <= 0
+			getgenv().SB2DeathCamHealthConn = hum.HealthChanged:Connect(function(hp)
+				if hp <= 0 then
+					wasDead = true
+					return
+				end
+				if wasDead then
+					wasDead = false
+					restoreCamAfterRevive(model)
+				end
+			end)
+			local prevDied = getgenv().SB2DeathCamDiedConn
+			if prevDied then
+				pcall(function()
+					prevDied:Disconnect()
+				end)
+			end
+			getgenv().SB2DeathCamDiedConn = hum.Died:Connect(function()
+				wasDead = true
+				cachedMyChar, cachedMyCharAt = nil, 0
+				getgenv().SB2DeathCamUntil = os.clock() + 8
+				restoreCamAfterRevive(model)
+			end)
+		end)
+	end
+	hookCharacterDeathCam(getMyCharacterModel() or LocalPlayer.Character)
+	pcall(function()
+		local folder = workspace:FindFirstChild('Characters')
+		if folder then
+			local prev = getgenv().SB2DeathCamCharsConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+			end
+			getgenv().SB2DeathCamCharsConn = folder.ChildAdded:Connect(function(ch)
+				if ch and ch.Name == LocalPlayer.Name then
+					cachedMyChar, cachedMyCharAt = nil, 0
+					hookCharacterDeathCam(ch)
+					restoreCamAfterRevive(ch)
+				end
+			end)
+		end
+	end)
+
 	safeConnect(LocalPlayer.CharacterAdded, function(newCharacter)
 		Character = newCharacter
 		cachedMyChar, cachedMyCharAt = nil, 0
 		lastCharacterAddedAt = os.clock()
 		voidHuskSince = nil
+		hookCharacterDeathCam(newCharacter)
+		restoreCamAfterRevive(newCharacter)
 		task.spawn(function()
 			-- If Event dive is off, never spawn into leftover dive noclip.
 			if getgenv().SB2DiveFarmOn ~= true then
@@ -8591,7 +10077,7 @@ local ok, err = pcall(function()
 						pcall(function()
 							for _, p in ipairs(newCharacter:GetDescendants()) do
 								if p:IsA('BasePart') then
-									if p.CollisionGroup == 'SB2DiveNoclip' then
+									if p.CollisionGroup == 'SB2DiveNoclip' or p.CollisionGroup == 'SB2SelfNoclip' then
 										p.CollisionGroup = 'Players'
 									end
 									if p.Name == 'HumanoidRootPart'
@@ -8628,29 +10114,13 @@ local ok, err = pcall(function()
 				clearStaleSpawnVerticalPin(hrp)
 				lockReplicationFocus(newCharacter)
 				requestStreamAround(newCharacter, true)
-				-- Unconditional holdCombatAnchor(4) pinned spawn Y and fought walk/idle anim (micro bob).
-				if isToggleOn('CombatAnchor') or getgenv().SB2CombatAnchorOn == true then
-					if hrp.Position.Y < 120 then
-						holdCombatAnchor(4)
-					else
-						getgenv().SB2AnchorLockCF = nil
-						getgenv().SB2AnchorHoldUntil = 0
-					end
-				end
+				-- Combat Anchor is retired. Do not pin the spawn position.
+				getgenv().SB2CombatAnchorOn = false
+				getgenv().SB2AnchorLockCF = nil
+				getgenv().SB2AnchorHoldUntil = 0
 			end
-			for _ = 1, 30 do
-				if isToggleOn('ViewPlayer') or isToggleOn('ViewPlayerStream') then
-					return
-				end
-				if not inGameplayWorld() then
-					return
-				end
-				if fixCamera(newCharacter) then
-					requestStreamAround(newCharacter, true)
-					return
-				end
-				task.wait(0.2)
-			end
+			getgenv().SB2ForceCamFix = true
+			restoreCamAfterRevive(newCharacter)
 		end)
 	end)
 
@@ -8754,7 +10224,18 @@ local ok, err = pcall(function()
 			end
 			lockReplicationFocus(char)
 			pinHighAir(char)
-			if cameraLooksBroken(cam, char) then
+			local deathUntil = tonumber(getgenv().SB2DeathCamUntil) or 0
+			if deathUntil > os.clock() then
+				local hrp = char and char:FindFirstChild('HumanoidRootPart')
+				local hum = char and char:FindFirstChildOfClass('Humanoid')
+				if hrp and hum and hum.Health > 0 and cam then
+					local dist = (cam.CFrame.Position - hrp.Position).Magnitude
+					local typeLocked = cam.CameraType == Enum.CameraType.Scriptable or cam.CameraType == Enum.CameraType.Fixed
+					if dist > 100 or typeLocked then
+						snapCamToLiving(char)
+					end
+				end
+			elseif cameraLooksBroken(cam, char) then
 				fixCamera(char)
 				pinHighAir(char)
 			end
@@ -9747,6 +11228,8 @@ local ok, err = pcall(function()
 			['Realm Judgement'] = true,
 			['Realm Banishment'] = true,
 			['Meteor Shot'] = true,
+			['Shadow Step'] = true,
+			['Spirit Dash'] = true,
 		}
 
 		local FORCE_ATTACK_SKILLS = {
@@ -9755,14 +11238,10 @@ local ok, err = pcall(function()
 			['Summon Rifle'] = true,
 			['Summon Minigun'] = true,
 		}
-		-- Rifle / minigun official handlers FireServer then task.wait(3) while usingSkill
-		-- is locked. Remote-only payload matches the game dump (no Direction table).
 		local SUMMON_NO_DIR_SKILLS = {
 			['Summon Rifle'] = true,
 			['Summon Minigun'] = true,
 		}
-		-- Official handlers FireServer once then task.wait(3) while shots tick.
-		-- Interrupting with another UseSkill / clearing usingSkill cuts damage (15k ticks, not 295k).
 		local SUMMON_CHANNEL_SEC = {
 			['Summon Rifle'] = 3,
 			['Summon Minigun'] = 3,
@@ -10101,8 +11580,6 @@ local ok, err = pcall(function()
 						keepMap = collectMultiSkillMap(getgenv().SB2LastCombatOptions.SupportSkillName)
 					elseif option == Options.FarmSupportSkillName then
 						keepMap = collectMultiSkillMap(getgenv().SB2LastCombatOptions.FarmSupportSkillName)
-					elseif option == Options.SkillName then
-						keepMap = collectMultiSkillMap(getgenv().SB2LastCombatOptions.SkillName)
 					end
 				end
 				-- Empty combat support means Cursed Enhancement, unless the user cleared it.
@@ -10311,8 +11788,6 @@ local ok, err = pcall(function()
 			if not skills then
 				return nil
 			end
-			-- Official UseSkill sets usingSkill for the whole handler (Rifle waits 3s).
-			-- Remote casts ignore that lock so several skills can fire together.
 			if skills.usingSkill and skills.usingSkill ~= 'none' then
 				pcall(function()
 					skills.usingSkill = 'none'
@@ -10485,18 +11960,6 @@ local ok, err = pcall(function()
 				return syncMultiSkillOrder('SB2SupportSkillOrder', combatMap)
 			end
 			return syncMultiSkillOrder('SB2FarmSupportSkillOrder', farmMap)
-		end
-
-		local function getActiveWeaponSkillNames()
-			local combatMap = collectMultiSkillMap(Options.SkillName and Options.SkillName.Value)
-			local farmMap = collectMultiSkillMap(Options.FarmSkillName and Options.FarmSkillName.Value)
-			local map = combatMap
-			if usingEventFarmSkills() then
-				map = next(farmMap) and farmMap or combatMap
-			elseif not next(combatMap) then
-				map = farmMap
-			end
-			return syncMultiSkillOrder('SB2WeaponSkillOrder', map)
 		end
 
 		local function getActiveWeaponSkillName()
@@ -11252,7 +12715,6 @@ local ok, err = pcall(function()
 			local channelSec = SUMMON_CHANNEL_SEC[skillName]
 			local channelUntil = tonumber(getgenv().SB2SummonChannelUntil) or 0
 			if os.clock() < channelUntil then
-				-- Do not interrupt an active rifle/minigun stream.
 				return false
 			end
 
@@ -11275,8 +12737,6 @@ local ok, err = pcall(function()
 
 			local fireOk = false
 			if channelSec then
-				-- Remote only — do not call Skills.UseSkill (client lock / anim / wait).
-				-- Server streams shots for ~3s after this one FireServer.
 				faceNearestMobForSummon()
 				fireOk = pcall(function()
 					CombatEvent:FireServer('Skills', { 'UseSkill', skillName })
@@ -11399,49 +12859,20 @@ local ok, err = pcall(function()
 					return true
 				end
 			end
-			local fired = false
-			local lastName = nil
-			local function trySupport(skillName)
-				if not skillName or skillName == '(none)' then
-					return
-				end
-				local forced = SUPPORT_FORCE_INCLUDE[skillName] == true
-				if SKIP_UTILITY_SKILLS[skillName] and not forced then
-					return
-				end
-				local info = getSkillInfo(skillName)
-				if not forced and not (info.anytime == true and not info.class) then
-					return
-				end
-				local mySkills = getLiveProfile() and getLiveProfile():FindFirstChild('Skills')
-				if mySkills and not mySkills:FindFirstChild(skillName) then
-					return
-				end
-				if not isSkillReady(skillName) then
-					return
-				end
-				if getPlayerStamina() < (info.cost or 0) then
-					return
-				end
-				if fireUseSkill(skillName, info, {
-					muteFor = 2.0,
-					silentFail = true,
-					ignoreGap = true,
-				}) then
-					fired = true
-					lastName = skillName
-				end
+			local skillName, info = getSupportCastTarget()
+			if not skillName then
+				return false
 			end
-			trySupport('Cursed Enhancement')
-			for _, skillName in ipairs(getActiveSupportSkillList()) do
-				if skillName ~= 'Cursed Enhancement' then
-					trySupport(skillName)
-				end
+			-- ignoreGap: weapon UseSkill spam was eating the shared cast gap so CE never fired.
+			local ok = fireUseSkill(skillName, info, {
+				muteFor = 2.0,
+				silentFail = true,
+				ignoreGap = true,
+			}) == true
+			if ok then
+				getgenv().SB2LastSupportCast = { skill = skillName, at = os.clock() }
 			end
-			if lastName then
-				getgenv().SB2LastSupportCast = { skill = lastName, at = os.clock() }
-			end
-			return fired
+			return ok
 		end
 
 		local ensureSkillWindow = function()
@@ -11469,22 +12900,16 @@ local ok, err = pcall(function()
 			end
 
 			local skillName = getActiveWeaponSkillName()
-			local weaponNames = getActiveWeaponSkillNames()
-			if #weaponNames == 0 and skillName then
-				weaponNames = { skillName }
-			end
-			local function isSkipTag(name)
-				return not name
-					or name == 'Block'
-					or name == 'Roll'
-					or name == 'Sprint'
-					or name == 'Realm Judgement'
-					or name == 'Realm Banishment'
-					or name == 'Meteor Shot'
-					or isPoorAuraTagSkill(name)
-			end
 			local function activeWeaponTag()
-				if isSkipTag(skillName) then
+				if not skillName
+					or skillName == 'Block'
+					or skillName == 'Roll'
+					or skillName == 'Sprint'
+					or skillName == 'Realm Judgement'
+					or skillName == 'Realm Banishment'
+					or skillName == 'Meteor Shot'
+					or isPoorAuraTagSkill(skillName)
+				then
 					return nil
 				end
 				local now = time()
@@ -11497,43 +12922,58 @@ local ok, err = pcall(function()
 				return nil
 			end
 
-			-- Support + every selected weapon skill in the same tick.
+			-- Support + weapon in the same tick (remote UseSkill; no usingSkill lock).
 			pcall(castSelectedSupportSkill)
 
-			local tagName = nil
-			for _, name in ipairs(weaponNames) do
-				local info = getSkillInfo(name)
-				local forced = FORCE_ATTACK_SKILLS[name] == true
-				if name == 'Block' or name == 'Roll' or name == 'Sprint' then
-					continue
+			if not skillName
+				or skillName == 'Block'
+				or skillName == 'Roll'
+				or skillName == 'Sprint'
+				or skillName == 'Realm Judgement'
+				or skillName == 'Realm Banishment'
+				or skillName == 'Meteor Shot'
+				or isPoorAuraTagSkill(skillName)
+			then
+				return nil
+			end
+
+			local info = getSkillInfo(skillName)
+			local forced = FORCE_ATTACK_SKILLS[skillName] == true
+			-- Class gate: skip when Event dive owns the farm skill, or when the
+			-- selected combat skill matches held weapons.
+			if not forced then
+				if not info.class then
+					return nil
 				end
-				if not forced then
-					if not info.class then
-						continue
-					end
-					if not usingEventFarmSkills() then
-						local held = getEquippedWeaponClassesCached()
-						if not skillMatchesHeldWeapon(name, info, held) then
-							continue
+				if not usingEventFarmSkills() then
+					local held = getEquippedWeaponClassesCached()
+					if not skillMatchesHeldWeapon(skillName, info, held) then
+						-- Try first held-class skill instead of silently doing nothing.
+						local avail = getAvailableSkills()
+						local alt = nil
+						for _, name in ipairs(avail) do
+							if name ~= '(none)' and name ~= '(none for held weapon)' then
+								local altInfo = getSkillInfo(name)
+								if skillMatchesHeldWeapon(name, altInfo, held) then
+									alt = name
+									break
+								end
+							end
+						end
+						if not alt then
+							return nil
+						end
+						skillName = alt
+						info = getSkillInfo(skillName)
+						if not info.class or not skillMatchesHeldWeapon(skillName, info, held) then
+							return nil
 						end
 					end
 				end
-				if isSkillReady(name) then
-					fireUseSkill(name, info, {
-						muteFor = 1.35,
-						ignoreGap = true,
-						allowPistol = forced,
-					})
-				end
-				if not tagName and not isSkipTag(name) and not forced then
-					tagName = name
-				end
-			end
-			if tagName then
-				skillName = tagName
 			end
 
-			if isSkipTag(skillName) then
+			-- Summon Pistol is projectile-only — never open a CTF-style tag window for it.
+			if forced then
 				return nil
 			end
 
@@ -11542,7 +12982,7 @@ local ok, err = pcall(function()
 				return tagged
 			end
 
-			if not skillName then
+			if not isSkillReady(skillName) then
 				return nil
 			end
 			if getgenv().SB2SkillCastLock then
@@ -11556,7 +12996,7 @@ local ok, err = pcall(function()
 			-- still needs it for DealDamage/Attack tags between casts.
 			getgenv().SB2SkillActiveName = skillName
 
-			local ok = true
+			local ok = fireUseSkill(skillName, info, { muteFor = 1.35 })
 			task.defer(function()
 				task.wait(0.15)
 				getgenv().SB2SkillCastLock = false
@@ -11735,15 +13175,12 @@ local ok, err = pcall(function()
 
 		-- Pistol cast when a mob is close (not full 200-stud killaura).
 		local PISTOL_CAST_RANGE = 30
-		local SUMMON_CAST_RANGE = 90
 		local pistolInCastRange = function(origin)
 			local mobsRoot = workspace:FindFirstChild('Mobs')
 			if not mobsRoot or not origin then
 				return false
 			end
-			local selected = getActiveWeaponSkillName()
-			local range = SUMMON_CHANNEL_SEC[selected] and SUMMON_CAST_RANGE or PISTOL_CAST_RANGE
-			local rangeSq = range * range
+			local rangeSq = PISTOL_CAST_RANGE * PISTOL_CAST_RANGE
 			for _, mob in mobsRoot:GetChildren() do
 				if isDeadMob(mob) or shouldSkipMob(mob) then
 					continue
@@ -11873,6 +13310,252 @@ local ok, err = pcall(function()
 			end)
 			warn('[BetweenParty] UI not loaded — see Farm → Wave Defense label')
 		end
+
+		-- Auto Wave Skip Token: in a Between run, use one token on each regular wave as soon as
+		-- it starts. Special waves (Tempest, Lava, Blackout, Bob…) and boss waves can't be
+		-- skipped, so they're left alone and no token is wasted. Saved in PlayerTools/autowaveskip.
+		;(function()
+			local FLAG = 'PlayerTools/autowaveskip'
+			local KEEP = 'PlayerTools/autowaveskip_keep'
+			local BETWEEN = 78945654064532
+			local function readFlag(path, default)
+				local ok, v = pcall(function()
+					return isfile(path) and readfile(path) or nil
+				end)
+				if ok and type(v) == 'string' and v ~= '' then
+					return v
+				end
+				return default
+			end
+			local S = getgenv().SB2AutoWaveSkip or {}
+			getgenv().SB2AutoWaveSkip = S
+			S.on = readFlag(FLAG, 'false') == 'true'
+			S.keep = tonumber(readFlag(KEEP, '0')) or 0
+			S.used = S.used or 0
+			local cfg
+			local function waveCfg()
+				if cfg == nil then
+					local ok, c = pcall(function()
+						return require(game:GetService('ReplicatedStorage').WaveDefenseConfig)
+					end)
+					cfg = ok and type(c) == 'table' and c or false
+				end
+				return cfg or nil
+			end
+			local function isRegularWave(wave)
+				local env = workspace:GetAttribute('WaveDefenseEnvironment')
+				if type(env) ~= 'string' or env == '' then
+					return false
+				end
+				local c = waveCfg()
+				if c then
+					if (c.SpecialWaves and c.SpecialWaves[env]) or (c.BossWaves and c.BossWaves[env]) then
+						return false
+					end
+					local w = c.Waves and c.Waves[wave]
+					if type(w) == 'table' and type(w.Environment) == 'string' and w.Environment ~= env then
+						return false
+					end
+				end
+				-- Never on a boss: a visible boss health bar means hands off.
+				local ok, boss = pcall(function()
+					local pg = LocalPlayer:FindFirstChild('PlayerGui')
+					local bars = pg and pg:FindFirstChild('BossHealthBars', true)
+					if bars then
+						for _, b in ipairs(bars:GetChildren()) do
+							if b:IsA('GuiObject') and b.Visible then
+								return true
+							end
+						end
+					end
+					return false
+				end)
+				return not (ok and boss)
+			end
+			local function tokenItem()
+				local rs = game:GetService('ReplicatedStorage')
+				local prof = rs:FindFirstChild('Profiles') and rs.Profiles:FindFirstChild(LocalPlayer.Name)
+				local inv = prof and prof:FindFirstChild('Inventory')
+				return inv and inv:FindFirstChild('Wave Skip Token')
+			end
+			local function tokenCount(tok)
+				if not tok then
+					return 0
+				end
+				local c = tok:FindFirstChild('Count')
+				return c and c.Value or 1
+			end
+			if S.loop then
+				pcall(task.cancel, S.loop)
+			end
+			S.lastWave = nil
+			S.loop = task.spawn(function()
+				while true do
+					task.wait(0.4)
+					if S.on and game.PlaceId == BETWEEN then
+						local wave = tonumber(workspace:GetAttribute('Wave'))
+						local mobsFolder = workspace:FindFirstChild('Mobs')
+						local mobs = mobsFolder and #mobsFolder:GetChildren() or 0
+						if wave and wave ~= S.lastWave and mobs > 0 then
+							if isRegularWave(wave) then
+								local tok = tokenItem()
+								local have = tokenCount(tok)
+								if tok and have > (S.keep or 0) then
+									S.lastWave = wave
+									local ok = pcall(function()
+										game:GetService('ReplicatedStorage').Function:InvokeServer('Equipment', { 'UseItem', tok, 1 })
+									end)
+									if ok then
+										S.used += 1
+									end
+								end
+							else
+								S.lastWave = wave -- special / boss wave: skip trying this wave
+							end
+						end
+					end
+				end
+			end)
+			WdBox:AddToggle('AutoWaveSkip', {
+				Text = 'Auto use Wave Skip Token',
+				Default = S.on,
+				Tooltip = 'In a Between run, uses one Wave Skip Token on every regular wave as soon as it starts. Special and boss waves are left alone (they cannot be skipped).',
+			}):OnChanged(function(value)
+				S.on = value == true
+				S.lastWave = nil
+				pcall(writefile, FLAG, S.on and 'true' or 'false')
+			end)
+			WdBox:AddInput('AutoWaveSkipKeep', {
+				Text = 'Keep at least (tokens)',
+				Default = tostring(S.keep or 0),
+				Numeric = true,
+				Finished = true,
+				ClearTextOnFocus = false,
+				AllowEmpty = true,
+				Callback = function(v)
+					S.keep = tonumber(v) or 0
+					pcall(writefile, KEEP, tostring(S.keep))
+				end,
+			})
+		end)()
+
+		-- Auto 10m Boost Token: one at the start of wave 75 (Nythrane) and one when Rubricatus
+		-- (wave 100) dies. Once each per run. Saved in PlayerTools/autoboost75.
+		;(function()
+			local FLAG = 'PlayerTools/autoboost75'
+			local BETWEEN = 78945654064532
+			local TOKEN = '10m Boost Token'
+			local S = getgenv().SB2AutoBoost or {}
+			getgenv().SB2AutoBoost = S
+			local okF, flag = pcall(function()
+				return isfile(FLAG) and readfile(FLAG) or 'false'
+			end)
+			S.on = okF and flag == 'true'
+			local RS = game:GetService('ReplicatedStorage')
+			local function useToken(why)
+				local prof = RS:FindFirstChild('Profiles') and RS.Profiles:FindFirstChild(LocalPlayer.Name)
+				local inv = prof and prof:FindFirstChild('Inventory')
+				local tok = inv and inv:FindFirstChild(TOKEN)
+				if not tok then
+					Library:Notify('Auto boost: no ' .. TOKEN .. ' left (' .. why .. ')', 5)
+					return false
+				end
+				local ok, err = pcall(function()
+					RS.Function:InvokeServer('Equipment', { 'UseItem', tok, 1 })
+				end)
+				Library:Notify(ok and ('Auto boost: used ' .. TOKEN .. ' (' .. why .. ')') or ('Auto boost failed: ' .. tostring(err)), 5)
+				return ok
+			end
+			local function rubricatus()
+				local mobs = workspace:FindFirstChild('Mobs')
+				if not mobs then
+					return nil
+				end
+				for _, m in ipairs(mobs:GetChildren()) do
+					if string.find(string.lower(m.Name), 'rubricatus', 1, true) then
+						return m
+					end
+				end
+				return nil
+			end
+			local function dead(m)
+				if not m or not m.Parent then
+					return true
+				end
+				local ent = m:FindFirstChild('Entity')
+				local hp = ent and ent:FindFirstChild('Health')
+				return hp ~= nil and tonumber(hp.Value) ~= nil and hp.Value <= 0
+			end
+			if S.loop then
+				pcall(task.cancel, S.loop)
+			end
+			S.did75, S.didRub, S.rub = false, false, nil
+			S.loop = task.spawn(function()
+				while true do
+					task.wait(0.5)
+					if S.on and game.PlaceId == BETWEEN then
+						local wave = tonumber(workspace:GetAttribute('Wave')) or 0
+						if wave < 75 then
+							S.did75, S.didRub, S.rub = false, false, nil
+						end
+						if wave == 75 and not S.did75 then
+							S.did75 = true
+							useToken('wave ' .. wave)
+						end
+						if wave >= 100 and not S.didRub then
+							local m = rubricatus()
+							if m and not dead(m) then
+								S.rub = m
+							elseif S.rub and dead(S.rub) then
+								S.didRub, S.rub = true, nil
+								useToken('Rubricatus died')
+							end
+						end
+					end
+				end
+			end)
+			WdBox:AddToggle('AutoBoost75', {
+				Text = 'Auto 10m boost (wave 75 + Rubricatus)',
+				Default = S.on,
+				Tooltip = 'In a Between run: uses a 10m Boost Token when wave 75 starts and another when Rubricatus dies. Once each per run.',
+			}):OnChanged(function(value)
+				S.on = value == true
+				pcall(writefile, FLAG, S.on and 'true' or 'false')
+			end)
+		end)()
+
+		local function tryLoadBetweenCycle()
+			if getgenv().SB2BetweenCycleBuild == 'swing-v4' then
+				return true
+			end
+			local compile = loadstring or load
+			if type(compile) ~= 'function' or type(readfile) ~= 'function' or type(isfile) ~= 'function' then
+				return false
+			end
+			for _, modPath in ipairs({ 'PlayerTools/BetweenCycle.lua', 'BetweenCycle.lua' }) do
+				if isfile(modPath) then
+					local src = readfile(modPath)
+					if type(src) == 'string' and src ~= '' then
+						local fn, err = compile(src, modPath)
+						if fn then
+							local ok, result = pcall(fn)
+							if ok and type(result) == 'function' then
+								ok, result = pcall(result)
+							end
+							if ok then
+								getgenv().SB2BetweenCycleLoaded = true
+								return true
+							end
+							warn('[BetweenCycle] init failed: ', result)
+						else
+							warn('[BetweenCycle] compile failed: ', err)
+						end
+					end
+				end
+			end
+			return false
+		end
+		tryLoadBetweenCycle()
 
 		CombatBox:AddToggle('AutoSkill', {
 			Text = 'Auto skill damage',
@@ -12225,7 +13908,11 @@ local ok, err = pcall(function()
 					end
 				end
 				local hitLivesRush = wantHitLivesRush()
-				local tickGap = hitLivesRush and prof.hitLivesInterval or prof.interval
+				-- Slider is the wait before the next enemy. 0.18 matches the old default.
+				local tickGap = math.clamp(getOptionNumber('KillauraSpeed', 0.18), 0.04, 10)
+				if isWdHubKillauraCap() then
+					tickGap = math.max(tickGap, prof.interval or 0.22)
+				end
 				if usingEventFarmSkills() then
 					local diveFloor = combatLiteLoadEnabled() and 0.24 or 0.16
 					tickGap = math.max(tickGap, diveFloor)
@@ -12259,10 +13946,7 @@ local ok, err = pcall(function()
 					aaRange = math.max(aaRange, SKILL_HIT_RANGE)
 					skillRange = SKILL_HIT_RANGE
 				end
-				local delay = prof.delay or 0.1
-				if hitLivesRush then
-					delay = math.max(prof.hitLivesMinDelay or delay, delay)
-				end
+				local delay = tickGap
 				local origin = myPart.Position
 				local selectedSkill = getActiveWeaponSkillName()
 				local pistolMode = not hitLivesRush and FORCE_ATTACK_SKILLS[selectedSkill] == true
@@ -12551,6 +14235,107 @@ local ok, err = pcall(function()
 			end
 		end)
 
+		CombatBox:AddSlider('KillauraSpeed', {
+			Text = 'Killaura speed',
+			Default = 0.18,
+			Min = 0.04,
+			Max = 10,
+			Rounding = 2,
+			Suffix = 's',
+			Tooltip = 'Seconds before killaura can attack the next enemy. Lower is faster.',
+		})
+
+		CombatBox:AddToggle('AutoWalk', {
+			Text = 'Auto walk',
+			Default = false,
+			Tooltip = 'Walk toward the nearest living enemy. Stops a few studs short. Does not attack.',
+		}):OnChanged(function(value)
+			getgenv().SB2AutoWalkOn = value == true
+			local prev = getgenv().SB2AutoWalkConn
+			if prev then
+				pcall(function()
+					prev:Disconnect()
+				end)
+				getgenv().SB2AutoWalkConn = nil
+			end
+			local function haltWalk()
+				local model = getMyCharacterModel() or LocalPlayer.Character
+				local hum = model and model:FindFirstChildOfClass('Humanoid')
+				local hrp = model and model:FindFirstChild('HumanoidRootPart')
+				if hum and hrp then
+					pcall(function()
+						hum:MoveTo(hrp.Position)
+					end)
+				end
+			end
+			if not value then
+				haltWalk()
+				return
+			end
+			local lastStep = 0
+			getgenv().SB2AutoWalkConn = RunService.Heartbeat:Connect(function()
+				if getgenv().SB2AutoWalkOn ~= true or not isToggleOn('AutoWalk') then
+					return
+				end
+				local now = os.clock()
+				if now - lastStep < 0.2 then
+					return
+				end
+				lastStep = now
+				if getgenv().SB2LavaEscapeActive == true or getgenv().SB2BobEscapeActive == true
+					or getgenv().SB2RubricatusSurviveActive == true
+					or typeof(getgenv().SB2RubricatusCoverPos) == 'Vector3'
+				then
+					return
+				end
+				if not isLocalAlive() then
+					return
+				end
+				local model = getMyCharacterModel() or LocalPlayer.Character
+				local hum = model and model:FindFirstChildOfClass('Humanoid')
+				local hrp = model and model:FindFirstChild('HumanoidRootPart')
+				local mobs = workspace:FindFirstChild('Mobs')
+				if not hum or not hrp or not mobs then
+					return
+				end
+				local origin = hrp.Position
+				local best, bestD = nil, nil
+				for _, mob in ipairs(mobs:GetChildren()) do
+					if isDeadMob(mob) or shouldSkipMob(mob) or isRewardChestMob(mob) then
+						continue
+					end
+					local part = mob:FindFirstChild('HumanoidRootPart') or mob.PrimaryPart
+					if not (part and part:IsA('BasePart')) then
+						part = mob:FindFirstChildWhichIsA('BasePart')
+					end
+					if part and part:IsA('BasePart') then
+						local dx = part.Position.X - origin.X
+						local dz = part.Position.Z - origin.Z
+						local d = dx * dx + dz * dz
+						if not bestD or d < bestD then
+							bestD = d
+							best = part.Position
+						end
+					end
+				end
+				if not best or not bestD then
+					return
+				end
+				if math.sqrt(bestD) <= 8 then
+					pcall(function()
+						hum:MoveTo(origin)
+					end)
+					return
+				end
+				local flat = Vector3.new(best.X - origin.X, 0, best.Z - origin.Z)
+				local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.zAxis
+				local dest = Vector3.new(best.X, origin.Y, best.Z) - dir * 6
+				pcall(function()
+					hum:MoveTo(dest)
+				end)
+			end)
+		end)
+
 		local KILLAURA_OFF_WAVE = 75
 		CombatBox:AddToggle('KillauraOffWave75', {
 			Text = 'Killaura off at wave 75',
@@ -12594,18 +14379,57 @@ local ok, err = pcall(function()
 
 		CombatBox:AddToggle('AutoReviveHearts', {
 			Text = 'Auto revive (hearts)',
-			Default = true,
+			Default = getgenv().SB2FriendDefaultsOff ~= true,
 			Tooltip = 'Wave Defense: presses the red Revive button when you die, spending 1 heart. Never presses it at 0 hearts (that is the paid revive).',
 		})
 		task.spawn(function()
+			-- One heart per death. It used to press again every 2s while the death screen was
+			-- up, and reviving straight back into the attack that killed you chained deaths
+			-- until every heart was gone. Now: never twice for the same death, and if you died
+			-- again soon after a revive, wait a few seconds for the attack to end first.
 			local lastTry = 0
+			local lastReviveAt = -1e9
+			local revivedThisDeath = false
+			local deadSince = nil
+			local lastNote, lastNoteAt = nil, 0
+			local function note(msg)
+				-- Into the death log ring, so a death entry shows what auto revive did.
+				local now = os.clock()
+				if msg == lastNote and now - lastNoteAt < 5 then
+					return
+				end
+				lastNote, lastNoteAt = msg, now
+				local fn = getgenv().SB2DeathLogNote
+				if type(fn) == 'function' then
+					pcall(fn, 'REVIVE ' .. msg)
+				end
+			end
 			while getgenv()[CONFIG.GenvKey] and getgenv().SB2PlayerToolsGen == CONFIG.InstanceGen do
 				task.wait(0.5)
-				if not isToggleOn('AutoReviveHearts') or os.clock() - lastTry < 2 then
+				local now = os.clock()
+				if isLocalAlive() then
+					revivedThisDeath = false
+					deadSince = nil
 					continue
+				end
+				deadSince = deadSince or now
+				if revivedThisDeath then
+					continue
+				end
+				if not isToggleOn('AutoReviveHearts') then
+					note('skip: toggle off')
+					continue
+				end
+				if now - lastTry < 2 then
+					continue
+				end
+				if now - lastReviveAt < 15 and now - deadSince < 5 then
+					note('waiting: died again right after a revive')
+					continue -- died again right after a revive: let the attack finish first
 				end
 				local lives = LocalPlayer:GetAttribute('Lives')
 				if typeof(lives) ~= 'number' or lives <= 0 then
+					note('skip: hearts=' .. tostring(lives))
 					continue
 				end
 				local frame = nil
@@ -12614,14 +14438,19 @@ local ok, err = pcall(function()
 				end)
 				local btn = frame and frame:FindFirstChild('Options') and frame.Options:FindFirstChild('Revive')
 				if not (frame and frame.Visible and btn and btn.Text == 'Revive') then
+					note(('skip: button frame=%s visible=%s text=%s hearts=%s'):format(tostring(frame ~= nil),
+						tostring(frame and frame.Visible), tostring(btn and btn.Text), tostring(lives)))
 					continue
 				end
+				note('pressing Revive, hearts=' .. tostring(lives))
 				lastTry = os.clock()
+				revivedThisDeath = true
 				task.spawn(function()
 					local ok, res = pcall(function()
 						return game:GetService('ReplicatedStorage').Function:InvokeServer('UniqueFloorTypes', { 'WaveDefense', 'Revive' })
 					end)
 					if ok and res then
+						lastReviveAt = os.clock()
 						pcall(function()
 							frame.Visible = false
 						end)
@@ -12629,14 +14458,25 @@ local ok, err = pcall(function()
 							Library:Notify(('Auto revived — %d heart(s) left'):format(math.max(0, lives - 1)), 4)
 						end)
 					else
+						revivedThisDeath = false -- didn't go through: allowed to try again
 						warn('[PlayerTools] auto revive failed: ', ok and tostring(res) or res)
+						note('server said no: ' .. (ok and tostring(res) or tostring(res)))
 					end
 				end)
 			end
 		end)
 
-		-- Combat Anchor toggle removed — TP pin / dive still use holdCombatAnchor internally.
+		-- Combat Anchor is retired. Drop any lock left by an older session.
 		getgenv().SB2CombatAnchorOn = false
+		getgenv().SB2AnchorLockCF = nil
+		getgenv().SB2AnchorHoldUntil = 0
+		local retiredAnchorConn = getgenv().SB2CombatAnchorConn
+		if retiredAnchorConn then
+			pcall(function()
+				retiredAnchorConn:Disconnect()
+			end)
+			getgenv().SB2CombatAnchorConn = nil
+		end
 		pcall(applyCombatAnchor, false)
 
 		do
@@ -12673,6 +14513,58 @@ local ok, err = pcall(function()
 							warn('[AutoFloorDodge] init failed: ', result)
 						else
 							warn('[AutoFloorDodge] compile failed: ', err)
+						end
+					end
+				end
+			end
+		end
+
+		-- No collision with whitelisted players (NoPlayerCollide.lua; pauses around strangers).
+		pcall(function()
+			for _, modPath in ipairs({ 'PlayerTools/NoPlayerCollide.lua', 'NoPlayerCollide.lua' }) do
+				if type(isfile) == 'function' and isfile(modPath) then
+					local fn, err = (loadstring or load)(readfile(modPath), modPath)
+					if fn then
+						local ok, res = pcall(function()
+							fn()({ Box = CombatBox, Toggles = Toggles })
+						end)
+						if not ok then
+							warn('[NoPlayerCollide] init failed: ', res)
+						end
+					else
+						warn('[NoPlayerCollide] compile failed: ', err)
+					end
+					break
+				end
+			end
+		end)
+
+		do
+			local compile = loadstring or load
+			for _, modPath in ipairs({ 'PlayerTools/AtheonNukeDash.lua', 'AtheonNukeDash.lua' }) do
+				if type(isfile) == 'function' and isfile(modPath) and type(readfile) == 'function' then
+					local src = readfile(modPath)
+					if type(src) == 'string' and src ~= '' then
+						local fn, err = compile(src, modPath)
+						if fn then
+							local ok, result = pcall(fn)
+							if ok and type(result) == 'function' then
+								ok, result = pcall(result, {
+									CombatBox = CombatBox,
+									RunService = RunService,
+									LocalPlayer = LocalPlayer,
+									Toggles = Toggles,
+									isToggleOn = isToggleOn,
+									isLocalAlive = isLocalAlive,
+									getMyCharacterModel = getMyCharacterModel,
+								})
+							end
+							if ok then
+								break
+							end
+							warn('[AtheonNukeDash] init failed: ', result)
+						else
+							warn('[AtheonNukeDash] compile failed: ', err)
 						end
 					end
 				end
@@ -13262,12 +15154,33 @@ local ok, err = pcall(function()
 					hum.PlatformStand = false
 					hum.AutoRotate = true
 					local st = hum:GetState()
-					if st == Enum.HumanoidStateType.Flying then
+					if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.Jumping then
+						-- ChangeState mid-fall resets downward speed (pit float).
+						return
+					end
+					local hrp = model:FindFirstChild('HumanoidRootPart')
+					if hrp then
+						local vy = hrp.AssemblyLinearVelocity.Y
+						if typeof(vy) == 'number' and math.abs(vy) > 6 then
+							return
+						end
+					end
+					if st == Enum.HumanoidStateType.Flying or st == Enum.HumanoidStateType.PlatformStanding then
 						pcall(function()
-							if hum.FloorMaterial ~= Enum.Material.Air then
-								hum:ChangeState(Enum.HumanoidStateType.Running)
-							else
+							local gap = nil
+							local preview = getgenv().SB2DivePreviewGroundY
+							if hrp and type(preview) == 'function' then
+								local gy = preview(hrp.Position)
+								if typeof(gy) == 'number' then
+									gap = hrp.Position.Y - gy
+								end
+							end
+							-- FloorMaterial stays Grass after vacuum even 7 studs up.
+							-- Forcing Running there is the leftover hover / dead jump.
+							if (typeof(gap) == 'number' and gap > 4.5) or hum.FloorMaterial == Enum.Material.Air then
 								hum:ChangeState(Enum.HumanoidStateType.Freefall)
+							else
+								hum:ChangeState(Enum.HumanoidStateType.Running)
 							end
 						end)
 					end
@@ -13741,47 +15654,6 @@ local ok, err = pcall(function()
 		local function setDiveNoclip(on)
 			getgenv().SB2DiveNoclipOn = on == true
 			getgenv().SB2DiveFlyOn = on == true
-			--#region agent log
-			pcall(function()
-				local hrp = getMyBringPart()
-				local sampleCollide = hrp and hrp.CanCollide
-				local sampleGroup = nil
-				if hrp then
-					pcall(function()
-						sampleGroup = hrp.CollisionGroup
-					end)
-				end
-				local origN, groupN = 0, 0
-				for _ in pairs(diveNoclipOrig) do
-					origN += 1
-				end
-				for _ in pairs(diveNoclipGroups) do
-					groupN += 1
-				end
-				local line = game:GetService('HttpService'):JSONEncode({
-					sessionId = '7e9135',
-					runId = 'noclip-off',
-					hypothesisId = 'H3,H4,H5',
-					location = 'setDiveNoclip',
-					message = on and 'noclip ON' or 'noclip OFF',
-					data = {
-						on = on == true,
-						farmOn = getgenv().SB2DiveFarmOn == true,
-						toggle = isToggleOn('DiveFarm'),
-						hrpCollide = sampleCollide,
-						hrpGroup = sampleGroup,
-						origN = origN,
-						groupN = groupN,
-						stepped = diveNoclipStepped ~= nil,
-						hb = diveNoclipHeartbeat ~= nil,
-					},
-					timestamp = math.floor(os.clock() * 1000),
-				})
-				if type(appendfile) == 'function' then
-					appendfile('debug-7e9135.log', line .. '\n')
-				end
-			end)
-			--#endregion
 			if on then
 				setDiveMobIntangible(true)
 				diveApplyNoclipParts()
@@ -13954,6 +15826,25 @@ local ok, err = pcall(function()
 			if typeof(rubCover) == 'Vector3' and rubricatusCoverActive(hrp.Position) then
 				dest = rubCover
 			end
+			-- Never hold you inside a big ground nuke / Rubricatus laser line (AutoFloorDodge
+			-- tracks them in SB2RedLaser). After the Wendigo died this hold snapped you back
+			-- to the middle into a 170-wide nuke every frame, undoing the dodge.
+			do
+				local RLm = getgenv().SB2RedLaser
+				if type(RLm) == 'table' and type(RLm.escape) == 'function' then
+					local okEsc, out = pcall(RLm.escape, dest, nil)
+					if okEsc and typeof(out) == 'Vector3' then
+						dest = Vector3.new(out.X, dest.Y, out.Z)
+					end
+					-- Blackout wave: stay inside the orb light (outside it drains 5% HP a tick).
+					if type(RLm.blackoutClamp) == 'function' then
+						local okBo, bo = pcall(RLm.blackoutClamp, dest)
+						if okBo and typeof(bo) == 'Vector3' then
+							dest = bo
+						end
+					end
+				end
+			end
 			-- Reject absurd blinks (boss respawn / void) that explode physics.
 			local fromPos = hrp.Position
 			local jump = (dest - fromPos).Magnitude
@@ -14075,35 +15966,6 @@ local ok, err = pcall(function()
 				else
 					hrp.AssemblyAngularVelocity = Vector3.zero
 				end
-				--#region agent log
-				if math.abs(hrp.AssemblyLinearVelocity.Y) > 12 or math.abs(toDest.Y) > 3 then
-					pcall(function()
-						local now = os.clock()
-						if (now - (getgenv().SB2DbgBobLogAt or 0)) < 0.8 then
-							return
-						end
-						getgenv().SB2DbgBobLogAt = now
-						local line = game:GetService('HttpService'):JSONEncode({
-							sessionId = '7e9135',
-							runId = 'bob-fix',
-							hypothesisId = 'H-bob',
-							location = 'diveWriteCFrame',
-							message = 'y write',
-							data = {
-								destY = math.floor(dest.Y * 10 + 0.5) / 10,
-								posY = math.floor(hrp.Position.Y * 10 + 0.5) / 10,
-								vy = math.floor(hrp.AssemblyLinearVelocity.Y * 10 + 0.5) / 10,
-								lvY = diveLinVel.VectorVelocity.Y,
-								allowVert = writeOpts.allowVerticalVel == true,
-							},
-							timestamp = math.floor(os.clock() * 1000),
-						})
-						if type(appendfile) == 'function' then
-							appendfile('debug-7e9135.log', line .. '\n')
-						end
-					end)
-				end
-				--#endregion
 				lastDiveWritePos = dest
 				diveHoldPos = dest
 				if diving and (writeOpts.hoverHold == true or writeOpts.blink ~= true) then
@@ -14369,6 +16231,16 @@ local ok, err = pcall(function()
 		end
 		getgenv().SB2DiveEnsureHoldConns = diveEnsureHoldConns
 
+		-- AutoFloorDodge: after lava / Bob / orb, move the held point so the hold loop
+		-- stops dragging you back up to the old hover height.
+		getgenv().SB2DiveResetHold = function(pos)
+			if typeof(pos) == 'Vector3' then
+				diveHoldPos = pos
+				lastDiveWritePos = nil
+				getgenv().SB2DivePinPos = pos
+			end
+		end
+
 		local function diveClearHoldConns()
 			diveHoldPos = nil
 			lastDiveWritePos = nil
@@ -14403,8 +16275,21 @@ local ok, err = pcall(function()
 			if getgenv().SB2WaveDefensePlace == true then
 				return true
 			end
+			local wdMode = workspace:GetAttribute('WaveDefenseMode')
+			if type(wdMode) == 'string' and wdMode ~= '' then
+				return true
+			end
+			if workspace:GetAttribute('WaveDefenseEnvironment') ~= nil then
+				return true
+			end
 			local pid = tonumber(game.PlaceId)
-			return pid == 540240728 or pid == 78945654064532 or pid == 580239979
+			-- Event arenas (Atheon etc.) are not story floors — leftover walk
+			-- sanitize was forcing fly-off / clip mid-fall and floating people down pits.
+			return pid == 540240728
+				or pid == 78945654064532
+				or pid == 580239979
+				or pid == 13965775911
+				or pid == 121252145396212
 		end
 		getgenv().SB2IsWdInstanceWorld = isWdInstanceWorld
 
@@ -14436,15 +16321,60 @@ local ok, err = pcall(function()
 			return true
 		end
 
+		local function sb2IgnoreGroundPart(inst)
+			if not inst then
+				return true
+			end
+			if inst:IsA('Terrain') then
+				return false
+			end
+			if inst.Transparency >= 0.99 then
+				return true
+			end
+			local walk = inst
+			while walk do
+				local n = walk.Name
+				if n == 'TeleportMenu' or n == 'CharacterItems' or n == 'Characters' then
+					return true
+				end
+				walk = walk.Parent
+			end
+			return false
+		end
+
+		local function sb2AirborneNow(hrp, hum)
+			if hum then
+				local st = hum:GetState()
+				if st == Enum.HumanoidStateType.Jumping or st == Enum.HumanoidStateType.Freefall then
+					return true
+				end
+			end
+			if hrp then
+				local vy = hrp.AssemblyLinearVelocity.Y
+				if typeof(vy) == 'number' and math.abs(vy) > 6 then
+					return true
+				end
+			end
+			return false
+		end
+
 		local function sb2RestoreStoryWalkCollision()
 			if getgenv().SB2CombatAnchorOn == true or isToggleOn('CombatAnchor') then
+				return
+			end
+			local model = getMyCharacterModel() or LocalPlayer.Character
+			local hum = model and model:FindFirstChildOfClass('Humanoid')
+			local hrp = model and model:FindFirstChild('HumanoidRootPart')
+			if sb2AirborneNow(hrp, hum) then
 				return
 			end
 			if not isToggleOn('DiveFarm') and type(getgenv().SB2DiveSetNoclip) == 'function' then
 				pcall(getgenv().SB2DiveSetNoclip, false)
 			end
-			if type(getgenv().SB2DiveSetFlyHumanoid) == 'function' then
-				pcall(getgenv().SB2DiveSetFlyHumanoid, false)
+			if hum and (hum.PlatformStand or hum:GetState() == Enum.HumanoidStateType.Flying or getgenv().SB2DiveFlyOn == true) then
+				if type(getgenv().SB2DiveSetFlyHumanoid) == 'function' then
+					pcall(getgenv().SB2DiveSetFlyHumanoid, false)
+				end
 			end
 			pcall(getgenv().SB2SetAnchorPlayerNoclip, false)
 			pcall(getgenv().SB2DiveForceClip)
@@ -14459,18 +16389,30 @@ local ok, err = pcall(function()
 			end
 			getgenv().SB2DiveNoclipOn = false
 			getgenv().SB2DiveFlyOn = false
-			local model = getMyCharacterModel() or LocalPlayer.Character
 			if not model then
 				return
 			end
+			if not isToggleOn('SelfFly') then
+				local stopFly = getgenv().SB2SelfFlyStop
+				if getgenv().SB2SelfFlyOn == true and type(stopFly) == 'function' then
+					pcall(stopFly)
+				end
+			end
 			for _, p in ipairs(model:GetDescendants()) do
 				if p:IsA('BasePart') then
-					if p.CollisionGroup == 'SB2DiveNoclip' then
+					-- Fly used to leave SB2SelfNoclip on the body after the toggle was off.
+					-- That group does not hit the map, so you walk through walls.
+					if p.CollisionGroup == 'SB2DiveNoclip' or p.CollisionGroup == 'SB2SelfNoclip' then
 						pcall(function()
 							p.CollisionGroup = 'Players'
 						end)
 					end
-					if SB2_CORE_PART[p.Name] then
+					-- A normal body hits walls with the root and both torsos.
+					-- Leaving those CanCollide false lets you walk through the map.
+					-- The head stays non-colliding, same as other players.
+					if p.Name == 'Head' then
+						p.CanCollide = false
+					elseif SB2_CORE_PART[p.Name] then
 						p.CanCollide = true
 						p.CanTouch = true
 					end
@@ -14502,6 +16444,49 @@ local ok, err = pcall(function()
 				storyFloorYCache.z = pos.Z
 			end
 			return gy
+		end
+
+		local function sb2StandRootY(groundY, hum)
+			local hip = hum and tonumber(hum.HipHeight) or 2
+			return groundY + math.clamp(hip + 1.35, 2.6, 4.0)
+		end
+
+		local function sb2DropLeftoverHover(hrp, hum)
+			if not hrp then
+				return false
+			end
+			if getgenv().SB2DiveFarmOn == true or getgenv().SB2SelfFlyOn == true then
+				return false
+			end
+			if isToggleOn('DiveFarm') or isToggleOn('SelfFly') then
+				return false
+			end
+			if sb2AirborneNow(hrp, hum) then
+				return false
+			end
+			local vy = hrp.AssemblyLinearVelocity.Y
+			if typeof(vy) == 'number' and math.abs(vy) > 3 then
+				return false
+			end
+			local gy = sb2StoryGroundY(hrp)
+			if typeof(gy) ~= 'number' then
+				return false
+			end
+			if (hrp.Position.Y - gy) <= 5.2 then
+				return false
+			end
+			-- Stuck hover only: release into a real fall. Never plant or zero
+			-- velocity — those two are the air-stutter.
+			pcall(function()
+				hrp.Anchored = false
+			end)
+			if hum then
+				hum.PlatformStand = false
+				pcall(function()
+					hum:ChangeState(Enum.HumanoidStateType.Freefall)
+				end)
+			end
+			return true
 		end
 
 		local function diveEnsureIdlePhysics()
@@ -14611,6 +16596,15 @@ local ok, err = pcall(function()
 				return
 			end
 			if workspace:FindFirstChild('WaveDefenseStuff') then
+				return
+			end
+			if isWdInstanceWorld() then
+				return
+			end
+			local airModel = getMyCharacterModel() or LocalPlayer.Character
+			local airHum = airModel and airModel:FindFirstChildOfClass('Humanoid')
+			local airHrp = airModel and airModel:FindFirstChild('HumanoidRootPart')
+			if sb2AirborneNow(airHrp, airHum) then
 				return
 			end
 			if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
@@ -14906,33 +16900,58 @@ local ok, err = pcall(function()
 			local params = RaycastParams.new()
 			params.FilterType = Enum.RaycastFilterType.Exclude
 			local exclude = {}
-			local model = getMyCharacterModel()
-			if model then
-				exclude[#exclude + 1] = model
+			local function add(inst)
+				if inst then
+					exclude[#exclude + 1] = inst
+				end
 			end
-			if LocalPlayer.Character then
-				exclude[#exclude + 1] = LocalPlayer.Character
-			end
-			local items = workspace:FindFirstChild('CharacterItems')
-			if items then
-				exclude[#exclude + 1] = items
+			add(getMyCharacterModel())
+			add(LocalPlayer.Character)
+			add(workspace:FindFirstChild('CharacterItems'))
+			add(workspace:FindFirstChild('Characters'))
+			for _, name in ipairs({ 'NPCs', 'Mobs', 'Enemies', 'Generated NPCs', 'LiveMobs', 'Entities' }) do
+				add(workspace:FindFirstChild(name))
 			end
 			params.FilterDescendantsInstances = exclude
-			-- Cast from near the feet — old ref.Y+40 picked ceilings (The Between).
+			local floorRef = tonumber(getgenv().SB2DiveFloorRefY)
 			local bestY = nil
-			for _, lift in ipairs({ 6, 22, 55 }) do
+			local refHit = nil
+			-- Cast from just above the body. High lifts were picking TeleportMenu
+			-- roofs and invisible pad volumes, then leftover hover planted you there.
+			for _, lift in ipairs({ 3, 8, 18 }) do
 				local origin = Vector3.new(base.X, base.Y + lift, base.Z)
-				local hit = workspace:Raycast(origin, Vector3.new(0, -900, 0), params)
-				if hit and hit.Position.Y <= base.Y + 20 then
-					if not bestY or hit.Position.Y > bestY then
-						bestY = hit.Position.Y
+				local hit = workspace:Raycast(origin, Vector3.new(0, -2500, 0), params)
+				if hit then
+					local inst = hit.Instance
+					if sb2IgnoreGroundPart(inst) then
+						continue
+					end
+					local model = inst and inst:FindFirstAncestorWhichIsA('Model')
+					if model and model:FindFirstChildOfClass('Humanoid') then
+						continue
+					end
+					local y = hit.Position.Y
+					-- Real floors are underfoot. A 12-stud "above" window was the
+					-- ceiling / menu hit that kept people hung in the air.
+					if y <= base.Y + 2.4 and (base.Y - y) <= 220 then
+						if floorRef and math.abs(y - floorRef) <= 28 then
+							refHit = y
+						end
+						if not bestY or y > bestY then
+							bestY = y
+						end
 					end
 				end
+			end
+			if refHit then
+				return refHit
+			end
+			if floorRef and (not bestY or bestY > floorRef + 12) then
+				return floorRef
 			end
 			if bestY then
 				return bestY
 			end
-			local floorRef = tonumber(getgenv().SB2DiveFloorRefY)
 			if floorRef then
 				return floorRef
 			end
@@ -14940,7 +16959,7 @@ local ok, err = pcall(function()
 			if typeof(ref) == 'CFrame' then
 				return ref.Position.Y
 			end
-			return base.Y
+			return nil
 		end
 
 		divePreviewGroundY = function(xzPos)
@@ -15035,7 +17054,7 @@ local ok, err = pcall(function()
 				groundY = hrp.Position.Y - 1
 			end
 			getgenv().SB2DiveFloorRefY = groundY
-			local pos = Vector3.new(hrp.Position.X, groundY + 3, hrp.Position.Z)
+			local pos = Vector3.new(hrp.Position.X, sb2StandRootY(groundY, getMyCharacterModel() and getMyCharacterModel():FindFirstChildOfClass('Humanoid')), hrp.Position.Z)
 			diveReturnCF = CFrame.new(pos) * (hrp.CFrame - hrp.CFrame.Position)
 			getgenv().SB2DiveReturnCF = diveReturnCF
 		end
@@ -15044,164 +17063,34 @@ local ok, err = pcall(function()
 			local cf = diveReturnCF or getgenv().SB2DiveReturnCF
 			diveReturnCF = nil
 			getgenv().SB2DiveReturnCF = nil
-			--#region agent log
-			pcall(function()
-				local line = game:GetService('HttpService'):JSONEncode({
-					sessionId = '7e9135',
-					runId = 'noclip-off',
-					hypothesisId = 'H1,H2',
-					location = 'restoreDiveReturnCF',
-					message = 'restore enter',
-					data = {
-						cfOk = typeof(cf) == 'CFrame',
-						cfType = typeof(cf),
-						farmOn = getgenv().SB2DiveFarmOn == true,
-						toggle = isToggleOn('DiveFarm'),
-						noclipOn = getgenv().SB2DiveNoclipOn == true,
-						gen = diveRestoreGen,
-					},
-					timestamp = math.floor(os.clock() * 1000),
-				})
-				if type(appendfile) == 'function' then
-					appendfile('debug-7e9135.log', line .. '\n')
-				end
-			end)
-			--#endregion
-			if typeof(cf) ~= 'CFrame' then
-				--#region agent log
-				pcall(function()
-					local line = game:GetService('HttpService'):JSONEncode({
-						sessionId = '7e9135',
-						runId = 'noclip-off',
-						hypothesisId = 'H1',
-						location = 'restoreDiveReturnCF',
-						message = 'cf missing — force clip',
-						data = { cfType = typeof(cf) },
-						timestamp = math.floor(os.clock() * 1000),
-					})
-					if type(appendfile) == 'function' then
-						appendfile('debug-7e9135.log', line .. '\n')
-					end
-				end)
-				--#endregion
+			local hrp = getMyBringPart()
+			if not hrp then
 				setDiveNoclip(false)
+				getgenv().SB2DiveFloorRefY = nil
 				return
 			end
-			diveRestoreGen += 1
-			local gen = diveRestoreGen
-			task.spawn(function()
-				-- Do NOT setDiveNoclip(true) here — that re-snapshots CanCollide=false /
-				-- SB2DiveNoclip as "original" and permanently poisons restore.
-				-- Parts are already noclip from the farm session until we clip below.
-				local groundY = divePreviewGroundY(cf.Position)
-				local destPos = Vector3.new(cf.Position.X, groundY + 3, cf.Position.Z)
-				local dest = CFrame.new(destPos) * (cf - cf.Position)
-				-- Immediate snap so disable feels instant.
-				pcall(function()
-					local hrp = getMyBringPart()
-					if hrp then
-						hrp.Anchored = false
-						hrp.CFrame = dest
-						hrp.AssemblyLinearVelocity = Vector3.zero
-						hrp.AssemblyAngularVelocity = Vector3.zero
-					end
-				end)
-				for _ = 1, 24 do
-					if gen ~= diveRestoreGen or getgenv().SB2DiveFarmOn then
-						--#region agent log
-						pcall(function()
-							local line = game:GetService('HttpService'):JSONEncode({
-								sessionId = '7e9135',
-								runId = 'noclip-off',
-								hypothesisId = 'H2',
-								location = 'restoreDiveReturnCF',
-								message = 'early exit mid-loop',
-								data = {
-									gen = gen,
-									curGen = diveRestoreGen,
-									farmOn = getgenv().SB2DiveFarmOn == true,
-									noclipOn = getgenv().SB2DiveNoclipOn == true,
-								},
-								timestamp = math.floor(os.clock() * 1000),
-							})
-							if type(appendfile) == 'function' then
-								appendfile('debug-7e9135.log', line .. '\n')
-							end
-						end)
-						--#endregion
-						if getgenv().SB2DiveFarmOn ~= true and not isToggleOn('DiveFarm') then
-							setDiveNoclip(false)
-						end
-						return
-					end
-					local hrp = getMyBringPart()
-					if not hrp then
-						break
-					end
-					pcall(function()
-						hrp.Anchored = false
-						hrp.CFrame = dest
-						hrp.AssemblyLinearVelocity = Vector3.zero
-						hrp.AssemblyAngularVelocity = Vector3.zero
-					end)
-					if (hrp.Position - dest.Position).Magnitude <= 6 then
-						break
-					end
-					RunService.Heartbeat:Wait()
-				end
-				if gen ~= diveRestoreGen or getgenv().SB2DiveFarmOn then
-					--#region agent log
-					pcall(function()
-						local line = game:GetService('HttpService'):JSONEncode({
-							sessionId = '7e9135',
-							runId = 'noclip-off',
-							hypothesisId = 'H2',
-							location = 'restoreDiveReturnCF',
-							message = 'early exit pre-clip',
-							data = {
-								gen = gen,
-								curGen = diveRestoreGen,
-								farmOn = getgenv().SB2DiveFarmOn == true,
-								noclipOn = getgenv().SB2DiveNoclipOn == true,
-							},
-							timestamp = math.floor(os.clock() * 1000),
-						})
-						if type(appendfile) == 'function' then
-							appendfile('debug-7e9135.log', line .. '\n')
-						end
-					end)
-					--#endregion
-					if getgenv().SB2DiveFarmOn ~= true and not isToggleOn('DiveFarm') then
-						setDiveNoclip(false)
-					end
-					return
-				end
-				setDiveNoclip(false)
-				--#region agent log
-				pcall(function()
-					local hrp = getMyBringPart()
-					local line = game:GetService('HttpService'):JSONEncode({
-						sessionId = '7e9135',
-						runId = 'noclip-off',
-						hypothesisId = 'H3,H4',
-						location = 'restoreDiveReturnCF',
-						message = 'restore done',
-						data = {
-							noclipOn = getgenv().SB2DiveNoclipOn == true,
-							hrpCollide = hrp and hrp.CanCollide,
-							hrpGroup = hrp and hrp.CollisionGroup,
-						},
-						timestamp = math.floor(os.clock() * 1000),
-					})
-					if type(appendfile) == 'function' then
-						appendfile('debug-7e9135.log', line .. '\n')
-					end
-				end)
-				--#endregion
-				pcall(function()
-					LocalPlayer:RequestStreamAroundAsync(dest.Position, 40)
-				end)
+			local from = typeof(cf) == 'CFrame' and cf.Position or hrp.Position
+			local groundY = divePreviewGroundY(from)
+			if typeof(groundY) ~= 'number' then
+				groundY = hrp.Position.Y
+			end
+			local destPos = Vector3.new(from.X, sb2StandRootY(groundY, getMyCharacterModel() and getMyCharacterModel():FindFirstChildOfClass('Humanoid')), from.Z)
+			local dest = CFrame.new(destPos)
+			if typeof(cf) == 'CFrame' then
+				dest = CFrame.new(destPos) * (cf - cf.Position)
+			elseif type(getgenv().SB2UprightWorldCFrame) == 'function' then
+				dest = getgenv().SB2UprightWorldCFrame(CFrame.new(destPos))
+			end
+			pcall(function()
+				hrp.Anchored = false
+				hrp.CFrame = dest
+				hrp.AssemblyLinearVelocity = Vector3.zero
+				hrp.AssemblyAngularVelocity = Vector3.zero
 			end)
+			setDiveNoclip(false)
+			pcall(diveSetFlyHumanoid, false)
+			pcall(sb2DropLeftoverHover, hrp, getMyCharacterModel() and getMyCharacterModel():FindFirstChildOfClass('Humanoid'))
+			getgenv().SB2DiveFloorRefY = nil
 		end
 
 		local function diveFocusStream(cluster)
@@ -16060,6 +17949,10 @@ local ok, err = pcall(function()
 				local sx, sy, sz = size.X, size.Y, size.Z
 				local thick = math.min(sx, sy, sz)
 				local span = math.max(sx, sy, sz)
+				-- The arena floor is a huge disc. Attack markers are not.
+				if span > 80 then
+					return
+				end
 				local flat = thick < 8 and span >= 5
 				local neon = part.Material == Enum.Material.Neon or part.Material == Enum.Material.ForceField
 				local short = #tostring(part.Name) <= 2
@@ -16344,7 +18237,6 @@ local ok, err = pcall(function()
 			getgenv().SB2DiveUnderMap = false
 			getgenv().SB2DivePinPos = nil
 			getgenv().SB2DiveChaseGoal = nil
-			getgenv().SB2DiveFloorRefY = nil
 			getgenv().SB2DiveHoverUnanchorUntil = 0
 			getgenv().SB2DiveApproachUntil = 0
 			diveFleeing = false
@@ -16427,29 +18319,6 @@ local ok, err = pcall(function()
 				lockReplicationFocus(getMyCharacterModel())
 			end)
 			-- Only restore once — Heartbeat + toggle OnChanged both call stop.
-			--#region agent log
-			pcall(function()
-				local line = game:GetService('HttpService'):JSONEncode({
-					sessionId = '7e9135',
-					runId = 'noclip-off',
-					hypothesisId = 'H1,H4',
-					location = 'stopDiveFarm',
-					message = 'stop',
-					data = {
-						restore = restore == true,
-						wasOn = wasOn,
-						farmOn = getgenv().SB2DiveFarmOn == true,
-						toggle = isToggleOn('DiveFarm'),
-						noclipOn = getgenv().SB2DiveNoclipOn == true,
-						hasReturnCF = typeof(diveReturnCF) == 'CFrame' or typeof(getgenv().SB2DiveReturnCF) == 'CFrame',
-					},
-					timestamp = math.floor(os.clock() * 1000),
-				})
-				if type(appendfile) == 'function' then
-					appendfile('debug-7e9135.log', line .. '\n')
-				end
-			end)
-			--#endregion
 			if restore and wasOn then
 				-- Clip immediately — do not wait on async land (that left people
 				-- intangible through death/respawn when restore aborted).
@@ -16793,35 +18662,6 @@ local ok, err = pcall(function()
 				if typeof(arenaGround) == 'number' and fightY < arenaGround + 2 then
 					fightY = arenaGround + math.max(above, 4)
 				end
-				--#region agent log
-				pcall(function()
-					local now = os.clock()
-					if (now - (getgenv().SB2DbgHgtLogAt or 0)) < 0.9 then
-						return
-					end
-					getgenv().SB2DbgHgtLogAt = now
-					local line = game:GetService('HttpService'):JSONEncode({
-						sessionId = '7e9135',
-						runId = 'height-fix',
-						hypothesisId = 'H-h3,H-h4',
-						location = 'diveFightHeights',
-						message = 'fightY',
-						data = {
-							above = math.floor(above * 10 + 0.5) / 10,
-							topY = math.floor(topY * 10 + 0.5) / 10,
-							fightY = math.floor(fightY * 10 + 0.5) / 10,
-							floorY = math.floor(floorY * 10 + 0.5) / 10,
-							bodyH = math.floor(bodyH * 10 + 0.5) / 10,
-							auto = diveAutoHeightOn(),
-							slider = diveOptNumber('DiveFarmHeight', -999),
-						},
-						timestamp = math.floor(os.clock() * 1000),
-					})
-					if type(appendfile) == 'function' then
-						appendfile('debug-7e9135.log', line .. '\n')
-					end
-				end)
-				--#endregion
 				return focusPart, fightY, floorY, Vector3.new(hitPos.X, aimY, hitPos.Z)
 			end
 
@@ -17661,6 +19501,10 @@ local ok, err = pcall(function()
 							continue
 						end
 					end
+					if os.clock() < (tonumber(getgenv().SB2AtheonNukeDashBusyUntil) or 0) then
+						task.wait(0.05)
+						continue
+					end
 
 					local hpFrac = diveHealthFrac()
 					if hpFrac <= DIVE_HP_PANIC then
@@ -17740,9 +19584,15 @@ local ok, err = pcall(function()
 					end
 					if nukeCharge then
 						local rubMob = mob and string.find(normBossKey(mob.Name), 'rubricatus', 1, true)
+						local atheonDash = getgenv().SB2AtheonNukeDashOn == true
+							and mob
+							and (
+								string.find(normBossKey(mob.Name), 'atheon', 1, true)
+								or normBossKey(mob.Name) == 'kindled'
+							)
 						-- Rubricatus nuke is pillar cover, not under-map. Combo fill-ins
 						-- look like growing telegraphs and used to re-arm a 9s cover hold.
-						if not rubMob then
+						if not rubMob and not atheonDash then
 							if os.clock() >= diveNukeUntil then
 								diveNukeAnchor = nil
 							end
@@ -17819,6 +19669,14 @@ local ok, err = pcall(function()
 					end
 					if chargeThreat and isNukeBossMob(mob) and os.clock() >= diveNukeCooldownUntil
 						and not (mob and string.find(normBossKey(mob.Name), 'rubricatus', 1, true))
+						and not (
+							getgenv().SB2AtheonNukeDashOn == true
+							and mob
+							and (
+								string.find(normBossKey(mob.Name), 'atheon', 1, true)
+								or normBossKey(mob.Name) == 'kindled'
+							)
+						)
 					then
 						if os.clock() >= diveNukeUntil then
 							diveNukeAnchor = nil
@@ -18012,33 +19870,6 @@ local ok, err = pcall(function()
 								fightClamp.yMax = stickyFightY + 2
 							end
 						end
-						--#region agent log
-						pcall(function()
-							local now = os.clock()
-							if (now - (getgenv().SB2DbgStickyLogAt or 0)) < 0.9 then
-								return
-							end
-							getgenv().SB2DbgStickyLogAt = now
-							local line = game:GetService('HttpService'):JSONEncode({
-								sessionId = '7e9135',
-								runId = 'height-fix',
-								hypothesisId = 'H-h1,H-h2',
-								location = 'diveStickyY',
-								message = 'sticky',
-								data = {
-									stickyY = math.floor(stickyFightY * 10 + 0.5) / 10,
-									above = math.floor(stickyAbove * 10 + 0.5) / 10,
-									posY = math.floor(myPart.Position.Y * 10 + 0.5) / 10,
-									slider = diveOptNumber('DiveFarmHeight', -999),
-									auto = diveAutoHeightOn(),
-								},
-								timestamp = math.floor(os.clock() * 1000),
-							})
-							if type(appendfile) == 'function' then
-								appendfile('debug-7e9135.log', line .. '\n')
-							end
-						end)
-						--#endregion
 						diveLastCluster = lockedPos
 					end
 
@@ -18151,51 +19982,6 @@ local ok, err = pcall(function()
 								noClamp = orbNow ~= nil,
 							})
 						end
-						--#region agent log
-						do
-							local y = myPart.Position.Y
-							local bag = getgenv().SB2DbgBobBag
-							if type(bag) ~= 'table' then
-								bag = { t0 = os.clock(), ymin = y, ymax = y, n = 0 }
-								getgenv().SB2DbgBobBag = bag
-							end
-							bag.n = (bag.n or 0) + 1
-							if y < bag.ymin then
-								bag.ymin = y
-							end
-							if y > bag.ymax then
-								bag.ymax = y
-							end
-							if (os.clock() - bag.t0) >= 1 then
-								pcall(function()
-									local lvY = diveLinVel and diveLinVel.VectorVelocity.Y or 0
-									local line = game:GetService('HttpService'):JSONEncode({
-										sessionId = '7e9135',
-										runId = 'bob-verify',
-										hypothesisId = 'H-bob',
-										location = 'diveFightLoop',
-										message = 'yRange1s',
-										data = {
-											yRange = math.floor((bag.ymax - bag.ymin) * 100 + 0.5) / 100,
-											ymin = math.floor(bag.ymin * 10 + 0.5) / 10,
-											ymax = math.floor(bag.ymax * 10 + 0.5) / 10,
-											stickY = math.floor(stickyFightY * 10 + 0.5) / 10,
-											posY = math.floor(y * 10 + 0.5) / 10,
-											lvY = math.floor(lvY * 10 + 0.5) / 10,
-											vy = math.floor(myPart.AssemblyLinearVelocity.Y * 10 + 0.5) / 10,
-											station = posDelta <= moveThresh,
-											n = bag.n,
-										},
-										timestamp = math.floor(os.clock() * 1000),
-									})
-									if type(appendfile) == 'function' then
-										appendfile('debug-7e9135.log', line .. '\n')
-									end
-								end)
-								getgenv().SB2DbgBobBag = { t0 = os.clock(), ymin = y, ymax = y, n = 0 }
-							end
-						end
-						--#endregion
 					end
 
 					local hpNow = diveGetMobHealth(mob)
@@ -18534,26 +20320,6 @@ local ok, err = pcall(function()
 			if type(getgenv().SB2PersistCombatPrefs) == 'function' then
 				pcall(getgenv().SB2PersistCombatPrefs)
 			end
-			--#region agent log
-			pcall(function()
-				local line = game:GetService('HttpService'):JSONEncode({
-					sessionId = '7e9135',
-					runId = 'height-fix',
-					hypothesisId = 'H-h1',
-					location = 'DiveFarmHeight.OnChanged',
-					message = 'slider',
-					data = {
-						slider = diveOptNumber('DiveFarmHeight', -999),
-						above = diveFarmAboveStuds(),
-						auto = diveAutoHeightOn(),
-					},
-					timestamp = math.floor(os.clock() * 1000),
-				})
-				if type(appendfile) == 'function' then
-					appendfile('debug-7e9135.log', line .. '\n')
-				end
-			end)
-			--#endregion
 			if isToggleOn('DiveFarm') or getgenv().SB2DiveFarmOn == true then
 				local hrp = getMyBringPart()
 				local dest = hrp and diveIdleHoverPos(hrp)
@@ -18629,28 +20395,6 @@ local ok, err = pcall(function()
 						end)
 					end
 				end
-				--#region agent log
-				pcall(function()
-					local line = game:GetService('HttpService'):JSONEncode({
-						sessionId = '7e9135',
-						runId = 'flee-prefs',
-						hypothesisId = 'H-race',
-						location = 'CombatBox:earlyApplyDivePrefs',
-						message = 'early apply dive prefs',
-						data = {
-							fileFlee = data.DiveFleeDepth,
-							fileBoss = data.DiveFleeDepthBoss,
-							fileH = data.DiveFarmHeight,
-							liveFlee = Options.DiveFleeDepth and Options.DiveFleeDepth.Value,
-							liveBoss = Options.DiveFleeDepthBoss and Options.DiveFleeDepthBoss.Value,
-						},
-						timestamp = math.floor(os.clock() * 1000),
-					})
-					if type(appendfile) == 'function' then
-						appendfile('debug-7e9135.log', line .. '\n')
-					end
-				end)
-				--#endregion
 			end)
 		end)
 
@@ -18786,7 +20530,6 @@ local ok, err = pcall(function()
 		local STRANGER_COMBAT_OFF = {
 			AutoAttack = true,
 			AutoSkill = true,
-			AutoSwing = true,
 			SupportSkill = true,
 			SupportBossOnly = true,
 			DiveFarm = true,
@@ -18794,7 +20537,39 @@ local ok, err = pcall(function()
 			AutoFloorDodge = true,
 			BossWaypointRoute = true,
 			BossComboEnable = true,
+			SelfFly = true,
+			-- AutoSwing left out on purpose: it can stay on with strangers around.
+			AutoWalk = true,
+			HiveBossRouteAll = true,
 		}
+
+		-- Remember which combat toggles the whitelist rule switched off, so they come back
+		-- on by themselves once only whitelisted players are left (survives a server hop).
+		local STRANGER_RESTORE_PATH = 'PlayerTools/stranger_restore.json'
+		local function loadStrangerWasOn()
+			local set = {}
+			pcall(function()
+				if isfile(STRANGER_RESTORE_PATH) then
+					local d = game:GetService('HttpService'):JSONDecode(readfile(STRANGER_RESTORE_PATH))
+					if type(d) == 'table' then
+						for _, n in ipairs(d) do
+							if type(n) == 'string' and STRANGER_COMBAT_OFF[n] then
+								set[n] = true
+							end
+						end
+					end
+				end
+			end)
+			return set
+		end
+		local function saveStrangerWasOn(set)
+			local list = {}
+			for n in pairs(set) do
+				list[#list + 1] = n
+			end
+			pcall(writefile, STRANGER_RESTORE_PATH, game:GetService('HttpService'):JSONEncode(list))
+		end
+		getgenv().SB2StrangerWasOn = getgenv().SB2StrangerWasOn or loadStrangerWasOn()
 
 		local function forceAllCombatOffForStrangers(reason, notifyJoiner)
 			local strangers = type(getgenv().SB2OtherPlayersPresent) == 'function'
@@ -18817,10 +20592,71 @@ local ok, err = pcall(function()
 					local toggle = Toggles[name]
 					if type(toggle) == 'table' and toggle.Value == true and type(toggle.SetValue) == 'function' then
 						if name == 'AutoFloorDodge' then
-							getgenv().SB2StrangerDodgeWasOn = true
+							-- Turned off for strangers, but never turned back on by itself:
+							-- stays off for the rest of this server until you switch it on.
+							getgenv().SB2DodgeStrangerOffThisServer = true
+						else
+							getgenv().SB2StrangerWasOn[name] = true
+							saveStrangerWasOn(getgenv().SB2StrangerWasOn)
 						end
 						toggle:SetValue(false)
 						anyToggle = true
+					end
+				end)
+			end
+			-- Hand movement back to you: drop every hold / pin / hover the dodge or dive
+			-- had on your character, now and again shortly after (a hold can be mid-write).
+			if type(getgenv().SB2ReleaseMovement) ~= 'function' then
+				getgenv().SB2ReleaseMovement = function()
+					pcall(getgenv().SB2StopAutoFloorDodgeLoop or function() end)
+					pcall(getgenv().SB2BreakSoftMovementPin or function() end)
+					pcall(getgenv().SB2ClearWdDodgeHoverState or function() end)
+					pcall(function()
+						local hive = getgenv().SB2Hive
+						if hive and type(hive.stopMovement) == 'function' then
+							hive.stopMovement()
+						end
+					end)
+					for _, k in ipairs({
+						'SB2DivePinPos', 'SB2FloorDodgeGoal', 'SB2WdRiftHopGoal', 'SB2LavaHoverY',
+						'SB2LavaFightY', 'SB2BobHoldY', 'SB2RubFinalPos', 'SB2DiscEscapePos',
+						'SB2WendigoHold', 'SB2DarknerOrbXZ', 'SB2DarknerOrbStandY', 'SB2AnchorLockCF',
+						'SB2TpPinCFrame',
+					}) do
+						getgenv()[k] = nil
+					end
+					getgenv().SB2TpPinActive = false
+					getgenv().SB2TpPinUntil = 0
+					getgenv().SB2AnchorHoldUntil = 0
+					getgenv().SB2BobEscapeActive = false
+					getgenv().SB2LavaEscapeActive = false
+					getgenv().SB2WdRiftHopActive = false
+					getgenv().SB2AutoFloorDodgeOn = false
+					pcall(function()
+						local char = game:GetService('Players').LocalPlayer.Character
+						if not char then
+							return
+						end
+						for _, d in ipairs(char:GetDescendants()) do
+							if d:IsA('BasePart') and d.Anchored then
+								d.Anchored = false
+							end
+						end
+						local hum = char:FindFirstChildOfClass('Humanoid')
+						if hum then
+							hum.PlatformStand = false
+							if hum.WalkSpeed <= 0 then
+								hum.WalkSpeed = 16
+							end
+						end
+					end)
+				end
+			end
+			pcall(getgenv().SB2ReleaseMovement)
+			for _, delayT in ipairs({ 0.3, 1, 2.5 }) do
+				task.delay(delayT, function()
+					if getgenv().SB2StrangerCombatLock == true then
+						pcall(getgenv().SB2ReleaseMovement)
 					end
 				end)
 			end
@@ -18849,6 +20685,17 @@ local ok, err = pcall(function()
 					getgenv().SB2SetBossWaypointRoute(false)
 				end
 			end)
+			pcall(function()
+				if getgenv().SB2SelfFlyOn == true
+					or getgenv().SB2SelfFlyConn ~= nil
+					or (getgenv().SB2SelfFlyVel and getgenv().SB2SelfFlyVel.Parent)
+				then
+					local stopFly = getgenv().SB2SelfFlyStop
+					if type(stopFly) == 'function' then
+						stopFly()
+					end
+				end
+			end)
 			stopCombatRuntime(true)
 			if notifyJoiner and anyToggle then
 				pcall(function()
@@ -18863,6 +20710,60 @@ local ok, err = pcall(function()
 			return true
 		end
 		getgenv().SB2ForceCombatOffForStrangers = forceAllCombatOffForStrangers
+
+		-- Whitelist rule, other half: once only whitelisted players are here, switch back on
+		-- every combat toggle the rule turned off. Auto attack / Auto skill are left to Resume
+		-- when it is on (it teleports you to your waypoint first).
+		do
+			local token = {}
+			getgenv().SB2StrangerRestoreToken = token
+			task.spawn(function()
+				task.wait(4)
+				while getgenv().SB2StrangerRestoreToken == token do
+					pcall(function()
+						local set = getgenv().SB2StrangerWasOn
+						if type(set) ~= 'table' or next(set) == nil then
+							return
+						end
+						local strangersFn = getgenv().SB2OtherPlayersPresent
+						local strangers = type(strangersFn) == 'function' and strangersFn() or otherPlayersPresent()
+						if strangers then
+							return
+						end
+						local resumeOn = type(Toggles.SoloCombatResume) == 'table' and Toggles.SoloCombatResume.Value == true
+						local hubLobby = type(getgenv().SB2IsWaveDefenseHubLobby) == 'function'
+							and getgenv().SB2IsWaveDefenseHubLobby()
+						local restored = {}
+						for name in pairs(set) do
+							local trio = name == 'AutoAttack' or name == 'AutoSkill'
+							if name == 'AutoFloorDodge' then
+								set[name] = nil -- dodge is never auto-restored after strangers
+							elseif trio and (resumeOn or hubLobby) then
+								set[name] = nil -- Resume (or the hub-lobby rule) owns these
+							else
+								local t = Toggles[name]
+								if type(t) == 'table' and type(t.SetValue) == 'function' then
+									if t.Value ~= true then
+										getgenv().SB2DodgeAutoSetting = true
+										pcall(function()
+											t:SetValue(true)
+										end)
+										getgenv().SB2DodgeAutoSetting = false
+										restored[#restored + 1] = tostring(t.Text or name)
+									end
+									set[name] = nil
+								end
+							end
+						end
+						saveStrangerWasOn(set)
+						if #restored > 0 then
+							Library:Notify('Whitelist only — back on: ' .. table.concat(restored, ', '), 5)
+						end
+					end)
+					task.wait(2)
+				end
+			end)
+		end
 
 		local disableCombatForPlayerJoin = function(joiner)
 			if not joiner or joiner == LocalPlayer or isOwnAlt(joiner) then
@@ -18946,8 +20847,17 @@ local ok, err = pcall(function()
 			end
 			stopIfUiOff('AutoFloorDodge', 'SB2AutoFloorDodgeOn', 'SB2AutoFloorDodgeConn')
 			stopIfUiOff('AutoAttack', 'SB2AutoAttackOn', 'SB2AutoAttackConn')
+			stopIfUiOff('AutoWalk', 'SB2AutoWalkOn', 'SB2AutoWalkConn')
 			stopIfUiOff('AutoSkill', 'SB2AutoSkillOn', 'SB2AutoSkillOnlyConn')
 			stopIfUiOff('AutoSwing', nil, 'SB2AutoSwingConn')
+			stopIfUiOff('SelfFly', 'SB2SelfFlyOn', 'SB2SelfFlyConn', function()
+				if getgenv().SB2SelfFlyVel and getgenv().SB2SelfFlyVel.Parent then
+					local stopFly = getgenv().SB2SelfFlyStop
+					if type(stopFly) == 'function' then
+						stopFly()
+					end
+				end
+			end)
 			if getgenv().SB2CombatAnchorOn == true or getgenv().SB2CombatAnchorConn then
 				getgenv().SB2CombatAnchorOn = false
 				local anc = getgenv().SB2CombatAnchorConn
@@ -20985,7 +22895,10 @@ local ok, err = pcall(function()
 					end
 					local name = currentSoloWaypoint()
 					if not name then
-						continue
+						-- No waypoint on this floor (e.g. a Between run joined via a party):
+						-- still turn combat back on, just without the teleport.
+						resumeSoloCombat('boot', true)
+						return
 					end
 					local wp = findSoloWaypointRec(name)
 					local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart')
@@ -21665,6 +23578,44 @@ local ok, err = pcall(function()
 		end
 
 		local InvTab = Window:AddTab('Inventory', 'package')
+		-- Inventory sections start collapsed (like the Wiki tab): collect every groupbox
+		-- added to this tab, then collapse them once the whole tab has been built.
+		;(function()
+			local boxes, done = {}, {}
+			getgenv().SB2InvTabBoxes = boxes
+			for _, m in ipairs({ 'AddLeftGroupbox', 'AddRightGroupbox' }) do
+				local orig = InvTab[m]
+				if type(orig) == 'function' then
+					InvTab[m] = function(self, ...)
+						local box = orig(self, ...)
+						if type(box) == 'table' then
+							boxes[#boxes + 1] = box
+						end
+						return box
+					end
+				end
+			end
+			local function collapseNew()
+				for _, box in ipairs(boxes) do
+					if not done[box] then
+						done[box] = true
+						pcall(function()
+							if type(box.SetCollapsed) == 'function' then
+								box:SetCollapsed(true)
+							end
+						end)
+					end
+				end
+				pcall(function()
+					if type(InvTab.RefreshSides) == 'function' then
+						InvTab:RefreshSides()
+					end
+				end)
+			end
+			-- Second pass catches sections that load a moment later (aura preview).
+			task.delay(0.6, collapseNew)
+			task.delay(3, collapseNew)
+		end)()
 
 		-- Top-right: hide unlocked inventory tiles (show Locked attribute only).
 		local FilterBox = InvTab:AddRightGroupbox('View filter')
@@ -25757,14 +27708,14 @@ local ok, err = pcall(function()
 		local StationsBox = InvTab:AddLeftGroupbox('Stations')
 		assert(StationsBox, 'Stations groupbox nil')
 
-		local function openUiStation(methodName, label)
+		local function openUiStation(methodName, label, arg)
 			local ui = RequiredServices and RequiredServices.UI
 			local fn = ui and ui[methodName]
 			if type(fn) ~= 'function' then
 				Library:Notify(label .. ' unavailable (UI services missing)')
 				return
 			end
-			local ok, err = pcall(fn)
+			local ok, err = pcall(fn, arg)
 			if not ok then
 				Library:Notify(('Failed to open %s: %s'):format(label, tostring(err)))
 			end
@@ -25780,6 +27731,73 @@ local ok, err = pcall(function()
 		StationsBox:AddButton('Open crystal forge', function()
 			openUiStation('openCrystalForge', 'Crystal forge')
 		end)
+		StationsBox:AddButton('Open wave defense forge', function()
+			-- Same forge UI, "Wave Defense" section (Sentinel's Embrace + Corrupted Bursts).
+			openUiStation('openCrystalForge', 'Wave defense forge', 'Wave Defense')
+		end)
+		-- Auto craft Tribute Upgrade Crystals (2 Legendary each) via the crystal forge recipe.
+		;(function()
+			local RS = game:GetService('ReplicatedStorage')
+			local st = getgenv().SB2AutoCraftTribute or {}
+			getgenv().SB2AutoCraftTribute = st
+			st.on = false
+			local function count(name)
+				local prof = RS:FindFirstChild('Profiles') and RS.Profiles:FindFirstChild(LocalPlayer.Name)
+				local it = prof and prof:FindFirstChild('Inventory') and prof.Inventory:FindFirstChild(name)
+				if not it then
+					return 0
+				end
+				local c = it:FindFirstChild('Count')
+				return c and c.Value or 1
+			end
+			local function keepAmount()
+				local o = Options and Options.AutoCraftTributeKeep
+				return math.max(0, math.floor(tonumber(o and o.Value) or 0))
+			end
+			local function run()
+				local made = 0
+				while st.on do
+					local leg = count('Legendary Upgrade Crystal')
+					if leg - 2 < keepAmount() then
+						break
+					end
+					pcall(function()
+						RS.Event:FireServer('Item', { 'Craft', 'Tribute Upgrade Crystal' })
+					end)
+					made += 1
+					task.wait(0.2)
+				end
+				local was = st.on
+				st.on = false
+				st.loop = nil
+				if was then
+					pcall(function()
+						if Toggles and Toggles.AutoCraftTribute and Toggles.AutoCraftTribute.Value then
+							Toggles.AutoCraftTribute:SetValue(false)
+						end
+					end)
+				end
+				Library:Notify(('Tribute crafting done: %d crafted, %d Tribute, %d Legendary left'):format(
+					made, count('Tribute Upgrade Crystal'), count('Legendary Upgrade Crystal')), 6)
+			end
+			StationsBox:AddToggle('AutoCraftTribute', {
+				Text = 'Auto craft Tribute crystals',
+				Default = false,
+				Tooltip = 'Crafts Tribute Upgrade Crystals (2 Legendary each) until Legendary runs out or hits the keep amount.',
+			}):OnChanged(function(v)
+				st.on = v == true
+				if st.on and not st.loop then
+					st.loop = task.spawn(run)
+				end
+			end)
+			StationsBox:AddInput('AutoCraftTributeKeep', {
+				Text = 'Keep Legendary crystals',
+				Default = '0',
+				Numeric = true,
+				Finished = true,
+				Placeholder = '0',
+			})
+		end)()
 		StationsBox:AddButton('Open Ancient Shrine', function()
 			local fn = getgenv().SB2OpenAncientShrine
 			if type(fn) ~= 'function' then
@@ -26954,6 +28972,225 @@ local ok, err = pcall(function()
 			refreshDismantleNameList('', true)
 		end)
 
+		-- Item editor (PlayerTools/ItemEditor.lua): visual-only name / rarity / level / stats
+		-- for items in YOUR inventory screen. Nothing is sent to the server.
+		;(function()
+			local EditBox = InvTab:AddLeftGroupbox('Item editor')
+			if not EditBox then
+				return
+			end
+			local function api()
+				local ed = getgenv().SB2ItemEditor
+				if type(ed) ~= 'table' and type(isfile) == 'function' and isfile('PlayerTools/ItemEditor.lua') then
+					pcall(function()
+						local fn = (loadstring or load)(readfile('PlayerTools/ItemEditor.lua'), '=ItemEditor')
+						if fn then
+							fn()
+						end
+					end)
+					ed = getgenv().SB2ItemEditor
+				end
+				if type(ed) == 'table' then
+					pcall(ed.start)
+					return ed
+				end
+				return nil
+			end
+			local labelToId = {}
+			local labels = {}
+			local token = 0
+			local function refreshList(query)
+				local ed = api()
+				table.clear(labelToId)
+				table.clear(labels)
+				if ed then
+					for _, row in ipairs(ed.list(query, 80)) do
+						labels[#labels + 1] = row.label
+						labelToId[row.label] = row.id
+					end
+				end
+				if Options.ItemEditItem then
+					Options.ItemEditItem:SetValues(labels)
+				end
+			end
+			local function selectedId()
+				local v = Options.ItemEditItem and Options.ItemEditItem.Value
+				if type(v) == 'table' then
+					v = v[1]
+				end
+				return v and labelToId[v]
+			end
+			local function statsToText(list)
+				local parts = {}
+				for _, e in ipairs(list or {}) do
+					parts[#parts + 1] = tostring(e[1]) .. '=' .. tostring(e[2])
+				end
+				return table.concat(parts, '; ')
+			end
+			local function textToStats(text)
+				local out = {}
+				for part in string.gmatch(tostring(text or ''), '[^;]+') do
+					local k, v = string.match(part, '^%s*(.-)%s*=%s*(.-)%s*$')
+					if k and k ~= '' then
+						out[k] = v or ''
+					end
+				end
+				return out
+			end
+			local function setInput(idx, value)
+				local o = Options[idx]
+				if o and type(o.SetValue) == 'function' then
+					pcall(function()
+						o:SetValue(tostring(value or ''))
+					end)
+				end
+			end
+			-- Stats with their own boxes; label must match what the inventory shows.
+			local STAT_FIELDS = {
+				{ 'ItemEditDamage', 'Damage' },
+				{ 'ItemEditCrit', 'Crit' },
+				{ 'ItemEditDefense', 'Defense' },
+				{ 'ItemEditHpRegen', 'Health Regeneration' },
+				{ 'ItemEditStamRegen', 'Stamina Regeneration' },
+			}
+			local function loadFields()
+				local ed = api()
+				local id = selectedId()
+				if not ed or not id then
+					return
+				end
+				local cur = ed.current(id) or {}
+				local ov = ed.get(id) or {}
+				setInput('ItemEditName', ov.name or cur.name or '')
+				setInput('ItemEditType', ov.classname or cur.classname or '')
+				setInput('ItemEditRarity', ov.rarity or cur.rarity or '')
+				setInput('ItemEditLevel', ov.level or cur.level or '')
+				local merged, order = {}, {}
+				for _, e in ipairs(cur.stats or {}) do
+					merged[e[1]] = e[2]
+					order[#order + 1] = e[1]
+				end
+				for k, v in pairs(ov.stats or {}) do
+					if merged[k] == nil then
+						order[#order + 1] = k
+					end
+					merged[k] = v
+				end
+				local own = {}
+				for _, f in ipairs(STAT_FIELDS) do
+					own[f[2]] = true
+					setInput(f[1], merged[f[2]] or '')
+				end
+				local rest = {}
+				for _, k in ipairs(order) do
+					if not own[k] and merged[k] ~= nil then
+						rest[#rest + 1] = { k, merged[k] }
+					end
+				end
+				setInput('ItemEditStats', statsToText(rest))
+			end
+
+			EditBox:AddLabel('Only changes what YOUR inventory shows (name, type line, rarity, level, stats). Real stats are untouched. Reopen the inventory to see changes.', true)
+			EditBox:AddInput('ItemEditQuery', {
+				Text = 'Name contains',
+				Default = '',
+				Placeholder = 'e.g. Angel',
+				Finished = false,
+				ClearTextOnFocus = false,
+				AllowEmpty = true,
+				Callback = function(value)
+					token += 1
+					local my = token
+					task.delay(0.15, function()
+						if my == token then
+							refreshList(value)
+						end
+					end)
+				end,
+			})
+			EditBox:AddDropdown('ItemEditItem', {
+				Text = 'Item (weapons / gear)',
+				Values = labels,
+				AllowNull = true,
+				Searchable = true,
+				Callback = function()
+					loadFields()
+				end,
+			})
+			EditBox:AddInput('ItemEditName', { Text = 'Display name', Default = '', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditType', { Text = 'Type line', Default = '', Placeholder = 'e.g. Limited Katana', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditRarity', { Text = 'Rarity', Default = '', Placeholder = 'e.g. Tribute', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditLevel', { Text = 'Level', Default = '', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditDamage', { Text = 'Damage', Default = '', Placeholder = 'e.g. 170,412', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditCrit', { Text = 'Crit', Default = '', Placeholder = 'e.g. 80%', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditDefense', { Text = 'Defense', Default = '', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditHpRegen', { Text = 'HP regen', Default = '', Placeholder = 'e.g. 60%', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditStamRegen', { Text = 'Stamina regen', Default = '', Placeholder = 'e.g. 70%', Finished = false, ClearTextOnFocus = false, AllowEmpty = true })
+			EditBox:AddInput('ItemEditStats', {
+				Text = 'Other stats',
+				Default = '',
+				Placeholder = 'Label=Value; Label=Value',
+				Finished = false,
+				ClearTextOnFocus = false,
+				AllowEmpty = true,
+			})
+			EditBox:AddButton('Apply to item', function()
+				local ed = api()
+				local id = selectedId()
+				if not ed or not id then
+					Library:Notify('Pick an item first.', 3)
+					return
+				end
+				local function val(idx)
+					local o = Options[idx]
+					return o and tostring(o.Value or '') or ''
+				end
+				local stats = textToStats(val('ItemEditStats'))
+				local cur = ed.current(id) or {}
+				local had = {}
+				for _, e in ipairs(cur.stats or {}) do
+					had[e[1]] = true
+				end
+				for _, f in ipairs(STAT_FIELDS) do
+					local v = val(f[1])
+					-- Blank box: hide a stat the item has; leave absent ones absent.
+					if v ~= '' or had[f[2]] then
+						stats[f[2]] = v
+					end
+				end
+				ed.set(id, {
+					name = val('ItemEditName'),
+					classname = val('ItemEditType'),
+					rarity = val('ItemEditRarity'),
+					level = tonumber(val('ItemEditLevel')),
+					stats = stats,
+				})
+				refreshList(Options.ItemEditQuery and Options.ItemEditQuery.Value or '')
+				Library:Notify('Item edited (visual only). Reopen your inventory to see it.', 4)
+			end)
+			EditBox:AddButton('Reset item', function()
+				local ed = api()
+				local id = selectedId()
+				if ed and id then
+					ed.clear(id)
+					loadFields()
+					refreshList(Options.ItemEditQuery and Options.ItemEditQuery.Value or '')
+					Library:Notify('Item back to its real look.', 3)
+				end
+			end)
+			EditBox:AddButton('Reset all edits', function()
+				local ed = api()
+				if ed then
+					ed.clearAll()
+					refreshList(Options.ItemEditQuery and Options.ItemEditQuery.Value or '')
+					Library:Notify('All item edits removed.', 3)
+				end
+			end)
+			task.delay(1.5, function()
+				refreshList('')
+			end)
+		end)()
+
 		getgenv().SB2RapidInventoryUseBuild = nil
 		getgenv().SB2RapidInventoryUseStop = nil
 		getgenv().SB2RapidInventoryUseStart = nil
@@ -27760,13 +29997,9 @@ local ok, err = pcall(function()
 				descStr = descStr:gsub('"', "'")
 			end
 			lines[#lines + 1] = ('==<span id="%s">[[%s]]=='):format(spanId, chestName)
-			if priceStr ~= '' then
-				lines[#lines + 1] = ("'''Chest Price: %s R$'''<br>"):format(priceStr)
-			else
-				lines[#lines + 1] = "'''Chest Price:  R$'''<br>"
-			end
+			lines[#lines + 1] = ('Chest Price: "%s R$"<br>'):format(priceStr)
 			lines[#lines + 1] = ('"%s"<br>'):format(descStr)
-			lines[#lines + 1] = "'''Made by '''"
+			lines[#lines + 1] = 'Made by axioql'
 			lines[#lines + 1] = ''
 		end
 
@@ -28067,7 +30300,10 @@ local ok, err = pcall(function()
 			local collection = tostring(stats and stats.Class or '')
 			local weaponWord = wikiWeaponClassSingular(folder)
 			if collection ~= '' and kind == 'Weapon' then
-				return collection .. ' (' .. weaponWord .. ')'
+				if collection ~= weaponWord then
+					return collection .. ' <small>(' .. weaponWord .. ')</small>'
+				end
+				return collection
 			end
 			if collection ~= '' then
 				return collection
@@ -28135,11 +30371,16 @@ local ok, err = pcall(function()
 				return a.key < b.key
 			end)
 			local abilities = {}
-			if staminaPct ~= nil then
-				abilities[#abilities + 1] = ('+%s%% Stamina Regeneration'):format(tostring(staminaPct))
-			end
-			if healthPct ~= nil then
-				abilities[#abilities + 1] = ('+%s%% Health Regeneration'):format(tostring(healthPct))
+			local sameRegen = healthPct ~= nil and staminaPct ~= nil and healthPct == staminaPct
+			if sameRegen then
+				abilities[#abilities + 1] = ('+%s%% Health and Stamina Regeneration'):format(tostring(healthPct))
+			else
+				if staminaPct ~= nil then
+					abilities[#abilities + 1] = ('+%s%% Stamina Regeneration'):format(tostring(staminaPct))
+				end
+				if healthPct ~= nil then
+					abilities[#abilities + 1] = ('+%s%% Health Regeneration'):format(tostring(healthPct))
+				end
 			end
 			for _, row in ipairs(other) do
 				local label = prettyStatName(row.key)
@@ -28150,7 +30391,9 @@ local ok, err = pcall(function()
 				end
 			end
 			local proseTail = ''
-			if healthPct ~= nil and staminaPct ~= nil then
+			if sameRegen then
+				proseTail = ('a +%s%% health and stamina regeneration buff'):format(tostring(healthPct))
+			elseif healthPct ~= nil and staminaPct ~= nil then
 				proseTail = ('a +%s%% health regeneration buff and +%s%% stamina regeneration buff'):format(
 					tostring(healthPct),
 					tostring(staminaPct)
@@ -28185,9 +30428,10 @@ local ok, err = pcall(function()
 			end
 			local match = folder:FindFirstChild('MatchBest')
 			if match and match:IsA('ValueBase') then
-				local pct = math.floor((tonumber(match.Value) or 0) * 100 + 0.5)
+				local mult = tonumber(match.Value) or 0
+				local pct = math.floor(mult * 100 + 0.5)
 				if pct > 0 then
-					return statName, pct .. '% of highest base ' .. statName, nil
+					return statName, pct .. '% of highest base ' .. statName, nil, mult
 				end
 			end
 			local scale = folder:FindFirstChild('ScaleByLevel')
@@ -28200,6 +30444,38 @@ local ok, err = pcall(function()
 			return nil, nil, nil
 		end
 
+		local function wikiStatUpgradeValue(folder, statName)
+			local statsFolder = folder and folder:FindFirstChild('Stats')
+			local v = statsFolder and statsFolder:FindFirstChild(statName)
+			if v and v:IsA('ValueBase') then
+				return tonumber(v.Value)
+			end
+			return nil
+		end
+
+		-- Stats.DamageUpgrade <= 0 means the weapon cannot be upgraded.
+		local function wikiDamageUpgradeable(folder)
+			local n = wikiStatUpgradeValue(folder, 'DamageUpgrade')
+			if n ~= nil and n <= 0 then
+				return false
+			end
+			if folder and (folder:FindFirstChild('Unupgradable') or folder:FindFirstChild('Unupgradeable') or folder:FindFirstChild('Starred')) then
+				return false
+			end
+			return true
+		end
+
+		local function wikiDefenseUpgradeable(folder)
+			local n = wikiStatUpgradeValue(folder, 'DefenseUpgrade')
+			if n ~= nil and n <= 0 then
+				return false
+			end
+			if folder and (folder:FindFirstChild('Unupgradable') or folder:FindFirstChild('Unupgradeable') or folder:FindFirstChild('Starred')) then
+				return false
+			end
+			return true
+		end
+
 		local function dumpWikiMerchantItem(name, folder, kind, rarity, level, damage, crit, defense, buffs, merchant)
 			local critPct = wikiPctFromValue(crit)
 			local scaleStat, scaleText, scalePer = wikiStatScale(folder)
@@ -28209,6 +30485,14 @@ local ok, err = pcall(function()
 			local upgDmgText = (not scaledDmg and damage and damage > 0) and wikiCommaNumber(damage * 2) or ''
 			local defText = scaledDef or (defense and defense > 0 and wikiCommaNumber(defense)) or ''
 			local upgDefText = (not scaledDef and defense and defense > 0) and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
+			local dmgUpgradeable = wikiDamageUpgradeable(folder)
+			local defUpgradeable = wikiDefenseUpgradeable(folder)
+			if not dmgUpgradeable then
+				upgDmgText = ''
+			end
+			if not defUpgradeable then
+				upgDefText = ''
+			end
 			local isArmorLike = kind == 'Armor' or kind == 'Shield'
 			local typeLabel = wikiMerchantInfoboxType(folder, kind)
 			local overviewKind = wikiMerchantOverviewKind(folder, kind)
@@ -28235,7 +30519,7 @@ local ok, err = pcall(function()
 			if dmgText ~= '' then
 				if scalePer and scaledDmg then
 					lines[#lines + 1] = '|dmg=Damage based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
-				elseif scaledDmg then
+				elseif scaledDmg or not dmgUpgradeable then
 					lines[#lines + 1] = '|dmg=' .. dmgText
 				else
 					lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
@@ -28250,7 +30534,7 @@ local ok, err = pcall(function()
 			if defText ~= '' then
 				if scalePer and scaledDef then
 					lines[#lines + 1] = '|def=Defense based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
-				elseif scaledDef then
+				elseif scaledDef or not defUpgradeable then
 					lines[#lines + 1] = '|def=' .. defText
 				else
 					lines[#lines + 1] = '|def=Clean: ' .. defText
@@ -28267,7 +30551,11 @@ local ok, err = pcall(function()
 					lines[#lines + 1] = abilities[i]
 				end
 			end
-			lines[#lines + 1] = '|cost=[[File:ShopVelIcon.png|20px]] ' .. wikiCommaNumber(merchant.price)
+			if wikiNormRarity(rarity) == 'Burst' then
+				lines[#lines + 1] = '|cost=Untradable'
+			else
+				lines[#lines + 1] = '|cost=[[File:ShopVelIcon.png|20px]] ' .. wikiCommaNumber(merchant.price)
+			end
 			lines[#lines + 1] = '|obtain=' .. shopLink
 			lines[#lines + 1] = '}}'
 			lines[#lines + 1] = ''
@@ -28290,7 +30578,6 @@ local ok, err = pcall(function()
 					else
 						overview = overview .. (' It scales by %s Damage per level.'):format(wikiCommaNumber(scalePer))
 					end
-					overview = overview .. (' When the player is at level {{CurrentMaxLevel}}, it deals {{DamageLvl|base=%s}} damage.'):format(tostring(scalePer))
 				elseif critPct then
 					overview = overview .. (' It has a %s%% critical chance and scales with %s.'):format(
 						tostring(critPct),
@@ -28311,10 +30598,7 @@ local ok, err = pcall(function()
 			end
 			if scaledDef then
 				if scalePer then
-					overview = overview .. (' It scales by %s Defense per level. When the player is at level {{CurrentMaxLevel}}, it provides {{DamageLvl|base=%s}} defense.'):format(
-						wikiCommaNumber(scalePer),
-						tostring(scalePer)
-					)
+					overview = overview .. (' It scales by %s Defense per level.'):format(wikiCommaNumber(scalePer))
 				else
 					overview = overview .. (' It scales with %s.'):format(defText)
 				end
@@ -28333,6 +30617,9 @@ local ok, err = pcall(function()
 			elseif dmgText ~= '' and upgDmgText ~= '' then
 				overview = overview
 					.. (' When [[Upgrading|upgraded]] to +20, it does %s damage.'):format(upgDmgText)
+			end
+			if kind == 'Weapon' and not dmgUpgradeable then
+				overview = overview .. ' This weapon can not be upgraded to do more damage.'
 			end
 			if buffProse ~= '' then
 				overview = overview .. (' In addition, it grants the user %s.'):format(buffProse)
@@ -28367,13 +30654,18 @@ local ok, err = pcall(function()
 			end
 			local abilities = {}
 			local prose = {}
-			if healthPct ~= nil then
-				abilities[#abilities + 1] = ('+%s%% Health Regeneration'):format(tostring(healthPct))
-				prose[#prose + 1] = ('+%s%% health regeneration buff'):format(tostring(healthPct))
-			end
-			if staminaPct ~= nil then
-				abilities[#abilities + 1] = ('+%s%% Stamina Regeneration'):format(tostring(staminaPct))
-				prose[#prose + 1] = ('+%s%% stamina regeneration buff'):format(tostring(staminaPct))
+			if healthPct ~= nil and staminaPct ~= nil and healthPct == staminaPct then
+				abilities[#abilities + 1] = ('+%s%% Health and Stamina Regeneration'):format(tostring(healthPct))
+				prose[#prose + 1] = ('+%s%% health and stamina regeneration buff'):format(tostring(healthPct))
+			else
+				if healthPct ~= nil then
+					abilities[#abilities + 1] = ('+%s%% Health Regeneration'):format(tostring(healthPct))
+					prose[#prose + 1] = ('+%s%% health regeneration buff'):format(tostring(healthPct))
+				end
+				if staminaPct ~= nil then
+					abilities[#abilities + 1] = ('+%s%% Stamina Regeneration'):format(tostring(staminaPct))
+					prose[#prose + 1] = ('+%s%% stamina regeneration buff'):format(tostring(staminaPct))
+				end
 			end
 			for _, row in ipairs(other) do
 				local label = prettyStatName(row.key)
@@ -28418,7 +30710,6 @@ local ok, err = pcall(function()
 				'|type=Weapon',
 				'|rarity=' .. rarity,
 				'|level=',
-				'|obtain=[[]]',
 			}
 			if #abilities == 0 then
 				lines[#lines + 1] = '|abilities='
@@ -28440,7 +30731,6 @@ local ok, err = pcall(function()
 			end
 			lines[#lines + 1] = overview
 			lines[#lines + 1] = ''
-			lines[#lines + 1] = "The drop rate for this item is '''???'''."
 			lines[#lines + 1] = '[[Category:' .. wikiRarityCategory(rarity) .. ']]'
 			return table.concat(lines, '\n')
 		end
@@ -28473,8 +30763,11 @@ local ok, err = pcall(function()
 					lines[#lines + 1] = abilities[i]
 				end
 			end
-			lines[#lines + 1] = '|cost=None'
-			lines[#lines + 1] = '|obtain=[[]]'
+			if wikiNormRarity(rarity) == 'Burst' and (tonumber(valueOf(folder, 'Vel')) or 0) > 0 then
+				lines[#lines + 1] = '|cost=Untradable'
+			else
+				lines[#lines + 1] = '|cost=None'
+			end
 			lines[#lines + 1] = '|description='
 			lines[#lines + 1] = '}}'
 			lines[#lines + 1] = ''
@@ -28534,14 +30827,288 @@ local ok, err = pcall(function()
 			end
 
 			local critPct = wikiPctFromValue(crit)
-			local scaleStat, scaleText, scalePer = wikiStatScale(folder)
+			local scaleStat, scaleText, scalePer, matchMult = wikiStatScale(folder)
 			local scaledDmg = scaleStat == 'Damage' and scaleText and (scalePer or not damage or damage <= 0) and scaleText or nil
 			local scaledDef = scaleStat == 'Defense' and scaleText and (scalePer or not defense or defense <= 0) and scaleText or nil
 			local dmgText = scaledDmg or (damage and damage > 0 and wikiCommaNumber(damage)) or ''
 			local upgDmgText = (not scaledDmg and damage and damage > 0) and wikiCommaNumber(damage * 2) or ''
+			if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Damage' then
+				local extra = ''
+				if math.abs(matchMult - 1.1) > 0.0005 then
+					extra = '|mult=' .. tostring(matchMult)
+				end
+				dmgText = '{{MatchBest' .. extra .. '}}'
+				-- Burst 80% copies stay on that clean number through +20 (same percent of the
+				-- weapon fully upgraded). +25 is 100% of that fully upgraded weapon, which the
+				-- live template writes as mult=1 and max=yes (double the base damage).
+				if wikiNormRarity(rarity) == 'Burst' and math.abs(matchMult - 0.8) < 0.0005 then
+					upgDmgText = '{{MatchBest|mult=1|max=yes}}'
+				else
+					upgDmgText = '{{MatchBest' .. extra .. '|max=yes}}'
+				end
+				scaledDmg = dmgText
+			end
 			local defText = scaledDef or (defense and defense > 0 and wikiCommaNumber(defense)) or ''
 			local upgDefText = (not scaledDef and defense and defense > 0) and wikiCommaNumber(wikiMaxDefense(defense, rarity)) or ''
+			if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Defense' then
+				local extra = ''
+				if math.abs(matchMult - 0.3) > 0.0005 then
+					extra = '|mult=' .. tostring(matchMult)
+				end
+				defText = '{{MatchBestDef' .. extra .. '}}'
+				upgDefText = '{{MatchBestDef' .. extra .. '|max=yes}}'
+				scaledDef = defText
+			end
+			local dmgUpgradeable = wikiDamageUpgradeable(folder)
+			local defUpgradeable = wikiDefenseUpgradeable(folder)
+			if not dmgUpgradeable then
+				upgDmgText = ''
+			end
+			if not defUpgradeable and not (type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Defense') then
+				upgDefText = ''
+			end
 			local abilities, buffProse = wikiBuffAbilityLines(buffs)
+
+			local recipeFolder = folder:FindFirstChild('Recipe')
+			if
+				type(name) == 'string'
+				and string.sub(name, 1, 10) == 'Corrupted '
+				and wikiNormRarity(rarity) == 'Burst'
+				and recipeFolder
+			then
+				-- MatchBest keeps the templates set above. A flat ScaleByLevel line
+				-- only replaces a placeholder when this item is not Match Best.
+				if scaleStat == 'Damage' and scaleText and not (type(matchMult) == 'number' and matchMult > 0) then
+					scaledDmg = scaleText
+					dmgText = scaleText
+					upgDmgText = ''
+				end
+				if scaleStat == 'Defense' and scaleText then
+					if not (type(matchMult) == 'number' and matchMult > 0) then
+						scaledDef = scaleText
+						defText = scaleText
+						upgDefText = ''
+					end
+				end
+				if wikiNormRarity(rarity) == 'Burst' and not scaledDmg and damage and damage > 1 then
+					upgDmgText = wikiCommaNumber(math.floor(damage * 2.5 + 0.5))
+				end
+				local typeName = tostring(valueOf(folder, 'Type') or '')
+				local forgeTypeLabel = typeLabel
+				local forgeOverviewWord = overviewWord
+				if kind == 'Weapon' then
+					forgeTypeLabel = wikiWeaponClassSingular(folder)
+					forgeOverviewWord = string.lower(forgeTypeLabel)
+				elseif typeName == 'Accessory' then
+					forgeTypeLabel = 'Accessory'
+					forgeOverviewWord = 'accessory'
+				elseif kind == 'Armor' then
+					forgeTypeLabel = 'Armor'
+					forgeOverviewWord = 'armor'
+				elseif kind == 'Shield' then
+					forgeTypeLabel = 'Shield'
+					forgeOverviewWord = 'shield'
+				else
+					forgeOverviewWord = string.lower(tostring(overviewWord or 'item'))
+				end
+				local maxUp = wikiMaxUpgradeLevel(rarity)
+				local forgeLines = {
+					'{{ItemID}}',
+					'{{Item infobox',
+					'|name=' .. name,
+					'|image=<gallery>',
+					name .. '.png | Icon',
+					name .. ' in-game.png | In-game',
+					name .. ' gif.gif | In-game effect',
+					'</gallery>',
+					'|type=' .. forgeTypeLabel,
+					'|rarity=' .. rarity,
+					'|level=' .. (level and tostring(level) or ''),
+				}
+				if (tonumber(valueOf(folder, 'Vel')) or 0) > 0 or (tonumber(valueOf(recipeFolder, 'Vel')) or 0) > 0 then
+					forgeLines[#forgeLines + 1] = '|cost=Untradable'
+				end
+				if dmgText ~= '' then
+					if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Damage' and math.abs(matchMult - 0.8) < 0.0005 then
+						forgeLines[#forgeLines + 1] = '|dmg=Clean: 80%<br>Max: 100%'
+					elseif type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Damage' and upgDmgText ~= '' then
+						forgeLines[#forgeLines + 1] = '|dmg=Clean: ' .. dmgText .. '<br>Max: ' .. upgDmgText
+					elseif scaledDmg or not dmgUpgradeable then
+						forgeLines[#forgeLines + 1] = '|dmg=' .. dmgText
+					else
+						forgeLines[#forgeLines + 1] = '|dmg=Clean: ' .. dmgText
+						if upgDmgText ~= '' then
+							forgeLines[#forgeLines + 1] = 'Max: ' .. upgDmgText
+						end
+					end
+				end
+				if critPct then
+					forgeLines[#forgeLines + 1] = '|crit=' .. tostring(critPct) .. '%'
+				end
+				if defText ~= '' then
+					if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Defense' then
+						if upgDefText ~= '' then
+							forgeLines[#forgeLines + 1] = '|def=Clean: ' .. defText .. '<br>Max: ' .. upgDefText
+						else
+							forgeLines[#forgeLines + 1] = '|def=' .. defText
+						end
+					else
+						forgeLines[#forgeLines + 1] = '|def=' .. defText
+					end
+				end
+				forgeLines[#forgeLines + 1] = '|obtain=[[Wave Defense Forge]]'
+				if #abilities == 0 then
+					forgeLines[#forgeLines + 1] = '|abilities='
+				else
+					forgeLines[#forgeLines + 1] = '|abilities=' .. abilities[1]
+					for i = 2, #abilities do
+						forgeLines[#forgeLines + 1] = abilities[i]
+					end
+				end
+				forgeLines[#forgeLines + 1] = '}}'
+				forgeLines[#forgeLines + 1] = '== Overview =='
+				local overview = ("'''{{PAGENAME}}''' is a %s"):format(wikiRarityTag(rarity))
+				if level then
+					overview = overview .. (' level %d'):format(level)
+				end
+				overview = overview
+					.. (' %s, from the [[Wave Defense Forge]].'):format(forgeOverviewWord)
+				if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Defense' then
+					local pct = math.floor(matchMult * 100 + 0.5)
+					overview = overview .. (' Clean, it provides %s%% of the strongest upgradeable armor\'s base defense.'):format(
+						tostring(pct)
+					)
+					if upgDefText ~= '' and math.abs(matchMult - 1.1) > 0.0005 then
+						overview = overview
+							.. (' Fully upgraded, it provides %s%% of that armor fully upgraded.'):format(tostring(pct))
+					end
+				elseif scaledDef then
+					overview = overview .. (' It scales with %s.'):format(defText)
+				elseif isArmorLike and defText ~= '' then
+					overview = overview .. (' At base, it provides the player with %s defenses'):format(defText)
+					if upgDefText ~= '' then
+						overview = overview
+							.. (', and when [[Upgrading|upgraded]] to +%d, it provides the player with %s defense.'):format(
+								maxUp,
+								upgDefText
+							)
+					else
+						overview = overview .. '.'
+					end
+				elseif scaledDmg then
+					if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Damage' then
+						local pct = math.floor(matchMult * 100 + 0.5)
+						if critPct then
+							overview = overview .. (' It has a %s%% critical chance.'):format(tostring(critPct))
+						end
+						if wikiNormRarity(rarity) == 'Burst' and math.abs(matchMult - 0.8) < 0.0005 then
+							overview = overview .. '\n\nDamage breakdown:\n* Clean: 80% of that weapon\'s base damage.\n* +20: 80% of that weapon\'s max damage.\n* +25: the same damage as that weapon at max, which is 100%.\n\n+1 to +20 only get you to the 80% mark. +21-25 add the last 20%.'
+						else
+							overview = overview .. (' Clean, it does %s%% of the strongest upgradeable weapon\'s base damage.'):format(
+								tostring(pct)
+							)
+							if upgDmgText ~= '' then
+								overview = overview .. ' When [[Upgrading|upgraded]] to +20, that damage is doubled.'
+							end
+						end
+					elseif critPct then
+						overview = overview .. (' It has a %s%% critical chance and scales with %s.'):format(
+							tostring(critPct),
+							dmgText
+						)
+					else
+						overview = overview .. (' It scales with %s.'):format(dmgText)
+					end
+				elseif critPct then
+					overview = overview .. (' It has a %s%% critical chance'):format(tostring(critPct))
+					if dmgText ~= '' then
+						overview = overview .. (' and does %s damage.'):format(dmgText)
+					else
+						overview = overview .. '.'
+					end
+					if dmgText ~= '' and upgDmgText ~= '' then
+						overview = overview
+							.. (' When [[Upgrading|upgraded]] to +%d, it does %s damage.'):format(maxUp, upgDmgText)
+					end
+				elseif dmgText ~= '' then
+					overview = overview .. (' It does %s damage.'):format(dmgText)
+					if upgDmgText ~= '' then
+						overview = overview
+							.. (' When [[Upgrading|upgraded]] to +%d, it does %s damage.'):format(maxUp, upgDmgText)
+					end
+				end
+				if kind == 'Weapon' and not dmgUpgradeable then
+					overview = overview .. ' This weapon can not be upgraded to do more damage.'
+				end
+				if #buffProse > 0 then
+					overview = overview
+						.. (' In addition, it grants the user a %s.'):format(wikiJoinBuffProse(buffProse))
+				end
+				forgeLines[#forgeLines + 1] = overview
+				local velAmt = tonumber(valueOf(recipeFolder, 'Vel')) or 0
+				local velText
+				if velAmt >= 1000000 and velAmt % 1000000 == 0 then
+					velText = wikiCommaNumber(velAmt / 1000000) .. ' Million'
+				elseif velAmt > 0 then
+					velText = wikiCommaNumber(velAmt)
+				end
+				if velText then
+					forgeLines[#forgeLines + 1] = ''
+					forgeLines[#forgeLines + 1] = ('To craft, it requires %s [[Vel]] as well as the following items:'):format(
+						velText
+					)
+				else
+					forgeLines[#forgeLines + 1] = ''
+					forgeLines[#forgeLines + 1] = 'To craft, it requires the following items:'
+				end
+				forgeLines[#forgeLines + 1] = ''
+				local matOrder = {
+					['Corrupted Flame'] = 10,
+					['Elite Shard'] = 20,
+					['Refined Remnant'] = 30,
+					['Ancient Data Chip'] = 40,
+					['Experimental Ore'] = 50,
+					['Infernal Ore'] = 60,
+					['Nuclear Ore'] = 70,
+					['Radiated Ore'] = 80,
+					['Rare Shard'] = 90,
+					['Normal Shard'] = 100,
+				}
+				local mats = {}
+				for _, child in ipairs(recipeFolder:GetChildren()) do
+					if child:IsA('ValueBase') and child.Name ~= 'Vel' then
+						mats[#mats + 1] = {
+							name = child.Name,
+							count = tonumber(child.Value) or 0,
+						}
+					end
+				end
+				table.sort(mats, function(a, b)
+					local oa = matOrder[a.name] or 0
+					local ob = matOrder[b.name] or 0
+					if oa ~= ob then
+						return oa < ob
+					end
+					return a.name < b.name
+				end)
+				for _, mat in ipairs(mats) do
+					forgeLines[#forgeLines + 1] = ('* %s [[%s]] {{ItemIcon|%s}}'):format(
+						tostring(mat.count),
+						mat.name,
+						mat.name
+					)
+				end
+				forgeLines[#forgeLines + 1] = ''
+				if wikiNormRarity(rarity) == 'Burst' then
+					forgeLines[#forgeLines + 1] = '[[Category:Burst]]'
+				else
+					forgeLines[#forgeLines + 1] = '[[Category:' .. wikiRarityCategory(rarity) .. ']]'
+				end
+				forgeLines[#forgeLines + 1] = '[[Category:Wave Defense Forge]]'
+				forgeLines[#forgeLines + 1] = '[[Category:Craft Item]]'
+				return table.concat(forgeLines, '\n')
+			end
+
 			local baseName = name
 			local iconFile = baseName .. '.png'
 			local inGameFile = baseName .. ' in-game.png'
@@ -28553,21 +31120,33 @@ local ok, err = pcall(function()
 				'|image=<gallery>',
 				iconFile .. ' | Icon',
 				inGameFile .. ' | In-game',
+				baseName .. ' gif.gif | In-game effect',
 			}
-			if kind == 'Weapon' then
-				lines[#lines + 1] = baseName .. ' gif.gif | In-game effect'
-			end
 			lines[#lines + 1] = '</gallery>'
-			if kind == 'Weapon' and (folder:FindFirstChild('Untradeable') or folder:FindFirstChild('Untradable')) then
+			if wikiNormRarity(rarity) == 'Burst' and (
+				(tonumber(valueOf(folder, 'Vel')) or 0) > 0
+				or folder:FindFirstChild('Untradeable')
+				or folder:FindFirstChild('Untradable')
+			) then
+				lines[#lines + 1] = '|cost=Untradable'
+			elseif kind == 'Weapon' and (folder:FindFirstChild('Untradeable') or folder:FindFirstChild('Untradable')) then
 				lines[#lines + 1] = '|cost=Untradable'
 			end
 			lines[#lines + 1] = '|type=' .. typeLabel
 			lines[#lines + 1] = '|rarity=' .. rarity
 			lines[#lines + 1] = '|level=' .. (level and tostring(level) or '')
 			if dmgText ~= '' then
-				if scalePer and scaledDmg then
+				if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Damage' then
+					if wikiNormRarity(rarity) == 'Burst' and math.abs(matchMult - 0.8) < 0.0005 and type(name) == 'string' and string.sub(name, 1, 10) == 'Corrupted ' then
+						lines[#lines + 1] = '|dmg=Clean: 80%<br>Max: 100%'
+					elseif upgDmgText ~= '' then
+						lines[#lines + 1] = '|dmg=Clean: ' .. dmgText .. '<br>Max: ' .. upgDmgText
+					else
+						lines[#lines + 1] = '|dmg=' .. dmgText
+					end
+				elseif scalePer and scaledDmg then
 					lines[#lines + 1] = '|dmg=Damage based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
-				elseif scaledDmg then
+				elseif scaledDmg or not dmgUpgradeable then
 					lines[#lines + 1] = '|dmg=' .. dmgText
 				else
 					lines[#lines + 1] = '|dmg=Clean: ' .. dmgText
@@ -28580,9 +31159,15 @@ local ok, err = pcall(function()
 				lines[#lines + 1] = '|crit=' .. tostring(critPct) .. '%'
 			end
 			if defText ~= '' then
-				if scalePer and scaledDef then
+				if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Defense' then
+					if upgDefText ~= '' then
+						lines[#lines + 1] = '|def=Clean: ' .. defText .. '<br>Max: ' .. upgDefText
+					else
+						lines[#lines + 1] = '|def=' .. defText
+					end
+				elseif scalePer and scaledDef then
 					lines[#lines + 1] = '|def=Defense based on level.<br>+' .. wikiCommaNumber(scalePer) .. ' per level'
-				elseif scaledDef then
+				elseif scaledDef or not defUpgradeable then
 					lines[#lines + 1] = '|def=' .. defText
 				else
 					lines[#lines + 1] = '|def=Clean: ' .. defText
@@ -28591,7 +31176,9 @@ local ok, err = pcall(function()
 					end
 				end
 			end
-			lines[#lines + 1] = '|obtain=[[]]'
+			if recipeFolder then
+				lines[#lines + 1] = '|obtain=[[Wave Defense Forge]]'
+			end
 			if #abilities == 0 then
 				lines[#lines + 1] = '|abilities='
 				lines[#lines + 1] = '}}'
@@ -28610,13 +31197,23 @@ local ok, err = pcall(function()
 				if level then
 					overview = overview .. (' level %d'):format(level)
 				end
-				overview = overview .. (' %s, dropped by [[???]] in [[]].'):format(overviewWord)
+				if recipeFolder then
+					overview = overview .. (' %s, from the [[Wave Defense Forge]].'):format(overviewWord)
+				else
+					overview = overview .. (' %s, dropped by [[???]] in [[]].'):format(overviewWord)
+				end
 				if scaledDef then
-					if scalePer then
-						overview = overview .. (' It scales by %s Defense per level. When the player is at level {{CurrentMaxLevel}}, it provides {{DamageLvl|base=%s}} defense.'):format(
-							wikiCommaNumber(scalePer),
-							tostring(scalePer)
+					if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Defense' then
+						local pct = math.floor(matchMult * 100 + 0.5)
+						overview = overview .. (' Clean, it provides %s%% of the strongest upgradeable armor\'s base defense.'):format(
+							tostring(pct)
 						)
+						if upgDefText ~= '' and math.abs(matchMult - 1.1) > 0.0005 then
+							overview = overview
+								.. (' Fully upgraded, it provides %s%% of that armor fully upgraded.'):format(tostring(pct))
+						end
+					elseif scalePer then
+						overview = overview .. (' It scales by %s Defense per level.'):format(wikiCommaNumber(scalePer))
 					else
 						overview = overview .. (' It scales with %s.'):format(defText)
 					end
@@ -28633,7 +31230,22 @@ local ok, err = pcall(function()
 						overview = overview .. '.'
 					end
 				elseif scaledDmg then
-					if scalePer then
+					if type(matchMult) == 'number' and matchMult > 0 and scaleStat == 'Damage' then
+						local pct = math.floor(matchMult * 100 + 0.5)
+						if critPct then
+							overview = overview .. (' It has a %s%% critical chance.'):format(tostring(critPct))
+						end
+						if wikiNormRarity(rarity) == 'Burst' and math.abs(matchMult - 0.8) < 0.0005 then
+							overview = overview .. '\n\nDamage breakdown:\n* Clean: 80% of that weapon\'s base damage.\n* +20: 80% of that weapon\'s max damage.\n* +25: the same damage as that weapon at max, which is 100%.\n\n+1 to +20 only get you to the 80% mark. +21-25 add the last 20%.'
+						else
+							overview = overview .. (' Clean, it does %s%% of the strongest upgradeable weapon\'s base damage.'):format(
+								tostring(pct)
+							)
+							if upgDmgText ~= '' then
+								overview = overview .. ' When [[Upgrading|upgraded]] to +20, that damage is doubled.'
+							end
+						end
+					elseif scalePer then
 						if critPct then
 							overview = overview .. (' It has a %s%% critical chance and scales by %s Damage per level.'):format(
 								tostring(critPct),
@@ -28642,7 +31254,6 @@ local ok, err = pcall(function()
 						else
 							overview = overview .. (' It scales by %s Damage per level.'):format(wikiCommaNumber(scalePer))
 						end
-						overview = overview .. (' When the player is at level {{CurrentMaxLevel}}, it deals {{DamageLvl|base=%s}} damage.'):format(tostring(scalePer))
 					elseif critPct then
 						overview = overview .. (' It has a %s%% critical chance and scales with %s.'):format(
 							tostring(critPct),
@@ -28670,14 +31281,20 @@ local ok, err = pcall(function()
 					end
 				end
 			end
+			if kind == 'Weapon' and not dmgUpgradeable then
+				overview = overview .. ' This weapon can not be upgraded to do more damage.'
+			end
 			if #buffProse > 0 then
 				overview = overview
 					.. (' In addition, it grants the user a %s.'):format(wikiJoinBuffProse(buffProse))
 			end
 			lines[#lines + 1] = overview
 			lines[#lines + 1] = ''
-			lines[#lines + 1] = "The drop rate for this item is '''???'''."
 			lines[#lines + 1] = '[[Category:' .. wikiRarityCategory(rarity) .. ']]'
+			if recipeFolder then
+				lines[#lines + 1] = '[[Category:Wave Defense Forge]]'
+				lines[#lines + 1] = '[[Category:Craft Item]]'
+			end
 			return table.concat(lines, '\n')
 		end
 
@@ -28749,17 +31366,37 @@ local ok, err = pcall(function()
 			end)
 
 			local lines = {
-				'{{Aura Chest Page',
-				('|chest = %s'):format(chestName),
+				('[[File:%s.png|center|thumb]]'):format(chestName),
+				'',
+				'{| class="fandom-table" style="text-align:center;"',
+				'!Aura',
+				'!Image',
+				'!In-game Effect',
 			}
-			local lower = chestName:lower()
-			if lower:find('event', 1, true) then
-				lines[#lines + 1] = '|event = yes'
+			for _, row in ipairs(wikiRows) do
+				local auraName = row.name
+				lines[#lines + 1] = '|-'
+				lines[#lines + 1] = '{{Aura Gallery'
+				lines[#lines + 1] = '| title = ' .. auraName
+				lines[#lines + 1] = '| icon = ' .. auraName .. '.png'
+				lines[#lines + 1] = '| image1 = ' .. auraName .. ' ING.png'
+				lines[#lines + 1] = '| image2 = ' .. auraName .. ' GIF2.gif'
+				lines[#lines + 1] = '}}'
 			end
-			for i, row in ipairs(wikiRows) do
-				lines[#lines + 1] = ('|%d = %s'):format(i, row.name)
+			lines[#lines + 1] = '|}'
+			lines[#lines + 1] = '==Trivia=='
+			lines[#lines + 1] = ''
+			lines[#lines + 1] = '[[Category:Burst Store]]'
+			lines[#lines + 1] = '[[Category:Aura]]'
+			lines[#lines + 1] = '[[Category:Accessory]]'
+			lines[#lines + 1] = '[[Category:Robux]]'
+			lines[#lines + 1] = '[[Category:Items]]'
+			lines[#lines + 1] = '[[Category:Accessories]]'
+			lines[#lines + 1] = '[[Category:Chest]]'
+			if chestName:lower():find('event', 1, true) then
+				lines[#lines + 1] = '[[Category:Event]]'
+				lines[#lines + 1] = '[[Category:Event Aura]]'
 			end
-			lines[#lines + 1] = '}}'
 			return table.concat(lines, '\n')
 		end
 
@@ -29510,18 +32147,6 @@ local ok, err = pcall(function()
 			end
 		end)
 
-		DiffBox:AddButton('Copy IDs: mob variants', function()
-			copyMobVariantTagIcons()
-		end)
-
-		DiffBox:AddButton('Copy IDs: skills', function()
-			copySkillIconIds()
-		end)
-
-		DiffBox:AddButton('Copy: blessings ranges', function()
-			copyBlessingsValueRanges()
-		end)
-
 		DiffBox:AddButton('Copy wiki: all new', function()
 			local text, err = dumpAllNewWiki()
 			if not text then
@@ -29594,14 +32219,6 @@ local ok, err = pcall(function()
 
 		getgenv().SB2WriteWikiBatch34 = writeWikiBatch34
 
-		DiffBox:AddButton('Write wiki files: batch 34', function()
-			local ok, err = pcall(writeWikiBatch34)
-			if not ok then
-				warn('[PlayerTools Wiki] batch 34 error: ' .. tostring(err))
-				Library:Notify('Wiki batch 34 error: ' .. tostring(err), 10)
-			end
-		end)
-
 		DiffBox:AddButton('Save current DB as known', function()
 			local ok, n = saveKnownFromLive()
 			if not ok then
@@ -29615,36 +32232,6 @@ local ok, err = pcall(function()
 			local msg = ('Saved %d items as known. Next patch will only flag additions.'):format(n)
 			setLabel(statusLabel, msg)
 			Library:Notify(msg, 6)
-		end)
-
-		DiffBox:AddButton('Forget selected (test)', function()
-			local name = currentSelectedName()
-			if not name then
-				Library:Notify('Pick a search match or new-list item first')
-				return
-			end
-			local ok, removed = forgetNames({ name })
-			if not ok or #removed == 0 then
-				Library:Notify(name .. ' was not in the snapshot')
-				return
-			end
-			Library:Notify('Forgot ' .. name .. ' — scanning')
-			runScan(true)
-		end)
-
-		DiffBox:AddButton('Forget 3 random (test)', function()
-			local picks = pickRandomKnown(3)
-			if #picks == 0 then
-				Library:Notify('No known names to forget — save a snapshot first')
-				return
-			end
-			local ok, removed = forgetNames(picks)
-			if not ok or #removed == 0 then
-				Library:Notify('Could not update items_known.json')
-				return
-			end
-			Library:Notify('Forgot: ' .. table.concat(removed, ', '), 8)
-			runScan(true)
 		end)
 
 		local function applySearch(query)
@@ -30709,23 +33296,10 @@ local ok, err = pcall(function()
 		end
 	end)
 
-	HomeBox:AddToggle('FarmFps', {
-		Text = 'Farm FPS (potato graphics)',
-		Default = getgenv().SB2FarmFpsOn == true,
-		Tooltip = 'Quality 1 + no global shadows + no bloom/blur. Skill clone janitor always runs separately. Turn off on the main if you want pretty graphics.',
-	}):OnChanged(function(value)
-		if value then
-			if type(getgenv().SB2StartFarmFps) == 'function' then
-				getgenv().SB2StartFarmFps()
-			else
-				getgenv().SB2FarmFpsOn = true
-			end
-		elseif type(getgenv().SB2StopFarmFps) == 'function' then
-			getgenv().SB2StopFarmFps()
-		else
-			getgenv().SB2FarmFpsOn = false
-		end
-	end)
+	-- Farm FPS (potato graphics) toggle removed from Home; make sure it isn't left running.
+	if getgenv().SB2FarmFpsOn == true and type(getgenv().SB2StopFarmFps) == 'function' then
+		pcall(getgenv().SB2StopFarmFps)
+	end
 
 	Menu:AddButton('Test notification', function()
 		Library:Notify(
@@ -30788,6 +33362,366 @@ local ok, err = pcall(function()
 			end
 		end)
 	end)()
+	-- Hide "Vel Obtained" chat spam. Lives in PlayerTools/ClearVelChat.lua (moved out of CCI.iy).
+	;(function()
+		local path = joinPath(CONFIG.ConfigFolder, 'clearvel')
+		local function fileOn()
+			if type(isfile) == 'function' and type(readfile) == 'function' then
+				local ok, exists = pcall(isfile, path)
+				if ok and exists then
+					local okRead, body = pcall(readfile, path)
+					if okRead then
+						return tostring(body):lower():gsub('%s+', '') ~= 'false'
+					end
+				end
+			end
+			return getgenv().SB2FriendDefaultsOff ~= true
+		end
+		local function writeFile(on)
+			if type(makefolder) ~= 'function' or type(writefile) ~= 'function' then
+				return
+			end
+			local folder = CONFIG.ConfigFolder
+			if folder ~= '' and folder ~= '.' and type(isfolder) == 'function' and not isfolder(folder) then
+				makefolder(folder)
+			end
+			pcall(writefile, path, on and 'true' or 'false')
+		end
+		local function apply(on)
+			if not on then
+				if type(getgenv().SB2SetClearVel) == 'function' then
+					pcall(getgenv().SB2SetClearVel, false)
+				end
+				return true
+			end
+			if type(getgenv().SB2SetClearVel) ~= 'function' then
+				local loaded = false
+				for _, modPath in ipairs({ 'PlayerTools/ClearVelChat.lua', 'ClearVelChat.lua' }) do
+					if type(isfile) == 'function' and isfile(modPath) then
+						local ok, err = pcall(function()
+							local fn, cerr = (loadstring or load)(readfile(modPath), '=ClearVelChat')
+							assert(fn, cerr)
+							fn()
+						end)
+						if ok then
+							loaded = true
+							break
+						end
+						warn('[ClearVelChat] load failed: ' .. tostring(err))
+					end
+				end
+				if not loaded then
+					return false
+				end
+			end
+			local ok = pcall(getgenv().SB2SetClearVel, true)
+			return ok
+		end
+		HomeBox:AddToggle('ClearVelChat', {
+			Text = 'Hide "Vel Obtained" chat',
+			Default = fileOn(),
+			Tooltip = 'Blocks the Vel Obtained chat spam (was part of CCI). Saved in PlayerTools/clearvel.',
+		}):OnChanged(function(value)
+			writeFile(value == true)
+			if not apply(value == true) and value then
+				Library:Notify('Missing PlayerTools/ClearVelChat.lua', 5)
+			end
+		end)
+		task.defer(function()
+			if fileOn() then
+				apply(true)
+			end
+		end)
+	end)()
+	-- Boss effects lite: hides Rubricatus' laggy lightning/particle eye candy (attacks stay visible).
+	-- Lives in PlayerTools/BossFxLite.lua; saved in PlayerTools/bossfxlite.
+	;(function()
+		local path = joinPath(CONFIG.ConfigFolder, 'bossfxlite')
+		local function fileOn()
+			if type(isfile) == 'function' and type(readfile) == 'function' then
+				local ok, exists = pcall(isfile, path)
+				if ok and exists then
+					local okRead, body = pcall(readfile, path)
+					if okRead then
+						return tostring(body):lower():gsub('%s+', '') ~= 'false'
+					end
+				end
+			end
+			return getgenv().SB2FriendDefaultsOff ~= true
+		end
+		local function writeFile(on)
+			if type(makefolder) ~= 'function' or type(writefile) ~= 'function' then
+				return
+			end
+			local folder = CONFIG.ConfigFolder
+			if folder ~= '' and folder ~= '.' and type(isfolder) == 'function' and not isfolder(folder) then
+				makefolder(folder)
+			end
+			pcall(writefile, path, on and 'true' or 'false')
+		end
+		local function apply(on)
+			if not on then
+				if type(getgenv().SB2SetBossFxLite) == 'function' then
+					pcall(getgenv().SB2SetBossFxLite, false)
+				end
+				return true
+			end
+			if type(getgenv().SB2SetBossFxLite) ~= 'function' then
+				local loaded = false
+				for _, modPath in ipairs({ 'PlayerTools/BossFxLite.lua', 'BossFxLite.lua' }) do
+					if type(isfile) == 'function' and isfile(modPath) then
+						local ok, err = pcall(function()
+							local fn, cerr = (loadstring or load)(readfile(modPath), '=BossFxLite')
+							assert(fn, cerr)
+							fn()
+						end)
+						if ok then
+							loaded = true
+							break
+						end
+						warn('[BossFxLite] load failed: ' .. tostring(err))
+					end
+				end
+				if not loaded then
+					return false
+				end
+			end
+			local ok = pcall(getgenv().SB2SetBossFxLite, true)
+			return ok
+		end
+		HomeBox:AddToggle('BossFxLite', {
+			Text = 'Reduce boss effect lag',
+			Default = fileOn(),
+			Tooltip = 'Hides Rubricatus lightning, particles, glows and stone shards. The attacks themselves (laser line, warnings, discs, spikes) stay visible. Saved in PlayerTools/bossfxlite.',
+		}):OnChanged(function(value)
+			writeFile(value == true)
+			if not apply(value == true) and value then
+				Library:Notify('Missing PlayerTools/BossFxLite.lua', 5)
+			end
+		end)
+		task.defer(function()
+			if fileOn() then
+				apply(true)
+			end
+		end)
+	end)()
+	-- Item origin in the inventory click menu (PlayerTools/OriginInfo.lua). Saved in origininfo.
+	;(function()
+		local FLAG = joinPath(CONFIG.ConfigFolder, 'origininfo')
+		local function wanted()
+			if type(isfile) == 'function' and type(readfile) == 'function' then
+				local ok, exists = pcall(isfile, FLAG)
+				if ok and exists then
+					local okRead, body = pcall(readfile, FLAG)
+					if okRead then
+						return (tostring(body):lower():gsub('%s+', '')) ~= 'false'
+					end
+				end
+			end
+			return getgenv().SB2FriendDefaultsOff ~= true
+		end
+		local function apply(on)
+			if type(getgenv().SB2SetOriginInfo) ~= 'function' and type(isfile) == 'function' and isfile('PlayerTools/OriginInfo.lua') then
+				pcall(function()
+					local fn = (loadstring or load)(readfile('PlayerTools/OriginInfo.lua'), '=OriginInfo')
+					if fn then
+						fn()
+					end
+				end)
+			end
+			if type(getgenv().SB2SetOriginInfo) == 'function' then
+				pcall(getgenv().SB2SetOriginInfo, on == true)
+			end
+		end
+		HomeBox:AddToggle('OriginInfo', {
+			Text = 'Show item origin on click',
+			Default = wanted(),
+			Tooltip = 'Clicking an item in your inventory also shows who first owned it (Origin: name [UserId]). Saved in PlayerTools/origininfo.',
+		}):OnChanged(function(value)
+			if type(writefile) == 'function' then
+				pcall(writefile, FLAG, value and 'true' or 'false')
+			end
+			apply(value == true)
+		end)
+		task.delay(2, function()
+			if wanted() then
+				apply(true)
+			end
+		end)
+	end)()
+	-- Hit effects / map effects lite (PlayerTools/HitFxLite.lua). Saved in hitfxlite / mapfxlite.
+	;(function()
+		local function flagPath(name)
+			return joinPath(CONFIG.ConfigFolder, name)
+		end
+		local function fileOn(name)
+			if type(isfile) == 'function' and type(readfile) == 'function' then
+				local ok, exists = pcall(isfile, flagPath(name))
+				if ok and exists then
+					local okRead, body = pcall(readfile, flagPath(name))
+					if okRead then
+						return tostring(body):lower():gsub('%s+', '') == 'true'
+					end
+				end
+			end
+			return false
+		end
+		local function writeFlag(name, on)
+			if type(writefile) == 'function' then
+				pcall(writefile, flagPath(name), on and 'true' or 'false')
+			end
+		end
+		local function ensureLoaded()
+			if type(getgenv().SB2SetHitFxLite) == 'function' then
+				return true
+			end
+			for _, modPath in ipairs({ 'PlayerTools/HitFxLite.lua', 'HitFxLite.lua' }) do
+				if type(isfile) == 'function' and isfile(modPath) then
+					local ok, err = pcall(function()
+						local fn, cerr = (loadstring or load)(readfile(modPath), '=HitFxLite')
+						assert(fn, cerr)
+						fn()
+					end)
+					if ok then
+						return true
+					end
+					warn('[HitFxLite] load failed: ' .. tostring(err))
+				end
+			end
+			return false
+		end
+		HomeBox:AddToggle('HitFxLite', {
+			Text = 'Hide hit effects + damage numbers',
+			Default = fileOn('hitfxlite'),
+			Tooltip = 'Hides hit sparks and turns the game damage numbers off (only on your screen). Off puts them back. Saved in PlayerTools/hitfxlite.',
+		}):OnChanged(function(value)
+			writeFlag('hitfxlite', value == true)
+			if ensureLoaded() then
+				pcall(getgenv().SB2SetHitFxLite, value == true)
+				if not value and type(getgenv().SB2EnsureDamageIndicators) == 'function' then
+					pcall(getgenv().SB2EnsureDamageIndicators, 'hit fx off')
+				end
+			elseif value then
+				Library:Notify('Missing PlayerTools/HitFxLite.lua', 5)
+			end
+		end)
+		HomeBox:AddToggle('MapFxLite', {
+			Text = 'Hide map particles',
+			Default = fileOn('mapfxlite'),
+			Tooltip = 'Turns off the map torches / smoke / glow particles, beams and trails (only on your screen). Attacks, warnings, skills, players and mobs are never touched. Saved in PlayerTools/mapfxlite.',
+		}):OnChanged(function(value)
+			writeFlag('mapfxlite', value == true)
+			if ensureLoaded() then
+				local ok, n = pcall(getgenv().SB2SetMapFxLite, value == true)
+				if value and ok and Library then
+					Library:Notify(('Map particles off: %d'):format(tonumber(n) or 0), 3)
+				end
+			elseif value then
+				Library:Notify('Missing PlayerTools/HitFxLite.lua', 5)
+			end
+		end)
+		task.delay(1, function()
+			if fileOn('hitfxlite') and ensureLoaded() then
+				pcall(getgenv().SB2SetHitFxLite, true)
+			end
+		end)
+		-- Map parts stream in after join; switch map particles off once it has settled.
+		task.delay(10, function()
+			if fileOn('mapfxlite') and ensureLoaded() then
+				pcall(getgenv().SB2SetMapFxLite, true)
+			end
+		end)
+	end)()
+	-- Inventory themes: re-skin the game's inventory window (only on your screen).
+	-- Lives in PlayerTools/InventoryThemes.lua; choice saved in PlayerTools/inv_theme.
+	;(function()
+		local path = joinPath(CONFIG.ConfigFolder, 'inv_theme')
+		-- Full list comes from the module (more themes get added there); this is only a fallback.
+		local names = { 'Default', 'Midnight', 'Crimson', 'Glass', 'Mono', 'Gold', 'Sakura' }
+		local function saved()
+			if type(isfile) == 'function' and type(readfile) == 'function' then
+				local ok, exists = pcall(isfile, path)
+				if ok and exists then
+					local okRead, body = pcall(readfile, path)
+					if okRead then
+						local v = tostring(body):match('^%s*(.-)%s*$') -- keep inner spaces ('Frosted Glass')
+						for _, n in ipairs(names) do
+							if n == v then
+								return v
+							end
+						end
+					end
+				end
+			end
+			return 'Default'
+		end
+		local function save(name)
+			if type(makefolder) ~= 'function' or type(writefile) ~= 'function' then
+				return
+			end
+			local folder = CONFIG.ConfigFolder
+			if folder ~= '' and folder ~= '.' and type(isfolder) == 'function' and not isfolder(folder) then
+				makefolder(folder)
+			end
+			pcall(writefile, path, tostring(name))
+		end
+		local function ensureLoaded()
+			if type(getgenv().SB2SetInventoryTheme) == 'function' then
+				return true
+			end
+			for _, modPath in ipairs({ 'PlayerTools/InventoryThemes.lua', 'InventoryThemes.lua' }) do
+				if type(isfile) == 'function' and isfile(modPath) then
+					local ok, err = pcall(function()
+						local fn, cerr = (loadstring or load)(readfile(modPath), '=InventoryThemes')
+						assert(fn, cerr)
+						fn()
+					end)
+					if ok then
+						return true
+					end
+					warn('[InventoryThemes] load failed: ' .. tostring(err))
+				end
+			end
+			return false
+		end
+		local function apply(name)
+			if name == 'Default' and type(getgenv().SB2SetInventoryTheme) ~= 'function' then
+				return true
+			end
+			if not ensureLoaded() then
+				return false
+			end
+			return (pcall(getgenv().SB2SetInventoryTheme, name))
+		end
+		if ensureLoaded() and type(getgenv().SB2InventoryThemeNames) == 'table' then
+			names = getgenv().SB2InventoryThemeNames
+		end
+		local themeDropdown = Menu:AddDropdown('InventoryTheme', {
+			Text = 'Inventory theme',
+			Values = names,
+			Default = saved(),
+			AllowNull = false,
+			Tooltip = 'Re-skin the in-game inventory (only you see it). Also switchable from the Theme button on the inventory itself.',
+		})
+		local themeOpt = themeDropdown or (Options and Options.InventoryTheme)
+		if themeOpt and themeOpt.OnChanged then
+			themeOpt:OnChanged(function(value)
+				value = tostring(value or 'Default')
+				save(value)
+				if not apply(value) then
+					Library:Notify('Missing PlayerTools/InventoryThemes.lua', 5)
+				end
+			end)
+		end
+		task.defer(function()
+			-- Always load it so the Theme button shows inside the game's inventory.
+			ensureLoaded()
+			local name = saved()
+			if name ~= 'Default' then
+				apply(name)
+			end
+		end)
+	end)()
 	Menu:AddButton('Rejoin stuck loading now', function()
 		if LoadSkip.overlayUp() then
 			LoadSkip.rejoin('settings')
@@ -30827,14 +33761,56 @@ local ok, err = pcall(function()
 		if isToggleOn('DiveFarm') then
 			Toggles.DiveFarm:SetValue(false)
 		end
+		if Toggles.SelfFly and Toggles.SelfFly.Value then
+			Toggles.SelfFly:SetValue(false)
+		end
+		if type(getgenv().SB2SelfFlyStop) == 'function' then
+			pcall(getgenv().SB2SelfFlyStop)
+		end
+		if type(getgenv().SB2ClearVelStop) == 'function' then
+			pcall(getgenv().SB2ClearVelStop)
+		end
+		if type(getgenv().SB2BossFxLiteStop) == 'function' then
+			pcall(getgenv().SB2BossFxLiteStop)
+		end
+		if type(getgenv().SB2HitFxLiteStop) == 'function' then
+			pcall(getgenv().SB2HitFxLiteStop)
+		end
+		if type(getgenv().SB2OriginInfoStop) == 'function' then
+			pcall(getgenv().SB2OriginInfoStop)
+		end
+		if type(getgenv().SB2ItemEditor) == 'table' and type(getgenv().SB2ItemEditor.stop) == 'function' then
+			pcall(getgenv().SB2ItemEditor.stop)
+		end
+		if type(getgenv().SB2AutoBoost) == 'table' and getgenv().SB2AutoBoost.loop then
+			pcall(task.cancel, getgenv().SB2AutoBoost.loop)
+			getgenv().SB2AutoBoost.loop = nil
+		end
+		if type(getgenv().SB2AutoCraftTribute) == 'table' then
+			getgenv().SB2AutoCraftTribute.on = false
+		end
+		if type(getgenv().SB2AutoWaveSkip) == 'table' and getgenv().SB2AutoWaveSkip.loop then
+			pcall(task.cancel, getgenv().SB2AutoWaveSkip.loop)
+			getgenv().SB2AutoWaveSkip.loop = nil
+		end
+		if type(getgenv().SB2InventoryThemeStop) == 'function' then
+			pcall(getgenv().SB2InventoryThemeStop)
+		end
 		-- Stop hive runtime only. Do not SetValue(false) on HiveEnabled — OnChanged
 		-- would write optin false and sticky-drop this client from the peer list on reload.
 		if type(getgenv().SB2HiveStop) == 'function' then
 			pcall(getgenv().SB2HiveStop)
 		end
-		if RequiredServices and isToggleOn('ViewPlayersInventory') then
-			Toggles.ViewPlayersInventory:SetValue(false)
-			pcall(debug.setupvalue, RequiredServices.InventoryUI.GetInventoryData, 2, Profile)
+		if RequiredServices then
+			if isToggleOn('ViewPlayersInventory') and Toggles.ViewPlayersInventory then
+				Toggles.ViewPlayersInventory:SetValue(false)
+			end
+			pcall(function()
+				local mine = liveOwnProfile and liveOwnProfile() or Profile
+				if RequiredServices.InventoryUI and mine then
+					debug.setupvalue(RequiredServices.InventoryUI.GetInventoryData, 2, mine)
+				end
+			end)
 		end
 		if type(getgenv().SB2InvFilterCleanup) == 'function' then
 			pcall(getgenv().SB2InvFilterCleanup)
@@ -30918,6 +33894,13 @@ local ok, err = pcall(function()
 			'FarmSupportSkillName',
 			'FarmHealSkillName',
 			'FarmMendSkillName',
+			-- Own save files (between_follow.json / autoboost75): profile autoload must not flip them off.
+			'BetweenFollowFriend',
+			'BetweenAutoDifficulty',
+			'BetweenEliteFirst',
+			'BetweenFollowNames',
+			'BetweenFollowFallback',
+			'AutoBoost75',
 			-- SoloCombatResume / AutoBlockJoin intentionally NOT ignored —
 			-- Ignore skipped LoadJSON so Overwrite looked like it never stuck.
 		})
