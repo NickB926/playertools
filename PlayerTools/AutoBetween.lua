@@ -11,7 +11,7 @@
 	Autoload: autoexec/02_autobetween.lua (every account except NickB926, which runs PlayerTools).
 ]]
 
-local BUILD = 'auto-between-v14'
+local BUILD = 'auto-between-v22'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -1379,6 +1379,9 @@ end
 --   Rift wave: as soon as the Rifts of Chaos have spawned.
 --   Bob wave: as soon as its first mob has spawned.
 --   Wisp wave ("Seek those with a binding light"): mobs spawned and 2s after the dialogue has closed.
+--   Saurus (Elite, wave 23): as soon as he has spawned.
+--   Elite boss waves (ELITE_BOSS_WAVES below): as soon as the wave's boss(es) have spawned.
+--   Vaelith, the Riftborn (any wave, also after the Rift wave's own reset): as soon as he has spawned.
 --   Rubricatus: once he has finished spawning (stopped descending), plus a delay (2s).
 -- Sent once per wave on the command bar's own remote, so the bar is never opened.
 -- To add more waves later: add another branch in step() that calls fire() when its moment comes.
@@ -1388,20 +1391,26 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 	local okReset, errReset = pcall(function()
 		local RESET_COMMAND = 'ResetMobs;@all'
 		local LOG_PATH = 'PlayerTools/_resetmobs_log_' .. ACCT .. '.txt'
-		if settings.resetThunder == nil then
-			settings.resetThunder = true
-		end
-		if settings.resetRub == nil then
-			settings.resetRub = true
-		end
-		if settings.resetRift == nil then
-			settings.resetRift = true
-		end
-		if settings.resetBob == nil then
-			settings.resetBob = true
-		end
-		if settings.resetWisp == nil then
-			settings.resetWisp = true
+		-- keep the log from growing forever: past 300 KB, keep only the newest 100 KB
+		pcall(function()
+			if isfile(LOG_PATH) then
+				local text = readfile(LOG_PATH)
+				if #text > 300000 then
+					local tail = string.sub(text, #text - 100000)
+					writefile(LOG_PATH, string.sub(tail, (string.find(tail, '\n', 1, true) or 0) + 1))
+				end
+			end
+		end)
+		if settings.resetMobs == nil then
+			-- one switch now; stays off only if every old per-wave switch had been turned off
+			local anyOld, anyOn = false, false
+			for _, key in ipairs({ 'resetThunder', 'resetRub', 'resetRift', 'resetBob', 'resetWisp', 'resetSaurus', 'resetEliteBosses' }) do
+				if settings[key] ~= nil then
+					anyOld = true
+					anyOn = anyOn or settings[key] == true
+				end
+			end
+			settings.resetMobs = (not anyOld) or anyOn
 		end
 		if type(settings.resetRubDelay) ~= 'number' then
 			settings.resetRubDelay = 2
@@ -1419,44 +1428,12 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 		end
 
 		local ModBox = MainTab:AddLeftGroupbox('Auto ResetMobs')
-		ModBox:AddToggle('ABResetThunder', {
-			Text = 'On the thunder wave',
-			Default = settings.resetThunder == true,
-			Tooltip = 'Tempest wave: sends ' .. RESET_COMMAND .. ' once the dialogue at the bottom is gone and the lightning has started.',
+		ModBox:AddToggle('ABResetMobs', {
+			Text = 'Auto ResetMobs',
+			Default = settings.resetMobs == true,
+			Tooltip = 'Sends ' .. RESET_COMMAND .. ' by itself on: the thunder, Rift, Bob and Wisp waves, Saurus (Elite 23), the Elite boss waves (38-98), Vaelith and Rubricatus.',
 		}):OnChanged(function(v)
-			settings.resetThunder = v == true
-			saveSettings()
-		end)
-		ModBox:AddToggle('ABResetRift', {
-			Text = 'On the Rift wave',
-			Default = settings.resetRift == true,
-			Tooltip = 'Rift wave: sends ' .. RESET_COMMAND .. ' as soon as the Rifts of Chaos have spawned.',
-		}):OnChanged(function(v)
-			settings.resetRift = v == true
-			saveSettings()
-		end)
-		ModBox:AddToggle('ABResetBob', {
-			Text = 'On the Bob wave',
-			Default = settings.resetBob == true,
-			Tooltip = 'Bob wave: sends ' .. RESET_COMMAND .. ' as soon as its first mob has spawned.',
-		}):OnChanged(function(v)
-			settings.resetBob = v == true
-			saveSettings()
-		end)
-		ModBox:AddToggle('ABResetWisp', {
-			Text = 'On the Wisp wave',
-			Default = settings.resetWisp == true,
-			Tooltip = 'Wisp wave ("Seek those with a binding light"): sends ' .. RESET_COMMAND .. ' 2 seconds after the dialogue at the bottom has closed (mobs must have spawned).',
-		}):OnChanged(function(v)
-			settings.resetWisp = v == true
-			saveSettings()
-		end)
-		ModBox:AddToggle('ABResetRub', {
-			Text = 'On Rubricatus',
-			Default = settings.resetRub == true,
-			Tooltip = 'Sends ' .. RESET_COMMAND .. ' after Rubricatus has fully spawned, plus the delay below.',
-		}):OnChanged(function(v)
-			settings.resetRub = v == true
+			settings.resetMobs = v == true
 			saveSettings()
 		end)
 		ModBox:AddSlider('ABResetRubDelay', {
@@ -1510,16 +1487,93 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 		local WISP_DELAY = 2 -- seconds after the dialogue closes
 		local rubMob, rubSeenAt, rubLastPos, rubStillAt, rubReadyAt = nil, nil, nil, nil, nil
 		local riftSeenAt = nil -- first Rift of Chaos seen this wave
+		local bossSeenAt = nil -- first boss seen on an Elite boss wave
+		-- Vaelith has his own once-per-wave guard: he shows up after the Rift wave's reset was already sent.
+		local vaelithFiredWave = G.SB2AutoResetFiredVaelith
+		if vaelithFiredWave ~= wave then
+			vaelithFiredWave = nil
+			G.SB2AutoResetFiredVaelith = nil
+		end
+		-- Elite boss waves: wave -> the bosses to reset (name part, lower case; "^" = name starts with;
+		-- and how many of them). Other mobs on the wave are ignored. Every time one of them newly
+		-- appears the command is sent (again), so bosses that spawn late get their own reset; bosses that
+		-- appear within BOSS_BATCH seconds of each other share one. "delay" = extra seconds before sending.
+		local ELITE_BOSS_WAVES = {
+			[38] = { { 'atheon', 1 } },
+			[42] = { { 'tworz', 1 } },
+			[44] = { { 'eternal blossom knight', 1 } },
+			[48] = { { 'azeis', 1 } },
+			[50] = { { 'aegor', 1 } },
+			[54] = { { 'the waiter', 1 } }, -- the boss here is The Waiter (Rapapouillie is an ordinary mob, also on 60/62)
+			[57] = { { 'meatball', 1 } },
+			[61] = { { 'ramseis', 1 } },
+			[66] = { { 'kraken', 1 } },
+			[69] = { { 'leviathan', 1 } },
+			[73] = { { 'aeganatos', 1 } },
+			[75] = { { 'nythrane', 1 }, delay = 2 },
+			[79] = { { 'magnor', 1 } },
+			[82] = { { 'bulswick', 1 } },
+			[83] = { { 'egnor', 1 } },
+			[84] = { { 'cucurbita', 1 } },
+			[85] = { { 'headless horseman', 1 } },
+			[86] = { { 'wendigo', 1 } },
+			[87] = { { 'dracula', 1 } },
+			[89] = { { 'baal', 1 }, { 'magnor', 1 } },
+			[90] = { { 'cucurbita', 1 }, { 'grim, the overseer', 1 } },
+			[91] = { { 'egnor', 1 }, { '^ka, the', 1 }, { '^da, the', 1 }, { '^ra, the', 1 }, { '^za, the', 1 }, { '^wa, the', 1 } }, -- Egnor + the F11 minis
+			[92] = { { 'saurus, the', 1 }, { 'headless horseman', 1 } },
+			[93] = { { 'wendigo', 1 }, { 'radioactive', 1 }, { 'warlord', 1 } },
+			[94] = { { 'uriotol', 1 }, { 'duality reaper', 1 } },
+			[95] = { { 'dracula', 1 }, { 'rekindled', 2 } },
+			[96] = { { 'atheon', 3 } },
+			[97] = { { 'corrupted atheon', 1 } },
+			[98] = { { 'dracula', 1 }, { 'headless horseman', 1 } },
+		}
+		local BOSS_BATCH = 1
+		local bossNewAt = nil -- when a not-yet-reset boss was first seen
+		local bossMissNoted = false
+		-- how many of each boss on this wave already had a reset sent (kept across a reload)
+		local bossCovered = {}
+		-- The boss mobs themselves that already had a reset sent. Counting by instance, not by how
+		-- many are alive at once: on wave 96 the 3rd Atheon showed up after one of the first two had
+		-- died, the alive count never got past 2, and it was never reset.
+		local bossInst = setmetatable({}, { __mode = 'k' })
+		if type(G.SB2AutoResetBossCovered) == 'table' and G.SB2AutoResetBossCovered.wave == wave then
+			bossCovered = G.SB2AutoResetBossCovered.counts or {}
+			bossInst = G.SB2AutoResetBossCovered.inst or bossInst
+		else
+			G.SB2AutoResetBossCovered = nil
+		end
 		local bobNotes = 0
 
+		-- Every wave's mobs go to the log when the wave ends, so "what was wave N?" has an answer.
+		local seenNames, seenOrder, seenEnv = {}, {}, nil
 		local function onWaveChanged()
 			local now = workspace:GetAttribute('Wave')
 			if now == wave then
 				return
 			end
+			if wave ~= nil and #seenOrder > 0 then
+				resetLog(('summary: wave %s (%s%s, lasted %.0fs) had: %s'):format(
+					tostring(wave),
+					tostring(workspace:GetAttribute('WaveDefenseMode') or '?'),
+					seenEnv and (', ' .. seenEnv .. ' wave') or '',
+					os.clock() - waveAt,
+					table.concat(seenOrder, ' + ')
+				))
+			end
+			seenNames, seenOrder, seenEnv = {}, {}, nil
 			wave = now
 			waveAt = os.clock()
 			strikeAt = nil
+			vaelithFiredWave = nil
+			G.SB2AutoResetFiredVaelith = nil
+			bossSeenAt = nil
+			bossNewAt = nil
+			bossCovered = {}
+			bossInst = setmetatable({}, { __mode = 'k' })
+			G.SB2AutoResetBossCovered = nil
+			bossMissNoted = false
 			riftSeenAt = nil
 			bobNotes = 0
 			firedWave = nil
@@ -1589,6 +1643,18 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 			end
 			return n
 		end
+		local function waveMobNames()
+			local mobs = workspace:FindFirstChild('Mobs')
+			local names = {}
+			if mobs then
+				for _, mob in ipairs(mobs:GetChildren()) do
+					if mob.Name ~= 'Reward Chest' and mob:GetAttribute('Died') ~= true then
+						names[#names + 1] = mob.Name
+					end
+				end
+			end
+			return names
+		end
 		local function countBobs()
 			local mobs = workspace:FindFirstChild('Mobs')
 			local n = 0
@@ -1606,6 +1672,47 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 				return #workspace.WaveDefenseStuff.WaveDefenseRifts:GetChildren()
 			end)
 			return ok and n > 0 and n or 4
+		end
+
+		-- "Saurus, the All-Seeing" (not Reptasaurus), alive.
+		local function findSaurus()
+			local mobs = workspace:FindFirstChild('Mobs')
+			if not mobs then
+				return nil
+			end
+			for _, mob in ipairs(mobs:GetChildren()) do
+				if string.sub(string.lower(tostring(mob.Name)), 1, 6) == 'saurus' and mob:GetAttribute('Died') ~= true then
+					local entity = mob:FindFirstChild('Entity')
+					local health = entity and entity:FindFirstChild('Health')
+					local ok, hp = pcall(function()
+						return health.Value
+					end)
+					if health and ok and type(hp) == 'number' and hp > 0 then
+						return mob
+					end
+				end
+			end
+			return nil
+		end
+
+		local function findVaelith()
+			local mobs = workspace:FindFirstChild('Mobs')
+			if not mobs then
+				return nil
+			end
+			for _, mob in ipairs(mobs:GetChildren()) do
+				if string.sub(string.lower(tostring(mob.Name)), 1, 7) == 'vaelith' and mob:GetAttribute('Died') ~= true then
+					local entity = mob:FindFirstChild('Entity')
+					local health = entity and entity:FindFirstChild('Health')
+					local ok, hp = pcall(function()
+						return health.Value
+					end)
+					if health and ok and type(hp) == 'number' and hp > 0 then
+						return mob
+					end
+				end
+			end
+			return nil
 		end
 
 		local function findRubricatus()
@@ -1642,6 +1749,18 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 		local function step()
 			local now = os.clock()
 			onWaveChanged()
+			if wave ~= nil then
+				for _, name in ipairs(waveMobNames()) do
+					if not seenNames[name] and #seenOrder < 30 then
+						seenNames[name] = true
+						seenOrder[#seenOrder + 1] = name
+					end
+				end
+				local env = workspace:GetAttribute('WaveDefenseEnvironment')
+				if env == 'Tempest' or env == 'Rift' or env == 'Bob' or env == 'Wisp' then
+					seenEnv = env
+				end
+			end
 			if dialogueShowing() then
 				dialogueGoneAt = nil
 				dialogueSeenWave = wave
@@ -1652,14 +1771,111 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 				setResetStatus('not in a run')
 				return
 			end
+			-- Elite boss waves. (Above the "already sent this wave" stop: late bosses get their own send.)
+			local bossSpec = ELITE_BOSS_WAVES[wave]
+			local envNow = workspace:GetAttribute('WaveDefenseEnvironment')
+			local specialEnv = envNow == 'Tempest' or envNow == 'Rift' or envNow == 'Bob' or envNow == 'Wisp'
+			if bossSpec and not specialEnv and workspace:GetAttribute('WaveDefenseMode') == 'Elite' then
+				local names = waveMobNames()
+				local aliveMobs = {}
+				do
+					local mobsF = workspace:FindFirstChild('Mobs')
+					for _, mob in ipairs(mobsF and mobsF:GetChildren() or {}) do
+						if mob.Name ~= 'Reward Chest' and mob:GetAttribute('Died') ~= true then
+							aliveMobs[#aliveMobs + 1] = mob
+						end
+					end
+				end
+				local counts, fresh, freshInst, anyIn = {}, {}, {}, false
+				for i, need in ipairs(bossSpec) do
+					local pat, prefix = need[1], false
+					if string.sub(pat, 1, 1) == '^' then
+						pat, prefix = string.sub(pat, 2), true
+					end
+					local covered = bossCovered[i] or 0
+					local n = covered
+					for _, mob in ipairs(aliveMobs) do
+						local low = string.lower(mob.Name)
+						local hit
+						if prefix then
+							hit = string.sub(low, 1, #pat) == pat
+						else
+							hit = string.find(low, pat, 1, true) ~= nil
+						end
+						if hit then
+							anyIn = true
+							if not bossInst[mob] and n < need[2] then
+								n += 1
+								fresh[#fresh + 1] = mob.Name
+								freshInst[#freshInst + 1] = mob
+							end
+						end
+					end
+					counts[i] = n
+				end
+				if settings.resetMobs ~= true then
+					setResetStatus('boss wave — off')
+				elseif #fresh == 0 then
+					bossNewAt = nil
+					if next(bossCovered) ~= nil then
+						setResetStatus(('sent on wave %s — watching for more bosses'):format(tostring(wave)))
+					else
+						setResetStatus('boss wave — waiting for the boss')
+						if not anyIn and not bossMissNoted and #names > 0 and now - waveAt >= 25 then
+							bossMissNoted = true
+							resetLog('boss wave: expected boss not seen after 25s; alive: ' .. table.concat(names, ' + '))
+						end
+					end
+				else
+					bossSeenAt = bossSeenAt or now
+					bossNewAt = bossNewAt or now
+					-- single-boss waves send at once; with several bosses wait a moment so close spawns share a send
+					local wait = (tonumber(bossSpec.delay) or 0) + ((#bossSpec > 1 or bossSpec[1][2] > 1) and BOSS_BATCH or 0)
+					if now - bossNewAt < wait then
+						setResetStatus(('boss wave — sending in %.1fs'):format(wait - (now - bossNewAt)))
+					else
+						for i, n in ipairs(counts) do
+							bossCovered[i] = math.max(bossCovered[i] or 0, n)
+						end
+						for _, mob in ipairs(freshInst) do
+							bossInst[mob] = true
+						end
+						G.SB2AutoResetBossCovered = { wave = wave, counts = bossCovered, inst = bossInst }
+						bossNewAt = nil
+						fire('Elite boss wave', ('%.1fs into the wave, for: %s'):format(now - waveAt, table.concat(fresh, ' + ')))
+					end
+				end
+				return
+			end
+
+			-- Vaelith: checked before the "already sent this wave" stop, on purpose.
+			if settings.resetMobs == true and vaelithFiredWave ~= wave and findVaelith() then
+				vaelithFiredWave = wave
+				G.SB2AutoResetFiredVaelith = wave
+				fire('Vaelith', ('%.1fs into the wave'):format(now - waveAt))
+				return
+			end
 			if firedWave == wave then
 				setResetStatus(('sent on wave %s'):format(tostring(wave)))
 				return
 			end
 
+			-- Saurus: Elite, wave 23.
+			if wave == 23 and workspace:GetAttribute('WaveDefenseMode') == 'Elite' then
+				if settings.resetMobs ~= true then
+					setResetStatus('Saurus wave — off')
+				elseif not findSaurus() then
+					setResetStatus('Saurus wave — waiting for Saurus')
+				else
+					fire('Saurus', ('%.1fs into the wave'):format(now - waveAt))
+				end
+				return
+			end
+
+
 			-- Thunder wave.
 			if workspace:GetAttribute('WaveDefenseEnvironment') == 'Tempest' then
-				if settings.resetThunder ~= true then
+				if settings.resetMobs ~= true then
 					setResetStatus('thunder wave — off')
 				elseif not strikeAt or now - waveAt < 1 then
 					setResetStatus('thunder wave — waiting for lightning')
@@ -1675,7 +1891,7 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 			-- Rift wave.
 			if workspace:GetAttribute('WaveDefenseEnvironment') == 'Rift' then
 				local n = countRifts()
-				if settings.resetRift ~= true then
+				if settings.resetMobs ~= true then
 					setResetStatus('Rift wave — off')
 				elseif n == 0 then
 					setResetStatus('Rift wave — waiting for the rifts')
@@ -1693,7 +1909,7 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 
 			-- Bob wave.
 			if workspace:GetAttribute('WaveDefenseEnvironment') == 'Bob' then
-				if settings.resetBob ~= true then
+				if settings.resetMobs ~= true then
 					setResetStatus('Bob wave — off')
 				elseif countBobs() == 0 and countWaveMobs() == 0 then
 					setResetStatus('Bob wave — waiting for the mobs')
@@ -1705,7 +1921,7 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 
 			-- Wisp wave.
 			if workspace:GetAttribute('WaveDefenseEnvironment') == 'Wisp' then
-				if settings.resetWisp ~= true then
+				if settings.resetMobs ~= true then
 					setResetStatus('Wisp wave — off')
 				elseif countWaveMobs() == 0 then
 					setResetStatus('Wisp wave — waiting for the mobs')
@@ -1724,7 +1940,7 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 			-- Rubricatus.
 			local rub = findRubricatus()
 			if rub then
-				if settings.resetRub ~= true then
+				if settings.resetMobs ~= true then
 					setResetStatus('Rubricatus — off')
 					return
 				end

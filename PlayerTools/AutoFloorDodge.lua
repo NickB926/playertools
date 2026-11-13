@@ -5558,6 +5558,10 @@ return function(env)
 			if d <= LEASH_RADIUS then
 				return false
 			end
+			-- BetweenParty's chest walker is taking you to the reward chest: don't pull you back.
+			if now < (tonumber(getgenv().SB2ChestWalkUntil) or 0) then
+				return waitWhy(d, 'chest walk', hrp, now)
+			end
 			if now - (tonumber(getgenv().SB2LastDodgeMoveAt) or -1e9) < LEASH_PAUSE then
 				return false
 			end

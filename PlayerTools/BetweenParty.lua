@@ -2,7 +2,7 @@
 	The Between (Wave Defense party lobby) — create party, set mode/status, start run.
 	Split from PlayerTools_Obsidian.lua (register / size).
 ]]
-getgenv().SB2BetweenPartyBuild = 'follow-friend-v25-no-solo-wipe'
+getgenv().SB2BetweenPartyBuild = 'follow-friend-v26-walk-to-chest'
 
 -- Keep the in-game party panel in sync with the real party (Status/Mode).
 -- One loop per client: newest loader wins via a token.
@@ -1727,6 +1727,7 @@ return function(env)
 			end
 			local chest = findLivingRewardChest()
 			if not chest then
+				getgenv().SB2ChestAloneSince = nil
 				return
 			end
 			local mobs = workspace:FindFirstChild('Mobs')
@@ -1737,6 +1738,7 @@ return function(env)
 						local ent = m:FindFirstChild('Entity')
 						local hp = ent and ent:FindFirstChild('Health')
 						if ent and ent:GetAttribute('Died') ~= true and (not hp or (tonumber(hp.Value) or 0) > 0) then
+							getgenv().SB2ChestAloneSince = nil
 							return -- a real mob is still alive; killaura is busy anyway
 						end
 					end
@@ -1744,6 +1746,18 @@ return function(env)
 			end
 			local g = getgenv()
 			local now = os.clock()
+			-- Auto dodge on: it holds you in the middle for 12s after the last real mob (post-death
+			-- Rubricatus nuke) and only then comes down for the chest. Walking over before that just
+			-- got snapped back by its recenter every tick, so wait for its hand-off.
+			-- (Own 12.5s timer too, in case the dodge's hover rule is off and never sets the flag.)
+			if (tonumber(g.SB2ChestAloneSince) or 0) <= 0 then
+				g.SB2ChestAloneSince = now
+			end
+			if g.SB2AutoFloorDodgeOn == true and g.SB2DodgeChestGroundLogged ~= true
+				and now - g.SB2ChestAloneSince < 12.5
+			then
+				return
+			end
 			if now - (tonumber(g.SB2ChestHitAt) or 0) < 0.4 then
 				return
 			end
@@ -1753,11 +1767,49 @@ return function(env)
 			then
 				pcall(g.SB2StartKillauraLoop)
 			end
+			-- Walk to the chest first. DealDamage is range-limited server-side, so hitting it from
+			-- 200 studs away never lands (the old code logged "chest hit true" — a successful CALL —
+			-- while the chest sat untouched because the dodge never pathed over to it).
+			local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart')
+			local okPiv, chestPos = pcall(function()
+				return chest:GetPivot().Position
+			end)
+			if hrp and okPiv then
+				local MELEE = 9
+				-- Tell the dodge's walk-back to leave you alone while you're at the chest.
+				g.SB2ChestWalkUntil = os.clock() + 2
+				for _ = 1, 10 do
+					g.SB2ChestWalkUntil = os.clock() + 2
+					local gap = (chestPos - hrp.Position).Magnitude
+					if gap <= MELEE then
+						break
+					end
+					local dir = (chestPos - hrp.Position)
+					dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, 1)
+					-- hop in <=55-stud steps (the Between move check ignores jumps under ~80 studs),
+					-- stopping MELEE studs short so we end up beside the chest, not inside it.
+					local step = math.min(gap - MELEE, 55)
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.CFrame = CFrame.lookAt(hrp.Position + dir * step, chestPos)
+					task.wait(0.12)
+					hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart')
+					if not hrp then
+						break
+					end
+				end
+			end
 			local rs = g.SB2RequiredServices
 			local deal = rs and rs.Combat and rs.Combat.DealDamage
 			local okHit = false
 			if type(deal) == 'function' then
-				okHit = pcall(deal, chest, nil)
+				-- a few swings per tick now that we're in range, so it breaks quickly
+				for _ = 1, 4 do
+					okHit = pcall(deal, chest, nil) or okHit
+					if not findLivingRewardChest() then
+						break
+					end
+					task.wait(0.1)
+				end
 			end
 			if now - (tonumber(g.SB2ChestHitLogAt) or 0) > 3 then
 				g.SB2ChestHitLogAt = now

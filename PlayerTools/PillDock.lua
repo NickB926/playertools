@@ -17,7 +17,7 @@ local SAVE_PATHS = {
 	'pill_dock.json',
 }
 
-local ORDER = { 'Join', 'WP', 'JL' }
+local ORDER = { 'Join', 'WP', 'JL', 'TR', 'CD' }
 
 local function parentGui()
 	local ok, hui = pcall(function()

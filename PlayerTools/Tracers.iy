@@ -8,7 +8,21 @@
 
     Install: workspace/Tracers.iy → IY Plugins → Add → Tracers
     Commands: tracers | tracersoff | tracerstoggle | tracerscolor [r g b]
+    Pill: TR on the shared dock toggles tracers (TR· while off).
+
+    Highlights / lines / labels are colored by role:
+      Regular  = everyone by default (red, or tracerscolor)
+      Tester   = auto if their inventory has Astral Abyss
+      Admin    = names in ADMINS below (wins over tester)
 ]]
+
+---------------------------------------------------------------------
+-- ADMINS — put usernames or display names here (not case-sensitive).
+-- Reload the plugin after you edit this list.
+local ADMINS = {
+	'lonewolfclasher',
+}
+---------------------------------------------------------------------
 
 local Players = game:GetService('Players')
 local RunService = game:GetService('RunService')
@@ -21,7 +35,10 @@ local GENV = 'SB2Tracers'
 local GENV_STOP = 'SB2TracersStop'
 local GENV_CONN = 'SB2TracersConn'
 
-local DEFAULT_COLOR = Color3.fromRGB(255, 70, 70)
+local DEFAULT_COLOR = Color3.fromRGB(255, 70, 70) -- Regular
+local TESTER_COLOR = Color3.fromRGB(90, 200, 255)
+local ADMIN_COLOR = Color3.fromRGB(255, 210, 45)
+local TESTER_ITEM = 'Astral Abyss'
 local MAX_DIST_LABEL = 50000
 
 if type(getgenv()[GENV_STOP]) == 'function' then
@@ -114,6 +131,85 @@ local function getHead(char)
 		return nil
 	end
 	return char:FindFirstChild('Head')
+end
+
+local adminLookup = {}
+for _, name in ipairs(ADMINS) do
+	if type(name) == 'string' and name ~= '' then
+		adminLookup[string.lower(name)] = true
+	end
+end
+
+local roleCache = {} -- userId -> { role, nextCheck }
+
+local function isAdmin(plr)
+	if not plr then
+		return false
+	end
+	if adminLookup[string.lower(plr.Name)] then
+		return true
+	end
+	local display = plr.DisplayName
+	if type(display) == 'string' and display ~= '' and adminLookup[string.lower(display)] then
+		return true
+	end
+	return false
+end
+
+local function hasAstralAbyss(plr)
+	if not plr then
+		return false
+	end
+	local profiles = game:GetService('ReplicatedStorage'):FindFirstChild('Profiles')
+	local prof = profiles and profiles:FindFirstChild(plr.Name)
+	local inv = prof and prof:FindFirstChild('Inventory')
+	return inv ~= nil and inv:FindFirstChild(TESTER_ITEM) ~= nil
+end
+
+local function classifyPlayer(plr)
+	if not plr then
+		return 'Regular'
+	end
+	local uid = plr.UserId
+	local now = os.clock()
+	local cached = roleCache[uid]
+	if cached and now < (cached.nextCheck or 0) then
+		return cached.role
+	end
+	local role = 'Regular'
+	if isAdmin(plr) then
+		role = 'Admin'
+	elseif hasAstralAbyss(plr) then
+		role = 'Tester'
+	end
+	local delay = 2
+	if role == 'Admin' then
+		delay = 30
+	elseif role == 'Tester' then
+		delay = 8
+	end
+	roleCache[uid] = { role = role, nextCheck = now + delay }
+	return role
+end
+
+local function roleColor(role)
+	if role == 'Admin' then
+		return ADMIN_COLOR
+	end
+	if role == 'Tester' then
+		return TESTER_COLOR
+	end
+	return state.color
+end
+
+local function roleTag(role)
+	if role == 'Admin' then
+		return ' ADMIN'
+	end
+	if role == 'Tester' then
+		return ' TESTER'
+	end
+	return ''
 end
 
 local function headWorldPos(char, root)
@@ -310,6 +406,7 @@ local function clearEntry(userId)
 		end
 	end
 	entries[userId] = nil
+	roleCache[userId] = nil
 end
 
 local function clearAll()
@@ -318,7 +415,7 @@ local function clearAll()
 	end
 end
 
-local function ensureHighlight(plr, char)
+local function ensureHighlight(plr, char, color)
 	local e = entries[plr.UserId]
 	if not e or not state.chams then
 		if e and e.highlight then
@@ -329,9 +426,10 @@ local function ensureHighlight(plr, char)
 		end
 		return
 	end
+	color = typeof(color) == 'Color3' and color or state.color
 	if e.highlight and e.highlight.Parent == char then
-		e.highlight.FillColor = state.color
-		e.highlight.OutlineColor = state.color
+		e.highlight.FillColor = color
+		e.highlight.OutlineColor = color
 		e.highlight.Enabled = true
 		return
 	end
@@ -345,19 +443,20 @@ local function ensureHighlight(plr, char)
 	h.Name = 'SB2TracersChams'
 	h.Adornee = char
 	h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	h.FillColor = state.color
-	h.OutlineColor = state.color
+	h.FillColor = color
+	h.OutlineColor = color
 	h.FillTransparency = 0.55
 	h.OutlineTransparency = 0
 	h.Parent = char
 	e.highlight = h
 end
 
-local function ensureFallbackFolder(plr, myRoot, theirRoot, char)
+local function ensureFallbackFolder(plr, myRoot, theirRoot, char, color)
 	local e = entries[plr.UserId]
 	if not e then
 		return
 	end
+	color = typeof(color) == 'Color3' and color or state.color
 	local folder = e.folder
 	if not folder or not folder.Parent then
 		local parent = parentGui()
@@ -383,7 +482,7 @@ local function ensureFallbackFolder(plr, myRoot, theirRoot, char)
 		label.Size = UDim2.fromScale(1, 1)
 		label.Font = Enum.Font.GothamBold
 		label.TextSize = 14
-		label.TextColor3 = state.color
+		label.TextColor3 = typeof(color) == 'Color3' and color or state.color
 		label.TextStrokeTransparency = 0.4
 		label.Text = ''
 		label.Parent = billboard
@@ -411,7 +510,7 @@ local function ensureFallbackFolder(plr, myRoot, theirRoot, char)
 		beam.Width1 = 0.08
 		beam.FaceCamera = true
 		beam.LightEmission = 1
-		beam.Color = ColorSequence.new(state.color)
+		beam.Color = ColorSequence.new(color)
 		beam.Parent = holder
 		e.holder = holder
 		e.att0 = a0
@@ -430,11 +529,11 @@ local function ensureFallbackFolder(plr, myRoot, theirRoot, char)
 		e.att1.WorldPosition = theirRoot.Position
 		if e.beam then
 			e.beam.Enabled = state.lines == true
-			e.beam.Color = ColorSequence.new(state.color)
+			e.beam.Color = ColorSequence.new(color)
 		end
 	end
 	if e.label then
-		e.label.TextColor3 = state.color
+		e.label.TextColor3 = color
 		e.label.Visible = state.distance == true
 	end
 end
@@ -470,7 +569,7 @@ local function ensureEntry(plr)
 			if entries[uid] and state.enabled then
 				local char = getPlayerCharacter(plr)
 				if char then
-					ensureHighlight(plr, char)
+					ensureHighlight(plr, char, roleColor(classifyPlayer(plr)))
 				end
 			end
 		end)
@@ -568,17 +667,19 @@ local function updateOne(plr, myRoot)
 	end
 
 	local e = ensureEntry(plr)
-	ensureHighlight(plr, char)
+	local role = classifyPlayer(plr)
+	local color = roleColor(role)
+	ensureHighlight(plr, char, color)
 
 	local dist = (theirRoot.Position - myRoot.Position).Magnitude
-	local label = string.format('%s [%s]', plr.Name, formatDist(dist))
+	local label = string.format('%s [%s]%s', plr.Name, formatDist(dist), roleTag(role))
 
 	if hasDrawing then
 		local a, b = tracerScreenPoints(myRoot.Position, theirRoot.Position)
 		local headScreen, headOk = headScreenPoint(char, theirRoot)
 
 		if e.line then
-			e.line.Color = state.color
+			e.line.Color = color
 			if state.lines and a and b then
 				e.line.From = a
 				e.line.To = b
@@ -588,7 +689,7 @@ local function updateOne(plr, myRoot)
 			end
 		end
 		if e.text then
-			e.text.Color = state.color
+			e.text.Color = color
 			e.text.Text = label
 			if state.distance and headOk and headScreen then
 				e._basePos = headScreen
@@ -617,7 +718,7 @@ local function updateOne(plr, myRoot)
 		-- Billboard names only when the head is in front — behind would float mid-view.
 		local headObj = camObjectPos(headWorldPos(char, theirRoot) or theirRoot.Position)
 		local headFront = isInFront(headObj)
-		ensureFallbackFolder(plr, myRoot, theirRoot, char)
+		ensureFallbackFolder(plr, myRoot, theirRoot, char, color)
 		if e.beam then
 			e.beam.Enabled = state.lines == true
 		end
@@ -670,8 +771,69 @@ local function step()
 	staggerNameLabels()
 end
 
+local PILL_ON = Color3.fromRGB(255, 150, 150)
+local PILL_OFF = Color3.fromRGB(140, 140, 150)
+local PILL_BG_ON = Color3.fromRGB(92, 34, 38)
+local PILL_BG_OFF = Color3.fromRGB(28, 32, 40)
+
+local function loadPillDock()
+	if type(getgenv().SB2RegisterPill) == 'function' then
+		return true
+	end
+	for _, path in ipairs({ 'PlayerTools/PillDock.lua', 'PillDock.lua' }) do
+		local ok, src = pcall(function()
+			return readfile(path)
+		end)
+		if ok and type(src) == 'string' and #src > 50 then
+			local okLoad = pcall(function()
+				assert(loadstring(src))()
+			end)
+			if okLoad and type(getgenv().SB2RegisterPill) == 'function' then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function refreshTracersPill()
+	local on = state.enabled == true
+	if type(getgenv().SB2SetPillText) == 'function' then
+		getgenv().SB2SetPillText('TR', on and 'TR' or 'TR·')
+	end
+	local dock = getgenv().SB2PillDock
+	local pill = dock and dock.pills and dock.pills.TR
+	if pill then
+		pill.Text = on and 'TR' or 'TR·'
+		pill.TextColor3 = on and PILL_ON or PILL_OFF
+		pill.BackgroundColor3 = on and PILL_BG_ON or PILL_BG_OFF
+	end
+end
+
+local function registerTracersPill()
+	if not loadPillDock() then
+		return nil
+	end
+	local on = state.enabled == true
+	local btn = getgenv().SB2RegisterPill({
+		id = 'TR',
+		text = on and 'TR' or 'TR·',
+		textColor = on and PILL_ON or PILL_OFF,
+		strokeColor = Color3.fromRGB(140, 70, 70),
+		onClick = function()
+			local fn = getgenv().SB2TracersToggle
+			if type(fn) == 'function' then
+				fn()
+			end
+		end,
+	})
+	refreshTracersPill()
+	return btn
+end
+
 local function setEnabled(on)
 	state.enabled = on == true
+	refreshTracersPill()
 	if not state.enabled then
 		clearAll()
 		say('tracers off')
@@ -679,6 +841,12 @@ local function setEnabled(on)
 	end
 	say(hasDrawing and 'tracers on (Drawing)' or 'tracers on (Beam/Highlight fallback)')
 end
+
+getgenv().SB2TracersSetEnabled = setEnabled
+getgenv().SB2TracersToggle = function()
+	setEnabled(not state.enabled)
+end
+getgenv().SB2TracersRegisterPill = registerTracersPill
 
 local function stopPlugin()
 	state.enabled = false
@@ -706,6 +874,8 @@ end)
 Players.PlayerRemoving:Connect(function(plr)
 	clearEntry(plr.UserId)
 end)
+
+pcall(registerTracersPill)
 
 local Plugin = {
 	['PluginName'] = 'Tracers',
@@ -737,7 +907,7 @@ local Plugin = {
 		},
 		['tracerscolor'] = {
 			['ListName'] = 'tracerscolor [r g b]',
-			['Description'] = 'Set tracer/chams color 0-255 (default 255 70 70). Example: tracerscolor 0 255 120',
+			['Description'] = 'Set Regular player color 0-255 (default 255 70 70). Testers/admins keep their own colors.',
 			['Aliases'] = { 'tracercolour', 'espcolor' },
 			['Function'] = function(args)
 				local r = tonumber(args and args[1])

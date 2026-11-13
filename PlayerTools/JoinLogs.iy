@@ -1474,7 +1474,7 @@ local function buildGui()
 	)
 	local autoLabel = Instance.new('TextLabel')
 	autoLabel.BackgroundTransparency = 1
-	autoLabel.Size = UDim2.new(1, -72, 1, 0)
+	autoLabel.Size = UDim2.new(1, -150, 1, 0)
 	autoLabel.Position = UDim2.fromOffset(72, 0)
 	autoLabel.Font = Enum.Font.Gotham
 	autoLabel.TextSize = 12
@@ -1483,6 +1483,8 @@ local function buildGui()
 	autoLabel.TextTruncate = Enum.TextTruncate.AtEnd
 	autoLabel.Text = state.autoBlock and 'watching' or 'off'
 	autoLabel.Parent = autoBar
+	-- Left click: every @username in the list, one per line. Right click: name, @user and id.
+	local copyAllBtn = mkBtn(autoBar, 'Copy all', UDim2.fromOffset(74, 26), UDim2.new(1, -74, 0, 0), Color3.fromRGB(45, 70, 95))
 
 	local search = Instance.new('TextBox')
 	search.Name = 'Search'
@@ -1743,6 +1745,36 @@ local function buildGui()
 		else
 			say('writefile unavailable')
 		end
+	end))
+	local function copyAllNames(detailed)
+		local seen, lines = {}, {}
+		for _, e in ipairs(filteredEntries()) do
+			local key = tostring(e.userId)
+			if not seen[key] then
+				seen[key] = true
+				if detailed then
+					lines[#lines + 1] = ('%s (@%s) %s'):format(tostring(e.displayName), tostring(e.username), key)
+				else
+					lines[#lines + 1] = tostring(e.username)
+				end
+			end
+		end
+		if #lines == 0 then
+			say('nothing to copy')
+			return
+		end
+		if setClipboard(table.concat(lines, '\n')) then
+			say(('copied %d name%s'):format(#lines, #lines == 1 and '' or 's'))
+		else
+			say('clipboard unavailable')
+		end
+	end
+	getgenv().SB2JoinLogsCopyAll = copyAllNames
+	track(copyAllBtn.MouseButton1Click:Connect(function()
+		copyAllNames(false)
+	end))
+	track(copyAllBtn.MouseButton2Click:Connect(function()
+		copyAllNames(true)
 	end))
 	track(search:GetPropertyChangedSignal('Text'):Connect(function()
 		state.search = search.Text
