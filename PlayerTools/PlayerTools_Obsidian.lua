@@ -6009,6 +6009,11 @@ local ok, err = pcall(function()
 			floorRemnants = profileAttrNum('Floor_Remnants'),
 			eliteKeys = profileAttrNum('Elite_Wave_Keys'),
 			runeCatalyst = profileAttrNum('Catalyst_Runes'),
+			-- Profile.Boost is seconds of 2x boost left (game HUD: floor(v/3600)h).
+			boostSeconds = (function()
+				local b = profile:FindFirstChild('Boost')
+				return (b and b:IsA('ValueBase') and tonumber(b.Value)) or 0
+			end)(),
 			skills = skillNames,
 		}
 	end
@@ -7412,6 +7417,13 @@ local ok, err = pcall(function()
 			label .. ' — stats',
 			'Level ' .. tostring(info.level),
 			'Vel ' .. formatNumber(info.vel),
+			(function()
+				local s = math.max(0, math.floor(tonumber(info.boostSeconds) or 0))
+				if s <= 0 then
+					return 'Boost: none'
+				end
+				return ('Boost: %.1f h (%dh %02dm)'):format(s / 3600, s // 3600, (s % 3600) // 60)
+			end)(),
 			'Stamina regen: ' .. fmt(info.staminaRegen),
 			'Health regen: ' .. fmt(info.healthRegen),
 			'Speed buff: ' .. fmt(info.speedBuff),
