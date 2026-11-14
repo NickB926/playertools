@@ -6014,6 +6014,20 @@ local ok, err = pcall(function()
 				local b = profile:FindFirstChild('Boost')
 				return (b and b:IsA('ValueBase') and tonumber(b.Value)) or 0
 			end)(),
+			-- Inventory entries; stacked materials carry a Count child.
+			itemEntries = (function()
+				local inv = profile:FindFirstChild('Inventory')
+				return inv and #inv:GetChildren() or 0
+			end)(),
+			itemTotal = (function()
+				local inv = profile:FindFirstChild('Inventory')
+				local total = 0
+				for _, it in ipairs(inv and inv:GetChildren() or {}) do
+					local c = it:FindFirstChild('Count')
+					total += (c and tonumber(c.Value)) or 1
+				end
+				return total
+			end)(),
 			skills = skillNames,
 		}
 	end
@@ -7424,6 +7438,8 @@ local ok, err = pcall(function()
 				end
 				return ('Boost: %.1f h (%dh %02dm)'):format(s / 3600, s // 3600, (s % 3600) // 60)
 			end)(),
+			'Total items: ' .. formatNumber(info.itemEntries or 0)
+				.. ' (' .. formatNumber(info.itemTotal or 0) .. ' incl. stacks)',
 			'Stamina regen: ' .. fmt(info.staminaRegen),
 			'Health regen: ' .. fmt(info.healthRegen),
 			'Speed buff: ' .. fmt(info.speedBuff),

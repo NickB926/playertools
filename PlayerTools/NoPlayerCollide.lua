@@ -6,9 +6,12 @@
 	v4: also moves their parts into the game's own "NoCollision" collision group (which the
 	"Players" group never collides with). CanCollide alone gets switched back on by their Humanoid
 	inside the physics step, which is what still launched you upward now and then.
+	v5: (1) when it pauses for a stranger, an alt's collision only comes back once you are
+	apart (turning it on while overlapped made physics stack one account on top of the other);
+	(2) respawns / new gear folders are picked up the same frame instead of up to 0.5s later.
 	Used by PlayerTools (Combat box) and AutoBetween (Dodge box).
 ]]
-getgenv().SB2NoCollideBuild = 'no-collide-v4'
+getgenv().SB2NoCollideBuild = 'no-collide-v5'
 
 return function(env)
 	local box = env.Box
@@ -79,19 +82,55 @@ return function(env)
 		local fn = G.SB2OtherPlayersPresent
 		return type(fn) == 'function' and fn() == true
 	end
+	local function restorePart(part, orig)
+		pcall(function()
+			if part.Parent then
+				part.CanCollide = type(orig) ~= 'table' or orig[1] == true
+				part.CanTouch = type(orig) ~= 'table' or orig[2] == true
+				if type(orig) == 'table' and orig[3] then
+					part.CollisionGroup = orig[3]
+				end
+			end
+		end)
+		changed[part] = nil
+	end
 	local function restoreAll()
 		for part, orig in pairs(changed) do
-			pcall(function()
-				if part.Parent then
-					part.CanCollide = type(orig) ~= 'table' or orig[1] == true
-					part.CanTouch = type(orig) ~= 'table' or orig[2] == true
-					if type(orig) == 'table' and orig[3] then
-						part.CollisionGroup = orig[3]
-					end
-				end
-			end)
-			changed[part] = nil
+			restorePart(part, orig)
 		end
+	end
+	-- Paused: only give collision back to alts that are not overlapping you.
+	local SEPARATE = 7
+	local function rootOf(plr)
+		local c = plr and plr.Character
+		return c and (c:FindFirstChild('HumanoidRootPart') or c.PrimaryPart)
+	end
+	local function restoreSeparated()
+		local myRoot = rootOf(LocalPlayer)
+		local farCache = {}
+		local left = 0
+		for part, orig in pairs(changed) do
+			local owner = type(orig) == 'table' and orig[4] or nil
+			local far = farCache[owner or false]
+			if far == nil then
+				local r = owner and owner.Parent and rootOf(owner)
+				far = (not myRoot) or not r or (r.Position - myRoot.Position).Magnitude > SEPARATE
+				farCache[owner or false] = far
+			end
+			if far then
+				restorePart(part, orig)
+			else
+				left += 1
+				-- keep it off: the humanoid flips CanCollide back on each step
+				pcall(function()
+					if part.Parent then
+						part.CanCollide = false
+						part.CanTouch = false
+					end
+				end)
+			end
+		end
+		return left
 	end
 	local function rebuild()
 		cache = {}
@@ -115,7 +154,7 @@ return function(env)
 						end
 					end
 				end
-				cache[plr] = { parts = parts, roots = roots }
+				cache[plr] = { parts = parts, roots = roots, plr = plr }
 			end
 		end
 	end
@@ -137,8 +176,13 @@ return function(env)
 		local want = type(t) == 'table' and t.Value == true and not strangers()
 		if not want then
 			if active then
-				active = false
-				restoreAll()
+				local toggledOff = not (type(t) == 'table' and t.Value == true)
+				if toggledOff then
+					active = false
+					restoreAll()
+				elseif restoreSeparated() == 0 then
+					active = false
+				end
 			end
 			return
 		end
@@ -158,11 +202,12 @@ return function(env)
 			end
 		end
 		for _, entry in pairs(cache) do
+			local owner = entry.plr
 			for _, part in ipairs(entry.parts) do
 				-- Humanoids turn the root/torso back on every physics step, so this runs on every step
 				if part.Parent and (part.CanCollide or part.CanTouch or (NOCOLL and part.CollisionGroup ~= NOCOLL)) then
 					if not changed[part] then
-						changed[part] = { part.CanCollide, part.CanTouch, part.CollisionGroup } -- remember the originals
+						changed[part] = { part.CanCollide, part.CanTouch, part.CollisionGroup, owner } -- remember the originals
 					end
 					part.CanCollide = false
 					part.CanTouch = false
@@ -176,8 +221,34 @@ return function(env)
 	-- before physics (Stepped/PreSimulation) AND after it, so the humanoid can't sneak a step in between
 	local conn = RunService.Stepped:Connect(apply)
 	local conn2 = RunService.Heartbeat:Connect(apply)
-	watchConns[#watchConns + 1] = Players.PlayerAdded:Connect(function()
+	-- Respawn / floor change / gear swap: rebuild on the very next step.
+	local function watchPlayer(plr)
+		watchConns[#watchConns + 1] = plr.CharacterAdded:Connect(function()
+			dirty = true
+		end)
+	end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			watchPlayer(plr)
+		end
+	end
+	watchConns[#watchConns + 1] = Players.PlayerAdded:Connect(function(plr)
 		dirty = true
+		watchPlayer(plr)
+	end)
+	pcall(function()
+		local items = workspace:FindFirstChild('CharacterItems')
+		if items then
+			watchConns[#watchConns + 1] = items.ChildAdded:Connect(function()
+				dirty = true
+			end)
+		end
+		local chars = workspace:FindFirstChild('Characters')
+		if chars then
+			watchConns[#watchConns + 1] = chars.ChildAdded:Connect(function()
+				dirty = true
+			end)
+		end
 	end)
 
 	G.SB2NoCollideStop = function()

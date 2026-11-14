@@ -166,6 +166,15 @@ local function hasAstralAbyss(plr)
 	return inv ~= nil and inv:FindFirstChild(TESTER_ITEM) ~= nil
 end
 
+-- Profiles[name].Settings.PvP is the player's own PvP toggle (replicated for everyone).
+local function hasPvpOn(plr)
+	local profiles = game:GetService('ReplicatedStorage'):FindFirstChild('Profiles')
+	local prof = profiles and profiles:FindFirstChild(plr.Name)
+	local settings = prof and prof:FindFirstChild('Settings')
+	local v = settings and settings:FindFirstChild('PvP')
+	return v ~= nil and v.Value == true
+end
+
 local function classifyPlayer(plr)
 	if not plr then
 		return 'Regular'
@@ -673,6 +682,9 @@ local function updateOne(plr, myRoot)
 
 	local dist = (theirRoot.Position - myRoot.Position).Magnitude
 	local label = string.format('%s [%s]%s', plr.Name, formatDist(dist), roleTag(role))
+	if hasPvpOn(plr) then
+		label = label .. ' [pvp]'
+	end
 
 	if hasDrawing then
 		local a, b = tracerScreenPoints(myRoot.Position, theirRoot.Position)

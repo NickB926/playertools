@@ -11,7 +11,7 @@
 	Autoload: autoexec/02_autobetween.lua (every account except NickB926, which runs PlayerTools).
 ]]
 
-local BUILD = 'auto-between-v22'
+local BUILD = 'auto-between-v23'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -1531,6 +1531,12 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 		}
 		local BOSS_BATCH = 1
 		local bossNewAt = nil -- when a not-yet-reset boss was first seen
+		-- v23: a boss that blinks out for a moment (intro / phase swap / model replaced) used to restart
+		-- the send timer every time; with Nythrane's 2s delay it never got to send. Gaps under
+		-- BOSS_GAP seconds now keep the timer running.
+		local BOSS_GAP = 1.5
+		local bossGoneAt = nil
+		local bossSeenLogged = false
 		local bossMissNoted = false
 		-- how many of each boss on this wave already had a reset sent (kept across a reload)
 		local bossCovered = {}
@@ -1553,6 +1559,14 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 			if now == wave then
 				return
 			end
+			if wave ~= nil and ELITE_BOSS_WAVES[wave] and bossSeenAt and next(bossCovered) == nil then
+				resetLog(('MISSED Elite boss wave %s: boss first seen %.1fs in, wave ended %.1fs in, no reset sent (resetMobs=%s)'):format(
+					tostring(wave),
+					bossSeenAt - waveAt,
+					os.clock() - waveAt,
+					tostring(settings.resetMobs)
+				))
+			end
 			if wave ~= nil and #seenOrder > 0 then
 				resetLog(('summary: wave %s (%s%s, lasted %.0fs) had: %s'):format(
 					tostring(wave),
@@ -1570,6 +1584,8 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 			G.SB2AutoResetFiredVaelith = nil
 			bossSeenAt = nil
 			bossNewAt = nil
+			bossGoneAt = nil
+			bossSeenLogged = false
 			bossCovered = {}
 			bossInst = setmetatable({}, { __mode = 'k' })
 			G.SB2AutoResetBossCovered = nil
@@ -1816,7 +1832,14 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 				if settings.resetMobs ~= true then
 					setResetStatus('boss wave — off')
 				elseif #fresh == 0 then
-					bossNewAt = nil
+					if bossNewAt then
+						bossGoneAt = bossGoneAt or now
+						if now - bossGoneAt > BOSS_GAP then
+							resetLog(('boss wave: boss gone for %.1fs before the send timer finished (timer reset)'):format(now - bossGoneAt))
+							bossNewAt = nil
+							bossGoneAt = nil
+						end
+					end
 					if next(bossCovered) ~= nil then
 						setResetStatus(('sent on wave %s — watching for more bosses'):format(tostring(wave)))
 					else
@@ -1829,6 +1852,11 @@ if LocalPlayer.UserId == RESET_MOBS_USER_ID then
 				else
 					bossSeenAt = bossSeenAt or now
 					bossNewAt = bossNewAt or now
+					bossGoneAt = nil
+					if not bossSeenLogged then
+						bossSeenLogged = true
+						resetLog(('boss wave: saw %s %.1fs in'):format(table.concat(fresh, ' + '), now - waveAt))
+					end
 					-- single-boss waves send at once; with several bosses wait a moment so close spawns share a send
 					local wait = (tonumber(bossSpec.delay) or 0) + ((#bossSpec > 1 or bossSpec[1][2] > 1) and BOSS_BATCH or 0)
 					if now - bossNewAt < wait then
